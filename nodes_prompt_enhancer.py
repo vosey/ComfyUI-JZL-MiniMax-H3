@@ -20,7 +20,7 @@ class JZL_MiniMaxPromptEnhancer:
     """提示词增强 — 只润色 detailed_description，其余原样保留。"""
 
     _SEGMENT_INFO_KEYS = ["标题", "时长", "景别", "运镜", "角色", "场景", "道具", "动作描述", "氛围光影"]
-    _SEGMENT_INFO_KEYS_EN = ["Title", "Duration", "Shot size", "Camera", "Characters", "Scene", "Props", "Action", "Atmosphere"]
+    _SEGMENT_INFO_KEYS_EN = ["Title", "Duration", "Shot Size", "Camera Movement", "Characters", "Scene", "Props", "Action Description", "Mood & Lighting"]
     _CN_NUMS = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
                 "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十",
                 "二十一", "二十二", "二十三", "二十四"]
@@ -73,11 +73,13 @@ class JZL_MiniMaxPromptEnhancer:
 
     @classmethod
     def _extract_segment_info(cls, block):
-        """提取分段信息九行（**标题** 等），返回 dict。"""
+        """提取分段信息九行，中英两套字段名都支持（**标题**/**Title**、**时长**/**Duration**…），
+        返回 dict（键固定为中文键，便于按输出语言回填）。"""
         info = {}
-        for key in cls._SEGMENT_INFO_KEYS:
-            m = re.search(rf'\*\*{key}\*\*\s*[：:]\s*(.*?)(?:\n|$)', block)
-            info[key] = m.group(1).strip() if m else ""
+        for zh, en in zip(cls._SEGMENT_INFO_KEYS, cls._SEGMENT_INFO_KEYS_EN):
+            m = (re.search(rf'\*\*{zh}\*\*\s*[：:]\s*(.*)', block or "")
+                 or re.search(rf'\*\*{re.escape(en)}\*\*\s*[:：]\s*(.*)', block or ""))
+            info[zh] = m.group(1).strip() if m else ""
         return info
 
     @staticmethod

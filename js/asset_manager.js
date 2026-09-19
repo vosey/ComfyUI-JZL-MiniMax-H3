@@ -920,7 +920,7 @@ function extractShots(script) {
 }
 
 function createReshootSection(ctx) {
-    const { self, promptBox, ipWidget, resizeNode, isMini, reshootSegWidget } = ctx;
+    const { self, promptBox, ipWidget, resizeNode, isMini, reshootSegWidget, container } = ctx;
 
     // 折叠头
     const header = el("div", "display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:13px;font-weight:600;color:#e8a87c;border:1px solid #5b9bd5;border-radius:6px;padding:6px 8px;background:#2a2a2a;margin-top:4px;box-sizing:border-box;");
@@ -1020,8 +1020,17 @@ function createReshootSection(ctx) {
     segPrev.title = "上一段";
     segNext.title = "下一段";
 
-    // 锁定 / 解锁主提示词框
+    // 锁定 / 解锁：主提示词框 + 节点其它全部参数（重拍模式下其它参数不可操作，点击提示）
+    const LOCK_TIP = "请关闭重拍模式！";
+    const lockHint = el("span", "font-size:11px;color:#ffb84d;white-space:nowrap;", "🔒 其它参数已锁定");
+    lockHint.style.display = "none";
+    lockHint.title = LOCK_TIP;
+    header.appendChild(lockHint);
+    const lockCtx = { handler: null };
+
     const setLocked = (locked) => {
+        self.__jzlReshootLocked = !!locked;
+        // 1) 主提示词框
         if (locked) {
             promptBox.contentEditable = "false";
             promptBox.style.background = "#1d1d1d";
@@ -1033,6 +1042,83 @@ function createReshootSection(ctx) {
             promptBox.style.color = "#ddd";
             promptBox.dataset.placeholder = "输入故事/剧本提示词，用 @ 引用素材…";
         }
+        // 2) 节点表面参数 widget（新版前端每个 widget 有 DOM element）→ 鼠标不可操作
+        for (const w of (self.widgets || [])) {
+            if (!w) continue;
+            const nm = w.name || "";
+            if (nm === "jzl_manager" || nm === "internal_prompt" || nm === "manager_settings") continue;
+            const elm = w.element;
+            if (!elm || !elm.style) continue;
+            if (locked) {
+                if (w.__jzlLockBak === undefined) {
+                    w.__jzlLockBak = {
+                        pe: elm.style.pointerEvents, op: elm.style.opacity, cur: elm.style.cursor,
+                        dis: !!w.disabled, optDis: w.options ? !!w.options.disabled : undefined,
+                    };
+                }
+                elm.style.pointerEvents = "none";
+                elm.style.opacity = "0.45";
+                elm.style.cursor = "not-allowed";
+                w.disabled = true;              // 新版前端：彻底阻止下拉/输入（值仍可被重拍拦截程序临时改写）
+                if (!w.options) w.options = {};
+                w.options.disabled = true;
+                if (!w.__jzlLockClick) {
+                    w.__jzlLockClick = (e) => {
+                        if (!self.__jzlReshootLocked) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        notify(LOCK_TIP, "error");
+                    };
+                    elm.addEventListener("mousedown", w.__jzlLockClick, true);
+                    elm.addEventListener("click", w.__jzlLockClick, true);
+                }
+            } else if (w.__jzlLockBak !== undefined) {
+                elm.style.pointerEvents = w.__jzlLockBak.pe || "";
+                elm.style.opacity = w.__jzlLockBak.op || "";
+                elm.style.cursor = w.__jzlLockBak.cur || "";
+                w.disabled = !!w.__jzlLockBak.dis;
+                if (w.options && w.__jzlLockBak.optDis !== undefined) w.options.disabled = !!w.__jzlLockBak.optDis;
+                if (w.__jzlLockClick) {
+                    elm.removeEventListener("mousedown", w.__jzlLockClick, true);
+                    elm.removeEventListener("click", w.__jzlLockClick, true);
+                    delete w.__jzlLockClick;
+                }
+                delete w.__jzlLockBak;
+            }
+        }
+        // 3) DOM widget 内除重拍区以外的部分 → 同步变暗 + 不可点
+        if (container) {
+            for (const c of Array.from(container.children || [])) {
+                if (c === header || c === body) continue;
+                if (locked) {
+                    if (c.__jzlLockBak === undefined) c.__jzlLockBak = { pe: c.style.pointerEvents, op: c.style.opacity };
+                    c.style.pointerEvents = "none";
+                    c.style.opacity = "0.45";
+                } else if (c.__jzlLockBak !== undefined) {
+                    c.style.pointerEvents = c.__jzlLockBak.pe || "";
+                    c.style.opacity = c.__jzlLockBak.op || "";
+                    delete c.__jzlLockBak;
+                }
+            }
+        }
+        lockHint.style.display = locked ? "" : "none";
+        // 4) 点锁定区 → 提示「请关闭重拍模式！」（容器捕获阶段；重拍区放行）
+        if (locked && !lockCtx.handler) {
+            lockCtx.handler = (e) => {
+                if (!self.__jzlReshootLocked) return;
+                if (header.contains(e.target) || body.contains(e.target)) return;
+                e.preventDefault();
+                e.stopPropagation();
+                notify(LOCK_TIP, "error");
+            };
+            container?.addEventListener("mousedown", lockCtx.handler, true);
+            container?.addEventListener("click", lockCtx.handler, true);
+        } else if (!locked && lockCtx.handler) {
+            container?.removeEventListener("mousedown", lockCtx.handler, true);
+            container?.removeEventListener("click", lockCtx.handler, true);
+            lockCtx.handler = null;
+        }
+        setTimeout(() => { try { resizeNode(); } catch (_) {} }, 30);
     };
 
     // 加载提示词源（默认LLM拆解 或 本地文件）→ 切段 + 生产规范校验 + 填充界面。
@@ -1050,10 +1136,12 @@ function createReshootSection(ctx) {
         state.source = (meta && meta.display) ? meta.display : "";
         // 生产规范校验：段数 / H3_PROMPT 标记 / 与「生成视频数量」一致性
         const vcW = (self.widgets || []).find((w) => w.name === "video_count");
-        const vc = parseInt(readWidgetValue(vcW), 10) || 6;
+        const vcRaw = String(readWidgetValue(vcW) ?? "").trim();
+        const vcAuto = /剧情决定|自动/.test(vcRaw);           // 「剧情决定」：段数由 LLM 按剧情时间线自动定
+        const vc = (vcRaw.match(/\d+/) || [0])[0] * 1 || 6;
         const warns = [];
         if (!shots.length) warns.push("未识别到 [SHOT_START] 分段");
-        if (shots.length && shots.length !== vc) warns.push(`识别到 ${shots.length} 段，与「生成视频数量」${vc} 不一致`);
+        if (!vcAuto && shots.length && shots.length !== vc) warns.push(`识别到 ${shots.length} 段，与「生成视频数量」${vc} 不一致`);
         const noH3 = shots.filter((s) => s.indexOf("===H3_PROMPT===") < 0).length;
         if (noH3) warns.push(`${noH3} 段缺少 ===H3_PROMPT=== 标记`);
         if (warns.length) {
@@ -1156,7 +1244,7 @@ function createReshootSection(ctx) {
             return {
                 apply() {
                     if (rmW) setWidgetValue(rmW, "🪄 穿透生成模式");
-                    if (vcW) setWidgetValue(vcW, 1);
+                    if (vcW) setWidgetValue(vcW, "生成1段");
                     if (ipWidget) setWidgetValue(ipWidget, single);
                 },
                 restore() {
@@ -2604,7 +2692,7 @@ function defaultSettings() {
             infinite: {
                 window: 22, audio_link: true, audio_no_trim: false, settle: 12,
                 trim_mode: "像素域裁切（推荐）", guide_source: "一采latent尾部（推荐）",
-                second_guide: "first",
+                second_guide: "first", luma_match: true,
             },
             second: {
                 enabled: false,
@@ -3007,7 +3095,7 @@ function renderPrefPanel(c, s, d, node) {
     // 后端读取 sample_decode.infinite = { window, audio_no_trim, settle, trim_mode, guide_source, second_guide }
     const isInfNode = !!node && node.type === INF_NODE_TYPE;
     if (isInfNode) {
-        const inf = p.infinite || (p.infinite = { window: 22, audio_link: true, audio_no_trim: false });
+        const inf = p.infinite || (p.infinite = { window: 22, audio_link: true, audio_no_trim: false, luma_match: true });
         c.append(makeSectionTitle("无限时长衔接"));
         // 窗口取值恒为 17m+5（5/22/39/56）：段长恒为 17k+5，两者相减必是 17 的倍数 → 相位自动对齐
         const SEAM_WINDOWS = ["5", "22", "39", "56"];
@@ -3064,6 +3152,7 @@ function renderPrefPanel(c, s, d, node) {
             + "· 「latent域裁切（相位安全）」：先裁 latent 再解码（解码量更少、保留帧不含被裁内容），但丢弃 token 数必须是 5 的倍数（= 丢弃帧数是 17 的倍数 ⇒ 过渡需为 12 / 29 / 46，默认 12 满足）；条件不满足时自动回退像素域裁切（保证不闪烁）。\n"
             + "· 【过渡丢弃帧数】默认 12（官方 Director 经验值）：钉子会「压住」段首，模型先模仿/保持引导内容、之后才启动新动作，这段启动过渡留在成片里就是接缝处的「卡一下」（官方注释称 hold→pop）。丢弃量 = 窗口 + 过渡；卡顿感重就调大到 29，想让成片少裁几帧就保持 12。下拉只提供 **12 / 29 / 46**——只有它们能让「窗口 + 过渡」是 17 的倍数（生成帧数与落盘帧数都是 17 的倍数加 5），从而「落盘时长 = 你设定的时长」；其它值（含历史配置里的 0/5/8/17/22）会自动就近归一到这三个值。\n"
             + "· 【音频】接缝音频按同一丢弃量裁波形（音画等长）；拼接保存时视频 -c copy 无损、音频由各段无损 WAV 拼成整条后只编码一次 AAC → 段边界无 AAC encoder delay 误差（约 20–30ms/接缝）。\n"
+            + "· 【接缝亮度匹配（只做亮度）】默认开启：段首衔接帧被裁掉后，本段第一个画面是模型新生成的内容，其整体曝光可能与上一段末帧差一截（灯光/昼夜/室内外切换的段边界尤其明显）→ 接缝处亮度一跳。开启后把本段**开头 12 帧的平均亮度**从「上段末帧亮度」平滑渐入到「本段自身亮度」：每帧加同一个 delta（R=G=B，加性）、单帧限幅 ±0.10、三项差都小于 0.008 时**完全不动作**。只动亮度、不动 RGB 混合、不动构图，因此不会拖影/重影（乘法增益、长 RGB 混合、低频谱亮度场这些做法官方实测会「画面花 / 一闪一闪」，已弃用）。日志会打印「上段末帧亮度 → 本段渐入亮度」。\n"
             + "· 【引导来源】默认「一采 latent 尾部」：与下段目标同画布同 latent 空间，零 VAE 往返、零累积漂移；若画面异常可切「尾帧→VAE 重编码」对照（官方 AddGuide 同款）。\n"
             + "· 【二采引导来源】（仅开启二采时生效）：默认「上段一采 latent」——复用同一份引导、内部插值对齐放大后的二采画布（零额外内存）；也可切「上段二采 latent 尾部」= 用上一段**二采（refined）**latent 的同画布真实尾部做引导，与最终成片尾部版本完全一致（更准），代价是 CPU 常驻一份尾部切片（只留配置窗口所需 token，通常几~几十 MB）。两种都只影响二采这一步，一采引导恒用上段一采 latent。\n"
             + "· 1 段时无上段，自动跳过衔接（行为与「短剧导演台Max」完全一致）。\n"
@@ -3077,6 +3166,9 @@ function renderPrefPanel(c, s, d, node) {
         c.append(field("音频同步裁剪", checkboxControl(!inf.audio_no_trim,
             "裁剪段首衔接帧时，同步裁掉对应音频长度（窗口+过渡 秒）→ 音画对齐【默认开启·建议保持】。取消勾选 = 本段音频不做时间轴裁剪（仅作对比实验）：音频会整体后移造成音画错位；落盘时仍会强制与画面等长，不会让段尾画面被冻结",
             v => { if (v) { delete inf.audio_no_trim; } else { inf.audio_no_trim = true; } })));
+        c.append(field("接缝亮度匹配", checkboxControl((inf.luma_match === undefined) ? true : !!inf.luma_match,
+            "【默认开启·建议保持】只做亮度：把本段开头 12 帧的平均亮度朝上一段末帧平滑过渡（加性、单帧限幅 ±0.10），消除接缝亮度跳变。不做任何 RGB 混合（官方实测 RGB 混合会拖影），因此不会影响构图/细节；关闭 = 完全不动画面像素",
+            v => { inf.luma_match = !!v; })));
     }
 }
 
@@ -3159,16 +3251,20 @@ const USAGE_FALLBACK_HTML = `
 <li>接好模型输入：主模型 / CLIP / 视觉VAE / 音频VAE（含视频或音频参考时必须接音频VAE）</li>
 <li>在节点表面 📝 提示词 框输入故事 / 剧本（可用 @ 引用素材）</li>
 <li>点「📁 参考素材管理」上传并配置素材（图片 / 视频 / 音频）</li>
-<li>设置「视频数量」（1~48）、画幅、时长等参数后运行</li>
+<li>设置「生成视频数量」（默认「剧情决定」：LLM 按剧情时间线长度 ÷ 每段时长自动定段数；也可手动指定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段）、画幅、每段时长等参数后运行</li>
 </ol>
 <p style="margin:4px 0;">提示：不接模型也能运行——只做剧本分段 + 调度，不做采样解码。</p>
-<h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">二、运行模式</h4>
+<h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">二、运行模式（按你的处境选）</h4>
 <ul style="padding-left:20px;margin:4px 0;">
-<li><b>🛠️ 故事拆解模式</b>：按情节拆解为 N 段（不创意扩展）</li>
-<li><b>📚 故事扩写模式</b>：只按故事风格 + 扩写字数把故事扩写为丰满正文（不拆解；纯文本经剧本端口输出 + 落盘，不生成视频）</li>
-<li><b>🪄 穿透生成模式</b>：跳过 LLM 拆解与增强，直接用提示词生成</li>
-<li><b>📝 仅提示词输出</b>：拆解 + 增强的完整分段剧本文本经剧本端口输出，不生成视频</li>
+<li><b>🛠️ 故事拆解模式</b>：<b>你有一个已经满意的故事，想直接生成视频</b> → 选这个。（按情节拆成 N 段；不改剧情、不新增对白）</li>
+<li><b>📚 故事扩写模式</b>：故事太短/太简，想<b>先扩写成丰满正文再拆解</b> → 选这个。（纯文本，不生成视频）</li>
+<li><b>📝 仅提示词输出</b>：<b>你有故事，只想先看看拆解出来的提示词、暂不生成视频</b> → 选这个。（拆解 + 增强后从「已处理剧本」端口输出完整分段剧本；无需接模型）</li>
+<li><b>🪄 穿透生成模式</b>：<b>你已经用「仅提示词输出」拿到满意的提示词</b>，把它粘进提示词框直接生成视频 → 选这个。（跳过 LLM 拆解与增强；<b>必须使用「拆解模式」拆解好的提示词</b>，格式不对会直接报错终止、不生成）</li>
 </ul>
+<p style="margin:4px 0;">推荐流程：📝 仅提示词输出 调提示词 → 满意后切 🪄 穿透生成模式 用同一份提示词出片。</p>
+<p style="margin:4px 0;">⚠️ <b>输入要求</b>：🛠️ 故事拆解模式 / 📚 故事扩写模式 吃的是<b>自然语言故事</b>；若输入含已拆解标签（<b>===H3_PROMPT===</b>、<b>[SHOT_START]</b>、<b>subject_definitions:</b>、<b>### Video_001</b> 等）会直接报错终止，请改用 <b>🪄 穿透生成模式</b>。</p>
+<p style="margin:4px 0;">⚠️ 穿透生成模式 / 重拍只接受<b>拆解产物</b>：必须含 <b>[SHOT_START]…[SHOT_END]</b> 分段块且每段含 <b>===H3_PROMPT===</b> 六段正文；纯文本故事或手写草稿会被拒绝。段数需与「生成视频数量」匹配（选「<b>剧情决定</b>」则自动跟随剧本段数）；每段块内 <b>**时长**：N</b>（英文提示词为 <b>**Duration**：N</b>）决定该段时长，缺失时按节点「每段视频时长」生成。</p>
+<p style="margin:4px 0;">段数说明：默认「<b>剧情决定</b>」——LLM 先按<b>剧情时间线长度</b>（不是字数）判断需要多少总时长，再按你设定的每段时长自动定段数，避免「选的段数与剧情不匹配」。</p>
 <p style="margin:4px 0;">注：📚 故事扩写模式 / 📝 仅提示词输出 为纯文本模式，会自动静音上游（模型/CLIP/VAE）与除剧本端口外的下游节点，只跑 LLM 文本处理。</p>
 <h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">三、素材与参考调度</h4>
 <ul style="padding-left:20px;margin:4px 0;">
@@ -4011,7 +4107,7 @@ app.registerExtension({
             const reshootSegW = isMini ? (self.widgets || []).find((w) => w.name === "reshoot_segment") : null;
             const reshootSection = createReshootSection({
                 self, promptBox, ipWidget, resizeNode: resizeNodeForContent,
-                isMini: !!isMini, reshootSegWidget: reshootSegW,
+                isMini: !!isMini, reshootSegWidget: reshootSegW, container,
             });
             container.appendChild(reshootSection.header);
             container.appendChild(reshootSection.body);
@@ -4045,18 +4141,27 @@ app.registerExtension({
                 };
                 const ar = gv("aspect_ratio") || "16:9 (Widescreen)";
                 const mp = parseFloat(gv("megapixels")) || 1.0;
-                // duration 兼容区间（"5" / "5-5" / "4-10"）：解析出 lo/hi
-                const durRaw = ((gv("duration") ?? "5-5") + "").trim();
-                const durM = durRaw.match(/^(\d+(?:\.\d+)?)\s*[~\-—]\s*(\d+(?:\.\d+)?)$/);
+                // duration 兼容：「固定N秒」/「A~B秒」新选项，以及旧值（"5" / "5-5" / "4-10"）
+                const durRaw = ((gv("duration") ?? "固定5秒") + "").trim();
+                const durFix = durRaw.match(/固定\s*(\d+(?:\.\d+)?)\s*秒/);
+                const durM = durRaw.match(/(\d+(?:\.\d+)?)\s*[~\-—–]\s*(\d+(?:\.\d+)?)/);
                 let dlo, dhi;
-                if (durM) {
+                if (durFix) {
+                    const dv = Math.max(4, Math.min(15, parseFloat(durFix[1]) || 8));
+                    dlo = dv; dhi = dv;
+                } else if (durM) {
                     dlo = Math.max(4, Math.min(15, parseFloat(durM[1]) || 8));
                     dhi = Math.max(dlo, Math.min(15, parseFloat(durM[2]) || dlo));
                 } else {
                     const dv = Math.max(4, Math.min(15, parseFloat(durRaw) || 8));
                     dlo = dv; dhi = dv;
                 }
-                const count = parseInt(gv("video_count"), 10) || 6;
+                const vcRaw = String(gv("video_count") ?? "").trim();
+                const vcAuto = /剧情决定|自动/.test(vcRaw);      // 「剧情决定」：段数由 LLM 按剧情时间线自动定
+                const count = (vcRaw.match(/\d+/) || [0])[0] * 1 || 6;
+                // 动态参数用范围简写（如 1~56）
+                const cntLo = vcAuto ? 1 : count, cntHi = vcAuto ? 56 : count;
+                const cntTxt = vcAuto ? `${cntLo}~${cntHi}` : `${count}`;
                 const [wr, hr] = AR_MAP[ar] || [16, 9];
                 const total = mp * 1024 * 1024;
                 const scale = Math.sqrt(total / (wr * hr));
@@ -4066,14 +4171,14 @@ app.registerExtension({
                 const flo = calcF(dlo), fhi = calcF(dhi);
                 const ds = dlo === dhi ? `${dlo}` : `${dlo}~${dhi}`;
                 const fs = flo === fhi ? `${flo}` : `${flo}~${fhi}`;
-                const tfs = flo === fhi ? `${flo * count}` : `${flo * count}~${fhi * count}`;
-                const ts = dlo === dhi ? `${dlo * count}` : `${dlo * count}~${dhi * count}`;
+                const tfs = (flo * cntLo === fhi * cntHi) ? `${flo * cntLo}` : `${flo * cntLo}~${fhi * cntHi}`;
+                const ts = (dlo * cntLo === dhi * cntHi) ? `${dlo * cntLo}` : `${dlo * cntLo}~${dhi * cntHi}`;
                 const disp = (self.widgets || []).find((x) => x.name === "display_info");
                 if (!disp) return;
-                let out = `分辨率：${W}x${H}丨每段时长：${ds}s丨每段帧数：${fs}丨共计段数：${count}丨总帧数：${tfs}丨总时长：${ts}秒`;
+                let out = `分辨率：${W}x${H}丨每段时长：${ds}s丨每段帧数：${fs}丨共计段数：${cntTxt}丨总帧数：${tfs}丨总时长：${ts}秒`;
                 // ♾️ 无限时长：段 2+ 的**生成时长 = 设定时长 + 段首衔接跑道**（跑道 = 窗口 + 过渡，成片裁掉）
                 //    ⇒ 落盘时长 = 设定时长（节点的每个数值都按「落盘」显示，不再扣减）。
-                if (self.type === INF_NODE_TYPE && count > 1) {
+                if (self.type === INF_NODE_TYPE && (vcAuto || count > 1)) {
                     try {
                         let win = 22, settle = 12, tm = "";
                         const ms = gv("manager_settings");
@@ -4098,18 +4203,16 @@ app.registerExtension({
                         const latOK = lat && per > 0 && (per % 17 === 0);
                         const runwaySec = (per / 24).toFixed(2);
                         // 成片总长 = 设定时长 × 段数（跑道已裁掉）
-                        const t1 = flo * count, t2 = fhi * count;
+                        const t1 = flo * cntLo, t2 = fhi * cntHi;
                         const s1 = (t1 / 24).toFixed(2), s2 = (t2 / 24).toFixed(2);
                         const tt = t1 === t2 ? `${t1} 帧 ≈ ${s1} 秒` : `${t1}~${t2} 帧 ≈ ${s1}~${s2} 秒`;
                         const cutDesc = noTrim
-                            ? "不裁切（诊断·成片开头含衔接重复帧）"
+                            ? "不裁切（诊断）"
                             : (lat
-                                ? `latent域裁切（相位安全${latOK ? "·已满足" : "·条件不足→自动回退像素域"}）`
-                                : `像素域裁切`) + `：窗口 ${win} + 过渡 ${settleEff}${settleEff !== settle ? `（配置 ${settle} 已对齐）` : ""} = 段首 ${per} 帧`;
-                        const genNote = per > 0
-                            ? `丨第 2 段起生成时长 = 设定 + ${runwaySec}s（段首承接上段末帧的跑道，成片已裁掉）`
-                            : "";
-                        out = `分辨率：${W}x${H}丨每段帧数：${fs}（落盘）丨段数：${count}丨${cutDesc}${genNote}丨成片总长：${tt}丨（每段可按剧本「**时长**」各自不同）`;
+                                ? (latOK ? "latent域裁切" : "latent域裁切（条件不足→回退像素域）")
+                                : "像素域裁切") + `：窗口 ${win} + 过渡 ${settleEff}${settleEff !== settle ? `（配置 ${settle} 已对齐）` : ""}`;
+                        const genNote = per > 0 ? `丨后续时长 = 设定 + ${runwaySec}s` : "";
+                        out = `分辨率：${W}x${H}丨每段帧数：${fs}（落盘）丨段数：${cntTxt}丨${cutDesc}${genNote}丨成片总长：${tt}`;
                     } catch (_) { /* 解析失败则退回默认文案 */ }
                 }
                 setWidgetValue(disp, out);

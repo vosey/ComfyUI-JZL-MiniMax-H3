@@ -518,7 +518,7 @@ class JZL_MiniMax_ScriptProcessor:
                     "tooltip": "关闭=使用默认分段规则；开启=启用下方自定义规则（粘贴文本 / 填文件路径 / 浏览选文件）"}),
                 "story_name": ("STRING", {"default": "", "placeholder": "故事名称"}),
                 "story_input": ("STRING", {"multiline": True, "default": ""}),
-                "segment_count": (list(SEGMENT_COUNT_OPTIONS.keys()), {"default": list(SEGMENT_COUNT_OPTIONS.keys())[0] if SEGMENT_COUNT_OPTIONS else "4段"}),
+                "segment_count": (["剧情决定"] + list(SEGMENT_COUNT_OPTIONS.keys()), {"default": "剧情决定"}),
                 "segment_duration": ("INT", {"default": 8, "min": 4, "max": 15, "step": 1,
                     "tooltip": "每段视频时长(秒)，强制每段视频长度。与「海螺H3视频参数」的时长联动"}),
                 "prompt_lang": (["中文 [ZH]", "英文 [EN]"], {"default": "中文 [ZH]"}),
@@ -909,17 +909,22 @@ class JZL_MiniMax_ScriptProcessor:
             seam_runway=seam_runway,
         )
         segment_count = _resolve_segment_count(segment_count)
+        _auto_count = segment_count is None      # 「剧情决定」：段数由 LLM 按剧情时间线长度自动决定
         _dlo_set, _dhi_set, _ddesc = _parse_duration_spec(segment_duration)      # 设定时长（= 落盘时长）
         _dlo, _dhi, _ddesc = _duration_spec_with_runway(segment_duration, seam_runway)   # 生成时长
         if seam_runway > 0:
             _r = f"{seam_runway:.2f}".rstrip("0").rstrip(".")
             _gen = f"{_dlo:.2f}".rstrip("0").rstrip(".") if _dlo == _dhi else f"{_dlo:.1f}~{_dhi:.1f}"
-            _dur_clause = (f"每段的生成时长（写进该段 **时长** 字段）为：第 1 段固定 {int(_dlo_set)} 秒；"
+            _fld = "**Duration**" if lang == "en" else "**时长**"
+            _dur_clause = (f"每段的生成时长（写进该段 {_fld} 字段）为：第 1 段固定 {int(_dlo_set)} 秒；"
                            f"第 2 段起 {_gen} 秒（= 落盘 {int(_dlo_set)} 秒 + 段首衔接 {_r} 秒；"
                            f"段首 {_r} 秒是承接上一段末帧的延续段，成片会整段裁掉，新内容从 {_r} 秒之后开始）")
         else:
-            _dur_clause = f"每段视频固定 {int(_dlo)} 秒" if _dlo == _dhi else f"每段视频时长在 {int(_dlo)}~{int(_dhi)} 秒区间内，由你按剧情弧线给每段分配实际秒数（写进该段 **时长** 字段）"
-        user_msg = f"请生成恰好 {segment_count} 个分段，{_dur_clause}，输出 [SHOT_START]...[SHOT_END] 完整块（分段信息 + 六段提示词 + 调度指令）。"
+            _dur_clause = f"每段视频固定 {int(_dlo)} 秒" if _dlo == _dhi else f"每段视频时长在 {int(_dlo)}~{int(_dhi)} 秒区间内，由你按剧情弧线给每段分配实际秒数（写进该段 {'**Duration**' if lang == 'en' else '**时长**'} 字段）"
+        _seg_clause = ("请按剧情发展的时间线长度自动决定分段数（段数 = 剧情总时长 ÷ 每段时长，"
+                       "优先用足每段时长（区间取上限），最少 1 段、最多 56 段；剧情很短时宁可用 1 段长镜，"
+                       "绝不切成很多短段）" if _auto_count else f"请生成恰好 {segment_count} 个分段")
+        user_msg = f"{_seg_clause}，{_dur_clause}，输出 [SHOT_START]...[SHOT_END] 完整块（分段信息 + 六段提示词 + 调度指令）。"
 
         if "api" in str(llm_backend) and api_config:
             print("[JZL-API] 使用在线 API 生成，跳过本地模型加载")
@@ -1004,15 +1009,20 @@ class JZL_MiniMax_ScriptProcessor:
 
         # 统计表：只统计用户素材声明里的角色/场景/道具（不含 LLM 幻想元素），分段数用「要求的数量」
         stat_chars, stat_scenes, stat_props = self._parse_material_intro(ref_image_intro, ref_video_intro, ref_audio_intro)
-        stat_table = self._build_stat_table(stat_chars, stat_scenes, stat_props, segment_count)
+        actual_count = len(shots)
+        # 分段数用于统计表/BUS：「剧情决定」时用实际解析到的段数（段数由 LLM 按剧情定）
+        if _auto_count:
+            _stat_count = actual_count if actual_count > 0 else 1
+        else:
+            _stat_count = segment_count
+        stat_table = self._build_stat_table(stat_chars, stat_scenes, stat_props, _stat_count)
 
         # 槽位名校验告警（发现「天空」这类把描述当槽位名的情况，提示用户）
         if slot_warnings:
             stat_table = stat_table + "\n" + "\n".join(slot_warnings)
 
-        # 块数校验：LLM 实际输出分段数 ≠ 要求数时告警，防止静默丢段
-        actual_count = len(shots)
-        if actual_count != segment_count:
+        # 块数校验：LLM 实际输出分段数 ≠ 要求数时告警，防止静默丢段（「剧情决定」时不校验）
+        if not _auto_count and actual_count != segment_count:
             stat_table = (stat_table +
                           f"\n[⚠️ 分段数量不符] 要求 {segment_count} 段，实际解析到 {actual_count} 段。"
                           "请检查 LLM 输出是否被截断，或重新生成。")
@@ -1055,7 +1065,7 @@ class JZL_MiniMax_ScriptProcessor:
             "preference": preference,
             "story_style": story_style,
             "mode": mode,
-            "segment_count": segment_count,
+            "segment_count": _stat_count,
             "segment_duration": int(_dlo_set),          # 设定时长（= 落盘时长）；生成时长见 segment_duration_gen
             "segment_duration_desc": _ddesc,
             "segment_duration_gen": int(round(_dlo)),

@@ -95,6 +95,44 @@ ASPECT_RATIOS = {
 }
 
 
+# 每段视频时长选项（四个导演台节点共用：Pro / Max / Mini / 无限时长）
+# 固定 4~15 秒 + 常用区间；区间时由 LLM 按剧情弧线给每段实际秒数
+SEGMENT_DURATION_CHOICES = (
+    "固定4秒", "固定5秒", "固定6秒", "固定7秒", "固定8秒", "固定9秒", "固定10秒",
+    "固定11秒", "固定12秒", "固定13秒", "固定14秒", "固定15秒",
+    "4~9秒", "7~12秒", "10~15秒", "4~15秒",
+)
+SEGMENT_DURATION_DEFAULT = "固定5秒"
+
+# 生成视频数量选项（四节点共用）：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数
+VIDEO_COUNT_CHOICES = (
+    "剧情决定",
+    "生成1段", "生成2段", "生成3段", "生成4段", "生成6段", "生成9段",
+    "生成12段", "生成16段", "生成20段", "生成26段", "生成32段", "生成40段",
+    "生成48段", "生成56段",
+)
+VIDEO_COUNT_DEFAULT = "剧情决定"
+VIDEO_COUNT_FALLBACK = 6   # 「剧情决定」在拆解前的占位段数（拆解后按实际分段数覆盖）
+SEGMENT_COUNT_MAX = 56     # 段数上限（与选项一致）
+
+
+def _parse_video_count(video_count):
+    """video_count 选项 → ('auto', None)【剧情决定】或 ('fixed', N)。兼容旧数字值。"""
+    s = str(video_count if video_count is not None else VIDEO_COUNT_DEFAULT).strip()
+    if (not s) or s == "剧情决定":
+        return ("auto", None)
+    m = re.search(r"\d+", s)
+    if m:
+        return ("fixed", max(1, min(SEGMENT_COUNT_MAX, int(m.group(0)))))
+    return ("auto", None)
+
+
+def _vc_count(video_count, default=VIDEO_COUNT_FALLBACK):
+    """拆解前可用的段数：'剧情决定' → 占位 default（拆解后会用实际分段数覆盖）。"""
+    _mode, n = _parse_video_count(video_count)
+    return n if n else default
+
+
 def _story_style_options():
     """故事风格选项列表（供 schema combo 使用）。
 
@@ -468,13 +506,69 @@ def _validate_script(script, video_count=6):
     shots = [s.strip() for s in re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', script or "", re.DOTALL)]
     if not shots:
         return ["未识别到 [SHOT_START]~[SHOT_END] 分段（拆解结果可能损坏）"]
-    n = max(1, min(48, int(video_count or 6)))
+    n = _vc_count(video_count)
     if len(shots) != n:
         errs.append(f"识别到 {len(shots)} 段，与当前「生成视频数量」{n} 不一致")
     noh3 = [i + 1 for i, s in enumerate(shots) if "===H3_PROMPT===" not in s]
     if noh3:
         errs.append(f"第 {', '.join(str(x) for x in noh3[:6])}{'…' if len(noh3) > 6 else ''} 段缺少 ===H3_PROMPT=== 标记")
     return errs
+
+
+def _check_decomposed_script(script, video_count, auto_count=False, tag="管理器"):
+    """穿透生成模式 / 重拍模式前置校验：必须使用「拆解模式」拆解好的提示词。
+
+    返回 (err_msg | None, 实际分段数)。err_msg 非空 → 调用方报错终止、不生成。
+    ① 必须有 [SHOT_START]…[SHOT_END] 分段块；② 每段必须含 ===H3_PROMPT=== 六段正文；
+    ③ 非「剧情决定」时，段数必须与「生成视频数量」一致（否则会多生成空占位段）。
+    """
+    shots = [s.strip() for s in re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', script or "", re.DOTALL)]
+    if not shots:
+        return ("提示词格式不正确：未识别到 [SHOT_START]…[SHOT_END] 分段块。"
+                "穿透生成模式与重拍必须使用「拆解模式」拆解好的提示词（纯文本故事 / 手写草稿不能直接生成）。", 0)
+    noh3 = [i + 1 for i, s in enumerate(shots) if "===H3_PROMPT===" not in s]
+    if noh3:
+        return (f"提示词格式不正确：第 {', '.join(str(x) for x in noh3[:6])}{'…' if len(noh3) > 6 else ''} 段"
+                f"缺少 ===H3_PROMPT=== 六段提示词正文（不是「拆解模式」的输出）。", len(shots))
+    if not auto_count:
+        try:
+            want = int(video_count)
+        except Exception:
+            want = 0
+        if want and len(shots) != want:
+            return (f"提示词分段数与「生成视频数量」不一致：剧本实际 {len(shots)} 段，节点选了「生成{want}段」。"
+                    f"请把「生成视频数量」改为「剧情决定」，或改选与剧本段数一致的分段数。", len(shots))
+    miss = [i + 1 for i, s in enumerate(shots) if not re.search(r"\*\*(?:时长|Duration)\*\*\s*[:：]", s)]
+    if miss:
+        print(f"[JZL-{tag}] 提示：第 {', '.join(str(x) for x in miss[:6])}{'…' if len(miss) > 6 else ''} 段未写 "
+              f"**时长**/**Duration** 字段 → 该段按节点设定时长生成（用「拆解模式」产物才能逐段动态时长）")
+    return (None, len(shots))
+
+
+_SCRIPT_TAG_HINTS = (
+    (r'===H3_PROMPT===', "H3 六段提示词标记（===H3_PROMPT===）"),
+    (r'(?m)^\s*(?:subject_definitions|summary|retention_analysis|detailed_description|overall_soundscape|non_diegetic_music)\s*[:：]',
+     "六段字段（subject_definitions / detailed_description …）"),
+    (r'\[SHOT_START\]|\[SHOT_END\]', "分段块标记（[SHOT_START]…[SHOT_END]）"),
+    (r'===\s*(?:SCENE|VIDEO|AUDIO)_INSTRUCTION\s*===', "调度指令（===SCENE_INSTRUCTION=== …）"),
+    (r'(?m)^\s*###\s*Video_\d+', "分段标题（### Video_001）"),
+    (r'\*\*(?:时长|Duration)\*\*\s*[:：]', "分段信息字段（**时长** / **Duration**）"),
+)
+
+
+def _check_natural_language_input(text):
+    """故事拆解 / 故事扩写模式输入校验：必须是自然语言故事，不能是已拆解的提示词。
+
+    命中任一六段式/分段标签 → 返回错误描述；自然语言（无标签）→ None。
+    """
+    t = str(text or "")
+    if not t.strip():
+        return None
+    hits = [name for pat, name in _SCRIPT_TAG_HINTS if re.search(pat, t)]
+    if not hits:
+        return None
+    return ("提示词格式不正确：故事拆解模式与故事扩写必须使用自然语言提示词，不得包含 "
+            + "、".join(hits) + "。若要直接用已拆解的提示词生成视频，请改用「🪄 穿透生成模式」")
 
 
 # ── 生成核心：分段 / 编码 / 采样 / 解码 ──────────────────────
@@ -656,6 +750,7 @@ def _encode_ref_to_video(clip, vae, audio_vae, prompt, width, height, length,
 
 def _sample_av(model, positive, latent, sample_decode, seed):
     """MiniMax H3 采样：NestedTensor(视频+音频) → 去噪 latent。"""
+    _ensure_safe_attention(model)   # 50 系 + xformers：cutlass attention 不可用 → 自动回退 PyTorch SDPA
     steps = int(sample_decode.get("steps", 4) or 4)
     cfg = float(sample_decode.get("cfg", 1.0) or 1.0)
     denoise = float(sample_decode.get("denoise", 1.0) or 1.0)
@@ -905,6 +1000,87 @@ def _gpu_diag_hint():
         return ""
 
 
+def _attention_diag_hint(err_text=""):
+    """attention 后端（xformers）与显卡不兼容时的专项提示；不命中返回空串。"""
+    t = str(err_text or "")
+    low = t.lower()
+    if ("memory_efficient_attention" not in low) and ("xformers" not in low) and ("capability <= (9, 0)" not in t):
+        return ""
+    return ("\n  [JZL提示] attention 后端与显卡不兼容：xformers 的 cutlass attention 只编译到 sm90 及以下，"
+            "而你的 GPU 是 50 系（sm120）→ 该算子在 xformers 里不存在。三种解法（任一）：\n"
+            "    ① 工作流里若用了「Model Attention Backend」节点，把 backend 选为 \"pytorch attention\"（推荐）；\n"
+            "    ② 启动 ComfyUI 时加参数 --use-pytorch-cross-attention；\n"
+            "    ③ 卸载 xformers（pip uninstall xformers）。")
+
+
+def _ensure_safe_attention(model=None, tag="管理器"):
+    """Blackwell（sm100+）上 xformers 的 cutlass attention 不可用（只 <= sm90）→ 采样前自动回退 PyTorch SDPA。
+
+    只在检测到风险时生效；同进程内只打印一次（幂等）。返回 True 表示已回退。
+    """
+    try:
+        import torch as _t
+        if not _t.cuda.is_available():
+            return False
+        _major, _minor = _t.cuda.get_device_capability(0)
+    except Exception:
+        return False
+    if _major < 10:
+        return False
+    reverted = False
+    try:
+        from comfy.ldm.modules import attention as _attn
+        # 只在 attention 实际绑定为 xformers 时才回退（sage/flash 不受影响）
+        if getattr(getattr(_attn, "optimized_attention", None), "__name__", "") == "attention_xformers":
+            _attn.optimized_attention = _attn.attention_pytorch
+            _attn.optimized_attention_masked = _attn.attention_pytorch
+            reverted = True
+    except Exception:
+        pass
+    if reverted:
+        try:
+            import comfy.model_management as _mm
+            _mm.XFORMERS_IS_AVAILABLE = False
+        except Exception:
+            pass
+    if reverted and not getattr(_ensure_safe_attention, "_done", False):
+        _ensure_safe_attention._done = True
+        print(f"[JZL-{tag}] ⚠️ 检测到 xformers 在你的 GPU（sm{_major}{_minor}）上不受支持"
+              f"（xformers cutlass attention 仅支持 ≤ sm90）→ 采样已自动改用 PyTorch SDPA attention"
+              f"（本进程内生效，无需卸载 xformers）。")
+        print(f"[JZL-{tag}]    如仍有 attention 报错：① 把工作流「Model Attention Backend」节点改为 \"pytorch attention\"；"
+              f"② 或用 --use-pytorch-cross-attention 启动；③ 或卸载 xformers。")
+    # 模型级 override（Model Attention Backend 节点）会盖过上述回退 → 单独提醒
+    try:
+        if model is not None:
+            _ov = ((getattr(model, "model_options", None) or {}).get("transformer_options") or {}).get("optimized_attention_override")
+            _nm = (getattr(_ov, "__name__", "") or "").lower()
+            if _ov is not None and ("kitchen" in _nm or "xformers" in _nm) and not getattr(_ensure_safe_attention, "_ov_warned", False):
+                _ensure_safe_attention._ov_warned = True
+                print(f"[JZL-{tag}] ⚠️ 检测到模型被「Model Attention Backend」节点强制指定了 attention 后端（{_nm or 'custom'}）："
+                      f"它会覆盖本节点的自动回退 → 请把该节点 backend 改为 \"pytorch attention\"。")
+    except Exception:
+        pass
+    return reverted
+
+
+_JZL_SEG_ERR_SEEN = {}
+
+
+def _log_seg_error(tag, idx, err):
+    """分段失败日志：同一原因只详列一次（避免多段重复刷屏）。"""
+    try:
+        key = f"{tag}|{str(err)[:180]}"
+        prev = _JZL_SEG_ERR_SEEN.get(key)
+        if prev is not None:
+            print(f"[JZL-{tag}] 第{idx}段生成失败（与第 {prev} 段相同原因，不再重复打印）：{str(err).splitlines()[0][:200]}")
+        else:
+            _JZL_SEG_ERR_SEEN[key] = idx
+            print(f"[JZL-{tag}] 第{idx}段生成失败：{err}")
+    except Exception:
+        print(f"[JZL-{tag}] 第{idx}段生成失败：{err}")
+
+
 def _decode_av(vae, audio_vae, samples, sample_decode=None):
     """NestedTensor latent → (IMAGE [T,H,W,C], AUDIO dict|None)。
 
@@ -1102,6 +1278,79 @@ def _seam_runway_seconds(window, settle, enabled=True):
     if not enabled:
         return 0.0
     return (int(window) + int(settle)) / float(VIDEO_FPS or 24)
+
+
+# ♾️ 接缝亮度匹配（只做亮度）
+# 依据官方 Director（ComfyUI_MiniMaxH3_Director/director/segment_continuity.py）**实测保留下来**的那一种做法：
+#   · 乘法增益（gain）→ 局部对比被压 → 「画面花」；官方已关（CONTINUITY_SEAM_SOFTEN_* = 0）
+#   · 开口处做长 RGB 混合 / 亮度渐变 → post-seam brightness pump「一闪一闪」；官方已关（OPENING_LUMA_BLEND = 0）
+#   · 低频谱亮度空间场（opening Y-map）也被官方关掉（权重 0）
+#   · 只剩「**全局加性亮度渐入**」：每帧加同一个 delta(R=G=B)、单帧限幅、逐帧从「上段末帧亮度」过渡到
+#     「本段自身亮度」 → 保留局部对比、不复制轮廓（不重影）。官方常量：12 帧 / 上限 0.10 / 触发阈值 0.008。
+SEAM_LUMA_FRAMES = 12        # 亮度过渡帧数（官方 CONTINUITY_SEAM_ADD_LUMA_FRAMES）
+SEAM_LUMA_MAX_DELTA = 0.10   # 单帧最大加减亮度（0..1 单位；官方 CONTINUITY_SEAM_ADD_LUMA_MAX）
+SEAM_LUMA_EPS = 0.008        # 触发阈值（官方 CONTINUITY_OPENING_EXPOSURE_SPIKE）：三项差都小于它就不动画面
+
+
+def _seam_frame_luma(frame):
+    """一帧的 Rec.601 平均亮度（0..1）——与官方 `_additive_opening_luma` 同一套系数。"""
+    f = frame.float()
+    return float((f[..., 0] * 0.299 + f[..., 1] * 0.587 + f[..., 2] * 0.114).mean().item())
+
+
+def _seam_luma_ramp(image, prev_luma, frames=SEAM_LUMA_FRAMES, max_delta=SEAM_LUMA_MAX_DELTA, inplace=True):
+    """接缝亮度匹配：把本段开头若干帧的平均亮度朝「上一段末帧亮度」平滑过渡（**只动亮度**）。
+
+    为什么需要（我们此前完全空白的维度）：段首衔接帧被裁掉后，本段第一个画面是模型新生成的内容，
+    其整体曝光/环境光与上一段末帧可能差一截（尤其灯光/昼夜/室内外切换的段边界）→ 接缝处亮度一跳。
+
+    做法（严格对齐官方保留实现）：
+      · y_start = 上段末帧亮度；y_end = 本段第 n 帧自身亮度（n = min(12, 段长−1)）
+      · 第 i 帧 target = y_start*(1−t) + y_end*t（t = i/n）→ delta = clamp(target − 当前帧亮度, ±max_delta)
+      · 三通道加同一个 delta（加性，不做乘法增益）→ 保留局部对比，clamp 到 0..1
+      · 三项差（接缝差 / 开头两帧跳变 / 首尾差）都 < SEAM_LUMA_EPS 时**完全不动作**（画面零改动）
+
+    默认 inplace（不 clone）：一段 124 帧 × 768×1344×3 的 float32 约 1.5GB，二采放大后更大，
+    clone 会让单段显存峰值翻倍；这里只对每帧做一次「当帧临时张量 + 原地赋值」，峰值 = 1 帧。
+    返回 (image, applied, info)。
+    """
+    if image is None or not hasattr(image, "shape") or len(getattr(image, "shape", ())) != 4:
+        return image, False, {}
+    if prev_luma is None or float(max_delta) <= 0:
+        return image, False, {}
+    total = int(image.shape[0])
+    if total < 3:
+        return image, False, {}
+    n = min(int(frames), total - 1)
+    if n < 2:
+        return image, False, {}
+
+    y_start = float(prev_luma)
+    y0 = _seam_frame_luma(image[0])
+    y1 = _seam_frame_luma(image[1])
+    y2 = _seam_frame_luma(image[2])
+    y_end = _seam_frame_luma(image[n])
+    info = {"frames": int(n), "y_start": y_start, "y0": y0, "y_end": y_end,
+            "seam_gap": abs(y0 - y_start), "spike": abs(y1 - y0) + abs(y2 - y1),
+            "max_delta": float(max_delta)}
+    if (info["seam_gap"] < SEAM_LUMA_EPS and info["spike"] < SEAM_LUMA_EPS
+            and abs(y_end - y_start) < SEAM_LUMA_EPS):
+        info["applied"] = False
+        return image, False, info
+
+    out = image if inplace else image.clone()
+    dtype = out.dtype
+    with torch.no_grad():
+        for i in range(n):
+            t = float(i) / float(n)
+            target = y_start * (1.0 - t) + y_end * t
+            cur = _seam_frame_luma(out[i])
+            delta = max(-float(max_delta), min(float(max_delta), target - cur))
+            if abs(delta) < 1e-5:
+                continue
+            out[i] = (out[i].float() + delta).clamp(0.0, 1.0).to(dtype=dtype)
+    info["applied"] = True
+    return out, True, info
 
 
 def _seam_guide_from_pixels(prev_latent, plan, vae):
@@ -1671,26 +1920,31 @@ def _resolve_gen_size(aspect_ratio, megapixels):
 
 
 def _seg_len_for(raw, duration):
-    """本段视频帧长：优先读分段块里「**时长**: N」元数据（秒）→ 17k+5 对齐帧数；
+    """本段视频帧长：优先读分段块里「**时长**: N」（英文块为「**Duration**: N」）元数据（秒）→ 17k+5 对齐帧数；
     无该元数据（直通/纯文本单段）回退统一 duration。区间化后各段时长各异，靠它逐段生效。"""
-    m = re.search(r"\*\*时长\*\*\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)", raw or "")
+    m = re.search(r"\*\*(?:时长|Duration)\*\*\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)", raw or "")
     sec = float(m.group(1)) if m else float(duration or 8)
     sec = max(4.0, min(15.0, sec))
     return _resolve_length(sec)
 
 
 def _parse_duration_spec(duration):
-    """时长设置解析：int/float 或 '5'/'5-5'/'4-10' → (lo, hi, desc)。"""
-    v = duration if duration is not None else 8
-    _t = str(v).strip()
-    _r = re.search(r'^\s*(\d+(?:\.\d+)?)\s*[~\-—]\s*(\d+(?:\.\d+)?)\s*$', _t)
-    if _r:
-        lo = float(_r.group(1)); hi = float(_r.group(2))
-    else:
+    """时长解析：支持新选项「固定N秒」/「A~B秒」，并兼容旧值（8 / '5' / '5-5' / '4-10' / '4~10'）→ (lo, hi, desc)。
+    lo==hi 为固定秒数；lo<hi 为区间（拆解时每段按剧情弧线在区间内取实际秒数）。"""
+    _t = str(duration if duration is not None else SEGMENT_DURATION_DEFAULT).strip()
+    lo = hi = None
+    _fx = re.search(r'固定\s*(\d+(?:\.\d+)?)\s*秒', _t)
+    if _fx:
+        lo = hi = float(_fx.group(1))
+    if lo is None:
+        _rg = re.search(r'(\d+(?:\.\d+)?)\s*[~\-—–－]\s*(\d+(?:\.\d+)?)', _t)
+        if _rg:
+            lo = float(_rg.group(1)); hi = float(_rg.group(2))
+    if lo is None:
         try:
             _x = float(_t); lo = _x; hi = _x
         except Exception:
-            lo = 8; hi = 8
+            lo = 8.0; hi = 8.0
     lo = max(4.0, min(15.0, lo)); hi = max(lo, min(15.0, hi))
     if lo > hi:
         lo, hi = hi, lo
@@ -1881,9 +2135,9 @@ def _normalize_scene_slots(script_text, slot_to_asset):
         slots = d.get("slots")
         if not isinstance(slots, list):
             return block
-        # 顶部「**场景**: 」字段（与每段标题/场景元数据对齐，最可靠）；回退 subject_definitions 描述
+        # 顶部「**场景**: 」字段（英文块为「**Scene**: 」，与每段标题/场景元数据对齐，最可靠）；回退 subject_definitions 描述
         top_scenes = []
-        m_top = re.search(r'^\*\*场景\*\*\s*[:：]\s*(.+)$', block, re.M)
+        m_top = re.search(r'^\*\*(?:场景|Scene)\*\*\s*[:：]\s*(.+)$', block, re.M)
         if m_top:
             top_scenes = [x.strip() for x in re.split(r'[,，、/;；]', m_top.group(1)) if x.strip()]
         # subject_definitions: <Subject N> 是 <Picture M> 中的{描述}
@@ -1965,7 +2219,7 @@ def _prune_fantasy_assets(script_text, slot_to_asset):
 
     def _keep(item):
         item = (item or "").strip()
-        if not item or item == "无":
+        if not item or item in ("无", "none", "None", "NONE", "n/a", "N/A", "NA", "-", "—"):
             return True
         if ":" in item:
             _t, v = item.split(":", 1)
@@ -1973,12 +2227,15 @@ def _prune_fantasy_assets(script_text, slot_to_asset):
         return any(_match_asset(nm, item) for nm in known_names)
 
     def _fix_fields(block):
+        _en = bool(re.search(r'\*\*(?:Title|Duration|Shot Size|Camera Movement|Mood & Lighting)\*\*', block))
+        _empty, _sep = ("none", ", ") if _en else ("无", "、")
+
         def _repl(m):
             key = m.group(1).strip()
             items = [x.strip() for x in re.split(r'[,，、/;；]', m.group(2)) if x.strip()]
             kept = [x for x in items if _keep(x)]
-            return f"**{key}**: " + ("、".join(kept) if kept else "无")
-        return re.sub(r'^\*\*((?:角色|场景|道具|视频|音频|音效|音乐|其他))\*\*\s*[:：]\s*(.+)$',
+            return f"**{key}**: " + (_sep.join(kept) if kept else _empty)
+        return re.sub(r'^\*\*((?:角色|场景|道具|视频|音频|音效|音乐|其他|Characters|Scene|Props|Video|Audio|Sound|Music|Other))\*\*\s*[:：]\s*(.+)$',
                       _repl, block, flags=re.M)
 
     def _fix_slots(raw):
@@ -2250,15 +2507,18 @@ def _run_script_processor(story, manager, video_count, story_style, story_name, 
     enhance = manager.get("enhance") or {}
     is_api = "api" in str(enhance.get("llm_backend", ""))
     custom_config, parameters = _llm_local_config(enhance)
-    count = max(1, min(48, int(video_count or 6)))
+    _vc_auto = bool(manager.get("_jzl_auto_count"))
+    _vc_mode, _vc_n = _parse_video_count(video_count)
+    count = _vc_n if _vc_n else VIDEO_COUNT_FALLBACK
+    if _vc_mode == "auto":
+        _vc_auto = True
 
     # 本地后端未选模型：直接给出友好错误（官方 ScriptProcessor 内部不校验空模型，会尝试加载而崩）
     if not is_api and not (custom_config.get("model") or "").strip():
         return story, "[错误] 未选择本地 LLM 模型（请在「文本增强设置」里配置）"
 
-    # video_count → 精确分段数：直接传数字字符串（剧本处理器按数字精确解析，支持 1-24 任意值，
-    # 不再就近取 4/6/9/12/16/20/24——否则 video_count=1/2/3 会被错误映射成 4 段）
-    seg_label = str(count)
+    # video_count → 精确分段数（数字字符串）；「剧情决定」→ 传特殊标签，由 LLM 按剧情时间线长度自动定段数
+    seg_label = "剧情决定" if _vc_auto else str(count)
 
     # 自定义规则：管理器「系统提示词」直接喂给官方 ScriptProcessor 的 custom_rule_path（支持纯文本）
     custom_rule_text = (enhance.get("system_prompt") or "").strip()
@@ -2266,7 +2526,7 @@ def _run_script_processor(story, manager, video_count, story_style, story_name, 
     enhance_enabled = bool(enhance.get("enabled", False))
     script_force_offload = bool(enhance.get("force_offload", False)) and not enhance_enabled
 
-    print(f"[JZL-剧本] 直接调用 JZL_MiniMax_ScriptProcessor | 模式={mode} | 分段={count}段 | "
+    print(f"[JZL-剧本] 直接调用 JZL_MiniMax_ScriptProcessor | 模式={mode} | 分段={'剧情决定' if _vc_auto else str(count) + '段'} | "
           f"风格「{story_style}」 | 故事「{story_name or ''}」 | 后端={'API' if is_api else '本地'} | 增强={'开' if enhance_enabled else '关'}")
     script_output, _bus = JZL_MiniMax_ScriptProcessor().execute(
         mode=mode,
@@ -2548,14 +2808,14 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                     display_name="画幅比例", tooltip="画幅比例（分辨率按 MP×1024² 公式自动计算，对齐倍数固定 32）"),
                 io.Float.Input("megapixels", display_name="百万像素（MP）", default=0.4, min=0.1, max=16.0, step=0.1,
                     tooltip="总像素数（MP），画幅×MP 决定分辨率"),
-                io.String.Input("duration", display_name="每段视频时长(秒,可区间)", default="5-5",
-                    tooltip="每段视频时长（秒），等同「剧本与镜头处理器」的每段视频时长(秒)"),
+                io.Combo.Input("duration", options=list(SEGMENT_DURATION_CHOICES), default=SEGMENT_DURATION_DEFAULT,
+                    display_name="每段视频时长", tooltip="每段视频时长（秒）：固定 4~15 秒 或 区间（区间时 LLM 按剧情弧线给每段实际秒数）；等同「剧本与镜头处理器」的每段视频时长"),
                 io.Float.Input("scale_factor", display_name="参考数值放大", default=1.0, min=1.0, max=5.0, step=0.1,
                     tooltip="参考图放大系数"),
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.05,
                     tooltip="二采（Ref2va）放大倍数"),
-                io.Int.Input("video_count", display_name="生成视频数量", default=1, min=1, max=48,
-                    tooltip="生成视频数量（分段数，支持 1~48 任意值；统一控制：提示词拆解段数 / 分发列表数 / 采样数 / 分段保存数）"),
+                io.Combo.Input("video_count", options=list(VIDEO_COUNT_CHOICES), default=VIDEO_COUNT_DEFAULT,
+                    display_name="生成视频数量", tooltip="生成视频数量：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数（优先用足每段时长、防短剧情生成超多段）；也可固定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段（统一控制：提示词拆解段数 / 分发列表数 / 采样数 / 分段保存数）"),
                 # ③提示词：剧本处理器参数（主界面显示）
                 io.Combo.Input("story_style", options=story_styles, default=story_styles[0],
                     display_name="故事风格", tooltip="故事风格（剧本处理器按此风格拆解与润色）"),
@@ -2606,12 +2866,14 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
             return "no-manager"
 
     @classmethod
-    def execute(cls, run_mode="拆解故事模式", video_count=6, aspect_ratio="16:9 (Widescreen)",
+    def execute(cls, run_mode="拆解故事模式", video_count=VIDEO_COUNT_DEFAULT, aspect_ratio="16:9 (Widescreen)",
                 megapixels=1.0, duration="5-5", scale_factor=1.0, upscale_scale=1.5, display_info="",
                 story_style="热血战斗", story_name="",
                 external_prompt=None,
                 internal_prompt=None, manager_settings="",
                 clip=None, vae=None, audio_vae=None, model=None) -> io.NodeOutput:
+        _vc_auto = _parse_video_count(video_count)[0] == "auto"   # 「剧情决定」标记（manager 建后写入）
+        video_count = _vc_count(video_count)     # 「剧情决定」→ 占位 6（拆解后按实际分段数覆盖）
         run_mode = _normalize_run_mode(run_mode)
         pure_prompt = run_mode == "仅提示词输出"
         expand_mode = run_mode == "故事扩写模式"
@@ -2630,6 +2892,7 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
 
         # 节点独立配置：工作流内保存的 manager_settings 优先；空则回退全局（旧工作流兼容）
         manager = _parse_node_manager_settings(manager_settings)
+        manager["_jzl_auto_count"] = _vc_auto          # 「剧情决定」标记（供 _run_script_processor/日志用）
         duration_lo, duration_hi, duration_desc = _parse_duration_spec(duration)
         enhance = manager.get("enhance") or {}
         assets_cfg = manager.get("assets") or {}
@@ -2662,7 +2925,8 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
             "（穿透生成模式：跳过LLM拆解/增强，直接用提示词生成）" if passthrough else (
             "（故事拆解模式→生成）" if run_mode == "故事拆解模式" else "（故事扩写模式→生成）")))
         print(f"[JZL-管理器] 运行模式={run_mode} | LLM种子={llm_seed}({seed_control}) | "
-              f"采样种子模式={sample_decode.get('seed_mode', 'randomize')} | 共{max(1, min(48, int(video_count or 6)))}段{_mode_hint}")
+              f"采样种子模式={sample_decode.get('seed_mode', 'randomize')} | 共"
+              f"{'剧情决定' if manager.get('_jzl_auto_count') else str(_vc_count(video_count)) + ' 段'}{_mode_hint}")
 
         # 故事扩写模式：只按「故事风格 + 扩写字数」把故事扩写为丰满正文，不拆解；
         # 纯文本经「已处理剧本」端口输出 + 落盘；无需 model/clip/vae/audio_vae。
@@ -2697,10 +2961,11 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 _llm_finish(enhance)
                 # 图像/音频用 [None] 占位（不输出空列表，避免下游 slice_dict 崩溃）；剧本文本正常
                 return io.NodeOutput([None], [None], "")
-            _pcount = max(1, min(48, int(video_count)))
+            _pcount = _vc_count(video_count)
             ri, rv, ra, _ = _build_asset_intro(assets_cfg)
             _pe, _pp, _pv, _pa = _detect_enables(prompt_input, assets_cfg)
-            print(f"[JZL-管理器] 仅提示词输出：按「拆解模式(Decompose)」拆解为 {_pcount} 段 + 增强（纯文本，不生成视频）")
+            print(f"[JZL-管理器] 仅提示词输出：按「拆解模式(Decompose)」拆解为 "
+                  f"{'剧情决定' if manager.get('_jzl_auto_count') else str(_pcount) + ' 段'} + 增强（纯文本，不生成视频）")
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             processed, p_err = _run_script_processor(
@@ -2734,7 +2999,7 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
 
         width, height = _resolve_gen_size(aspect_ratio, megapixels)
         length = _resolve_length(duration_hi)
-        count = max(1, min(48, int(video_count)))
+        count = video_count
 
 
         # ── ③提示词：资产介绍 + 启用判断 + 槽位映射（供调度匹配）──
@@ -2743,6 +3008,14 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
         enable_scene, enable_props, enable_video, enable_audio = _detect_enables(prompt_input, assets_cfg)
 
         # ① 故事拆解（剧本处理器）：故事 → 分段（输入已是分段文本时跳过；直通模式跳过 LLM）
+        # 故事拆解 / 故事扩写：输入必须是自然语言故事；含六段式标签（已拆解提示词）→ 报错终止
+        if run_mode in ("故事拆解模式", "故事扩写模式"):
+            _nl_err = _check_natural_language_input(prompt_input)
+            if _nl_err:
+                print(f"[JZL-管理器] ❌ {_nl_err}（已终止）")
+                return io.NodeOutput([None], [None], prompt_input or "",
+                                     block_execution=f"❌ {_nl_err}",
+                                     ui={"manager_error": _nl_err})
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         # 每次运行归入一个新批次：output/jzl/{故事名}/第NNNNN次生成/（拆解+增强共用同一批次）
         gen_dir = None
@@ -2770,9 +3043,16 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 print(f"[JZL-管理器] LLM/API 出错，终止生成：{err}")
                 return io.NodeOutput([None], [None], prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
 
-        # 直通模式：无 [SHOT_START] 块 → 整段提示词当单段生成（不用 video_count 复制）
-        if passthrough and not has_shots:
-            count = 1
+        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        if passthrough:
+            _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
+                                                      auto_count=bool(manager.get("_jzl_auto_count")), tag="管理器")
+            if _pt_err:
+                print(f"[JZL-管理器] ❌ {_pt_err}（已终止）")
+                return io.NodeOutput([None], [None], prompt_input or "",
+                                     block_execution=f"❌ {_pt_err}",
+                                     ui={"manager_error": _pt_err})
+            count = _pt_n          # 以剧本实际分段数为准（避免多生成空占位段）
 
         # 调度指令规范化：LLM 可能把 slots 写成素材名（角色:兔子），用槽位映射反查纠正为槽位名（角色:角色A），
         # 保证下游调度严格按「类型:槽位名」匹配（对齐官方设定词「严禁写素材名」）
@@ -2795,6 +3075,8 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
 
         # ── 分段（融合分段处理中心）：按 [SHOT_START] 块切分 ──
         shots = re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', prompt_input or "", re.DOTALL)
+        if manager.get("_jzl_auto_count") and shots:
+            count = max(1, min(SEGMENT_COUNT_MAX, len(shots)))   # 「剧情决定」：以实际拆解出的分段数为准
 
         base_seed = int(sample_decode.get("seed", 0) or 0)
         seed_mode = sample_decode.get("seed_mode", "randomize") or "randomize"
@@ -2861,6 +3143,8 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
             mode = "纯文本生成音视频-T2VA"
             if ref_videos or ref_images or ref_audios:
                 mode = "多参考生成音视频-REF2VA"
+            print(f"[JZL-管理器] 第 {i + 1} 段生成模式 = {mode}"
+                  f"（本段参考：图 {len(ref_images)} / 视频 {len(ref_videos)} / 音频 {len(ref_audios)}）")
 
             can_generate = clip is not None and vae is not None and model is not None
             if (ref_videos or ref_audios) and audio_vae is None:
@@ -2937,7 +3221,11 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                     err += (f"\n  [JZL提示] CUDA 运行时错误（非内核不匹配），诊断：{_gpu_diag_hint()}\n"
                             f"  可能原因：驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、或某算子非法参数（如 attention 后端/参考张量）。"
                             f"完整堆栈已打印到上方日志，请按其定位。")
+                _attn_hint = _attention_diag_hint(err)
+                if _attn_hint:
+                    err += _attn_hint
                 errors.append(f"第{i + 1}段生成失败：{err}")
+                _log_seg_error("管理器", i + 1, err)
                 bus_items.append({
                     "index": i, "mode": mode, "prompt": h3,
                     "has_image": False, "has_audio": False,
@@ -3073,14 +3361,14 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                     display_name="画幅比例", tooltip="画幅比例（分辨率按 MP×1024² 公式自动计算，对齐倍数固定 32）"),
                 io.Float.Input("megapixels", display_name="百万像素（MP）", default=0.4, min=0.1, max=16.0, step=0.1,
                     tooltip="总像素数（MP），画幅×MP 决定分辨率"),
-                io.String.Input("duration", display_name="每段视频时长(秒,可区间)", default="5-5",
-                    tooltip="每段视频时长（秒），等同「剧本与镜头处理器」的每段视频时长(秒)"),
+                io.Combo.Input("duration", options=list(SEGMENT_DURATION_CHOICES), default=SEGMENT_DURATION_DEFAULT,
+                    display_name="每段视频时长", tooltip="每段视频时长（秒）：固定 4~15 秒 或 区间（区间时 LLM 按剧情弧线给每段实际秒数）；等同「剧本与镜头处理器」的每段视频时长"),
                 io.Float.Input("scale_factor", display_name="参考数值放大", default=1.0, min=1.0, max=5.0, step=0.1,
                     tooltip="参考图放大系数"),
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.05,
                     tooltip="二采（Ref2va）放大倍数"),
-                io.Int.Input("video_count", display_name="生成视频数量", default=1, min=1, max=48,
-                    tooltip="生成视频数量（分段数，支持 1~48 任意值；逐段即时落盘，段数再多也不叠加内存）"),
+                io.Combo.Input("video_count", options=list(VIDEO_COUNT_CHOICES), default=VIDEO_COUNT_DEFAULT,
+                    display_name="生成视频数量", tooltip="生成视频数量：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数（优先用足每段时长、防短剧情生成超多段）；也可固定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段。逐段即时落盘，段数再多也不叠加内存"),
                 io.Combo.Input("story_style", options=story_styles, default=story_styles[0],
                     display_name="故事风格", tooltip="故事风格（剧本处理器按此风格拆解与润色）"),
                 io.String.Input("story_name", display_name="故事名称", default="机智罗",
@@ -3124,12 +3412,14 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
             return "no-manager"
 
     @classmethod
-    def execute(cls, run_mode="拆解故事模式", video_count=6, aspect_ratio="16:9 (Widescreen)",
+    def execute(cls, run_mode="拆解故事模式", video_count=VIDEO_COUNT_DEFAULT, aspect_ratio="16:9 (Widescreen)",
                 megapixels=1.0, duration="5-5", scale_factor=1.0, upscale_scale=1.5, display_info="",
                 story_style="热血战斗", story_name="",
                 external_prompt=None,
                 internal_prompt=None, manager_settings="",
                 clip=None, vae=None, audio_vae=None, model=None) -> io.NodeOutput:
+        _vc_auto = _parse_video_count(video_count)[0] == "auto"   # 「剧情决定」标记（manager 建后写入）
+        video_count = _vc_count(video_count)     # 「剧情决定」→ 占位 6（拆解后按实际分段数覆盖）
         """复刻 8888：LLM 拆解 → 逐段完整链路（调度+编码+一采+latent放大+二采+解码）→
         每段即时 ffmpeg 落盘 → 释放该段显存/内存 → 下一段。跑 N 段与跑 1 段硬件占用不叠加。"""
         run_mode = _normalize_run_mode(run_mode)
@@ -3146,6 +3436,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                                   ui={"manager_error": "必须填写「故事名称」后才能生成"})
 
         manager = _parse_node_manager_settings(manager_settings)
+        manager["_jzl_auto_count"] = _vc_auto          # 「剧情决定」标记（供 _run_script_processor/日志用）
         duration_lo, duration_hi, duration_desc = _parse_duration_spec(duration)
         enhance = manager.get("enhance") or {}
         assets_cfg = manager.get("assets") or {}
@@ -3169,7 +3460,8 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
         else:
             llm_seed = current_seed
         print(f"[JZL-Max] 运行模式={run_mode} | LLM种子={llm_seed}({seed_control}) | "
-              f"采样种子模式={sample_decode.get('seed_mode', 'randomize')} | 共{max(1, min(48, int(video_count or 6)))}段（逐段即时落盘）")
+              f"采样种子模式={sample_decode.get('seed_mode', 'randomize')} | 共"
+              f"{'剧情决定' if manager.get('_jzl_auto_count') else str(_vc_count(video_count)) + ' 段'}（逐段即时落盘）")
 
         # 故事扩写模式：只按「故事风格 + 扩写字数」扩写正文，不拆解；纯文本输出，不生成视频
         if expand_mode:
@@ -3201,7 +3493,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
             if not prompt_input:
                 _llm_finish(enhance)
                 return io.NodeOutput("")
-            _pcount = max(1, min(48, int(video_count)))
+            _pcount = _vc_count(video_count)
             ri, rv, ra, _ = _build_asset_intro(assets_cfg)
             _pe, _pp, _pv, _pa = _detect_enables(prompt_input, assets_cfg)
             print("[JZL-Max] 仅提示词输出：按「拆解模式(Decompose)」拆解 + 增强（纯文本，不生成视频）")
@@ -3234,12 +3526,19 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
 
         width, height = _resolve_gen_size(aspect_ratio, megapixels)
         length = _resolve_length(duration_hi)
-        count = max(1, min(48, int(video_count)))
+        count = video_count
 
         ref_image_intro, ref_video_intro, ref_audio_intro, slot_to_asset = _build_asset_intro(assets_cfg)
         JZL_SLOT_MAP.update(slot_to_asset)
         enable_scene, enable_props, enable_video, enable_audio = _detect_enables(prompt_input, assets_cfg)
 
+        # 故事拆解 / 故事扩写：输入必须是自然语言故事；含六段式标签（已拆解提示词）→ 报错终止
+        if run_mode in ("故事拆解模式", "故事扩写模式"):
+            _nl_err = _check_natural_language_input(prompt_input)
+            if _nl_err:
+                print(f"[JZL-Max] ❌ {_nl_err}（已终止）")
+                return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_nl_err}",
+                                     ui={"manager_error": _nl_err})
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         gen_dir = None
         if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
@@ -3265,8 +3564,15 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                 print(f"[JZL-Max] LLM/API 出错，终止生成：{err}")
                 return io.NodeOutput(prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
 
-        if passthrough and not has_shots:
-            count = 1
+        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        if passthrough:
+            _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
+                                                      auto_count=bool(manager.get("_jzl_auto_count")), tag="Max")
+            if _pt_err:
+                print(f"[JZL-Max] ❌ {_pt_err}（已终止）")
+                return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_pt_err}",
+                                     ui={"manager_error": _pt_err})
+            count = _pt_n
 
         prompt_input = _normalize_dispatch_slots(prompt_input, slot_to_asset)
         prompt_input = _normalize_scene_slots(prompt_input, slot_to_asset)
@@ -3280,6 +3586,8 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
 
         # ── 分段：按 [SHOT_START] 块切分（等同 8888 里「列表分发按编号」）──
         shots = re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', prompt_input or "", re.DOTALL)
+        if manager.get("_jzl_auto_count") and shots:
+            count = max(1, min(SEGMENT_COUNT_MAX, len(shots)))   # 「剧情决定」：以实际拆解出的分段数为准
         base_seed = int(sample_decode.get("seed", 0) or 0)
         seed_mode = sample_decode.get("seed_mode", "randomize") or "randomize"
 
@@ -3350,6 +3658,8 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                 errors.append(f"第{i + 1}段跳过：未连接 {_need}，仅完成剧本分段（未生成视频）")
                 continue
 
+            print(f"[JZL-Max] 第 {i + 1} 段生成模式 = {mode}"
+                  f"（本段参考：图 {len(ref_images)} / 视频 {len(ref_videos)} / 音频 {len(ref_audios)}）")
             print(f"[JZL-Max] ── 分段 {i + 1}/{count} 生成开始（{mode}，种子 {seed}）──")
             try:
                 # 编码（ref2va，复刻 8888 ReferenceToVideo2）
@@ -3402,8 +3712,11 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                     err += (f"\n  [JZL提示] CUDA 运行时错误（非内核不匹配），诊断：{_gpu_diag_hint()}\n"
                             f"  可能原因：驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、或某算子非法参数（如 attention 后端/参考张量）。"
                             f"完整堆栈已打印到上方日志，请按其定位。")
+                _attn_hint = _attention_diag_hint(err)
+                if _attn_hint:
+                    err += _attn_hint
                 errors.append(f"第{i + 1}段生成失败：{err}")
-                print(f"[JZL-Max] 第{i + 1}段生成失败：{err}")
+                _log_seg_error("Max", i + 1, err)
 
         # 采样种子回写：randomize 时把第 1 段实际种子回传前端
         if seed_mode == "randomize" and first_seed is not None:
@@ -3503,14 +3816,14 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                     display_name="画幅比例", tooltip="画幅比例（分辨率按 MP×1024² 公式自动计算，对齐倍数固定 32）"),
                 io.Float.Input("megapixels", display_name="百万像素（MP）", default=0.4, min=0.1, max=16.0, step=0.1,
                     tooltip="总像素数（MP），画幅×MP 决定分辨率"),
-                io.String.Input("duration", display_name="每段视频时长(秒,可区间)", default="5-5",
-                    tooltip="每段视频时长（秒），等同「剧本与镜头处理器」的每段视频时长(秒)。无限时长下每段会往后损失「衔接窗口」帧长（默认 22 帧≈0.92 秒，被下一段复用），总时长 = Σ段长 − 窗口×(段数−1)"),
+                io.Combo.Input("duration", options=list(SEGMENT_DURATION_CHOICES), default=SEGMENT_DURATION_DEFAULT,
+                    display_name="每段视频时长", tooltip="每段视频时长（秒）：固定 4~15 秒 或 区间。等同「剧本与镜头处理器」的每段视频时长。无限时长下每段会往后损失「衔接窗口」帧长（默认 22 帧≈0.92 秒，被下一段复用），总时长 = Σ段长 − 窗口×(段数−1)"),
                 io.Float.Input("scale_factor", display_name="参考数值放大", default=1.0, min=1.0, max=5.0, step=0.1,
                     tooltip="参考图放大系数"),
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.05,
                     tooltip="二采（Ref2va）放大倍数。开启二采不影响段间衔接：衔接恒用「一采 latent」，二采结果只用于解码落盘"),
-                io.Int.Input("video_count", display_name="生成视频数量", default=1, min=1, max=48,
-                    tooltip="段数（1~48）。1 段=普通单段生成（不启用衔接）；≥2 段=无限时长链路。逐段即时落盘，段数再多也不叠加内存"),
+                io.Combo.Input("video_count", options=list(VIDEO_COUNT_CHOICES), default=VIDEO_COUNT_DEFAULT,
+                    display_name="生成视频数量", tooltip="段数：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数；1 段=普通单段生成（不启用衔接）；≥2 段=无限时长链路。逐段即时落盘，段数再多也不叠加内存"),
                 io.Combo.Input("story_style", options=story_styles, default=story_styles[0],
                     display_name="故事风格", tooltip="故事风格（剧本处理器按此风格拆解与润色）"),
                 io.String.Input("story_name", display_name="故事名称", default="机智罗",
@@ -3554,12 +3867,14 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
             return "no-manager"
 
     @classmethod
-    def execute(cls, run_mode="拆解故事模式", video_count=6, aspect_ratio="16:9 (Widescreen)",
+    def execute(cls, run_mode="拆解故事模式", video_count=VIDEO_COUNT_DEFAULT, aspect_ratio="16:9 (Widescreen)",
                 megapixels=1.0, duration="5-5", scale_factor=1.0, upscale_scale=1.5, display_info="",
                 story_style="热血战斗", story_name="",
                 external_prompt=None,
                 internal_prompt=None, manager_settings="",
                 clip=None, vae=None, audio_vae=None, model=None) -> io.NodeOutput:
+        _vc_auto = _parse_video_count(video_count)[0] == "auto"   # 「剧情决定」标记（manager 建后写入）
+        video_count = _vc_count(video_count)     # 「剧情决定」→ 占位 6（拆解后按实际分段数覆盖）
         """无限时长：LLM 拆解（每段新剧情）→ 逐段【上段衔接引导 + 编码 + 一采 + 二采 + 解码】→
         每段即时落盘 → 裁掉段首被钉住的窗口帧 → 释放该段显存 → 下一段。跑 N 段与跑 1 段占用不叠加。"""
         run_mode = _normalize_run_mode(run_mode)
@@ -3575,6 +3890,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                                   ui={"manager_error": "必须填写「故事名称」后才能生成"})
 
         manager = _parse_node_manager_settings(manager_settings)
+        manager["_jzl_auto_count"] = _vc_auto          # 「剧情决定」标记（供 _run_script_processor/日志用）
         duration_lo, duration_hi, duration_desc = _parse_duration_spec(duration)
         enhance = manager.get("enhance") or {}
         assets_cfg = manager.get("assets") or {}
@@ -3610,13 +3926,18 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         # ⭐ 段首衔接跑道（秒）= (窗口 + 过渡) / 24：段 2+ 的**生成时长 = 设定时长 + 跑道**。
         #    段首这一段是「承接上一段末帧」的锁定画面 + 模型启动过渡，成片会整段裁掉 ⇒ 落盘时长精确 = 用户设定。
         #    单段（count=1）或诊断档「不裁切」时跑道 = 0（没有衔接就没有额外生成内容）。
-        _seg_count_probe = max(1, min(48, int(video_count or 6)))
+        _seg_count_probe = _vc_count(video_count)
         seam_runway_sec = _seam_runway_seconds(seam_window_cfg, seam_settle,
                                                enabled=(_seg_count_probe > 1 and seam_trim_mode != "none"))
         if seam_runway_sec > 0:
             print(f"[JZL-无限时长] 段首衔接跑道 = {seam_runway_sec:.3f} 秒"
                   f"（窗口 {seam_window_cfg} + 过渡 {seam_settle} = {seam_window_cfg + seam_settle} 帧 / 24fps）"
                   f"→ 第 2 段起生成时长 = 设定时长 + 跑道，成片裁掉跑道 ⇒ **落盘时长 = 设定时长**")
+        # ♾️ 接缝亮度匹配（只做亮度）：把每段开头若干帧的亮度朝上段末帧平滑过渡（加性、限幅）
+        # 缺省 = 开（与官方 Director 一致：该做法是他们试错后**保留**的那一种，只动亮度不动 RGB）
+        seam_luma_on = _seam_flag(_inf.get("luma_match"), True)
+        if seam_runway_sec > 0 and not seam_luma_on:
+            print("[JZL-无限时长] 接缝亮度匹配：已关闭（配置 luma_match=false）")
         _save_cfg = manager.get("save") or {}
         save_mode = (_save_cfg.get("mode") or "分段保存").strip() or "分段保存"
         auto_merge_delete = bool(_save_cfg.get("auto_merge_delete"))
@@ -3638,9 +3959,10 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                        "none": "不裁切（诊断）"}.get(seam_trim_mode, seam_trim_mode)
         print(f"[JZL-无限时长] 运行模式={run_mode} | LLM种子={llm_seed}({seed_control}) | "
               f"采样种子模式={sample_decode.get('seed_mode', 'randomize')} | "
-              f"共{max(1, min(48, int(video_count or 6)))}段 | 衔接窗口={seam_window_cfg}帧 | "
+              f"共{'剧情决定' if manager.get('_jzl_auto_count') else str(_vc_count(video_count)) + ' 段'} | 衔接窗口={seam_window_cfg}帧 | "
               f"引导来源={'上段尾帧→VAE重编码' if seam_guide_source == 'pixel' else '一采latent尾部'} | "
               f"裁切方式={_trim_label} | 过渡丢弃={seam_settle}帧 | "
+              f"接缝亮度匹配={'开' if (seam_luma_on and seam_runway_sec > 0) else '关'} | "
               f"音频衔接={'开' if seam_audio_link else '关'} | 音频同步裁剪={'开' if seam_trim_audio else '关'} | "
               f"二采引导={'上段二采latent尾部' if seam_second_guide == 'second' else '上段一采latent（插值到二采画布）'}"
               f"（逐段即时落盘）")
@@ -3675,7 +3997,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
             if not prompt_input:
                 _llm_finish(enhance)
                 return io.NodeOutput("")
-            _pcount = max(1, min(48, int(video_count)))
+            _pcount = _vc_count(video_count)
             ri, rv, ra, _ = _build_asset_intro(assets_cfg)
             _pe, _pp, _pv, _pa = _detect_enables(prompt_input, assets_cfg)
             print("[JZL-无限时长] 仅提示词输出：按「拆解模式(Decompose)」拆解 + 增强（纯文本，不生成视频）")
@@ -3707,12 +4029,19 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
 
         width, height = _resolve_gen_size(aspect_ratio, megapixels)
         length = _resolve_length(duration_hi)
-        count = max(1, min(48, int(video_count)))
+        count = video_count
 
         ref_image_intro, ref_video_intro, ref_audio_intro, slot_to_asset = _build_asset_intro(assets_cfg)
         JZL_SLOT_MAP.update(slot_to_asset)
         enable_scene, enable_props, enable_video, enable_audio = _detect_enables(prompt_input, assets_cfg)
 
+        # 故事拆解 / 故事扩写：输入必须是自然语言故事；含六段式标签（已拆解提示词）→ 报错终止
+        if run_mode in ("故事拆解模式", "故事扩写模式"):
+            _nl_err = _check_natural_language_input(prompt_input)
+            if _nl_err:
+                print(f"[JZL-无限时长] ❌ {_nl_err}（已终止）")
+                return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_nl_err}",
+                                     ui={"manager_error": _nl_err})
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         # ⭐ 衔接跑道：段 2+ 的「生成时长 = 设定时长 + 跑道」（段首跑道会被裁掉 ⇒ 落盘时长 = 设定时长）。
         #    `gen_duration_lo` = 生成时长下限（块内缺 **时长** 字段时的兜底，也按生成时长算）。
@@ -3745,8 +4074,15 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                 print(f"[JZL-无限时长] LLM/API 出错，终止生成：{err}")
                 return io.NodeOutput(prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
 
-        if passthrough and not has_shots:
-            count = 1
+        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        if passthrough:
+            _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
+                                                      auto_count=bool(manager.get("_jzl_auto_count")), tag="无限时长")
+            if _pt_err:
+                print(f"[JZL-无限时长] ❌ {_pt_err}（已终止）")
+                return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_pt_err}",
+                                     ui={"manager_error": _pt_err})
+            count = _pt_n
 
         prompt_input = _normalize_dispatch_slots(prompt_input, slot_to_asset)
         prompt_input = _normalize_scene_slots(prompt_input, slot_to_asset)
@@ -3760,6 +4096,8 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
 
         # ── 分段：按 [SHOT_START] 块切分（每段一个独立新提示词 → 剧情持续推进）──
         shots = re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', prompt_input or "", re.DOTALL)
+        if manager.get("_jzl_auto_count") and shots:
+            count = max(1, min(SEGMENT_COUNT_MAX, len(shots)))   # 「剧情决定」：以实际拆解出的分段数为准
         base_seed = int(sample_decode.get("seed", 0) or 0)
         seed_mode = sample_decode.get("seed_mode", "randomize") or "randomize"
 
@@ -3781,6 +4119,8 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         prev_latent = None
         # ♾️ 二采引导状态（仅 second 模式保留）：上段二采 latent 的**尾部切片**（CPU，只留配置窗口所需 token）
         prev_latent2 = None
+        # ♾️ 接缝亮度匹配参考：上一段**落盘后**末帧的平均亮度（只存一个标量，不占内存）
+        prev_luma = None
         seam_window_used = 0
         total_frames = 0
         for i in range(count):
@@ -3822,6 +4162,8 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
             mode = "纯文本生成音视频-T2VA"
             if ref_videos or ref_images or ref_audios:
                 mode = "多参考生成音视频-REF2VA"
+            print(f"[JZL-无限时长] 第 {i + 1} 段生成模式 = {mode}"
+                  f"（本段参考：图 {len(ref_images)} / 视频 {len(ref_videos)} / 音频 {len(ref_audios)}）")
             can_generate = clip is not None and vae is not None and model is not None
             if (ref_videos or ref_audios) and audio_vae is None:
                 can_generate = False
@@ -3980,6 +4322,19 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                               f"或「设定时长 + 跑道」超出单段上限 15 秒（已自动取窗口上限）")
                 total_frames += _frames
 
+                # ★ ♾️ 接缝亮度匹配（**只做亮度**）：把本段开头若干帧的平均亮度朝上一段末帧平滑过渡。
+                #   只做加性（R=G=B）、单帧限幅 ±0.10、前 12 帧渐入、三项差都 < 0.008 时零改动。
+                #   官方 Director 实测结论：乘法增益 / 长 RGB 混合 / 开口亮度渐变都出问题，只有这一种安全。
+                #   必须在落盘**之前**做（拼接是 -c copy，不会重编码）；诊断档「不裁切」时不动像素。
+                if (seam_luma_on and prev_luma is not None and seam_plan is not None
+                        and seam_trim_mode != "none" and image is not None):
+                    image, _luma_ok, _luma_info = _seam_luma_ramp(image, prev_luma)
+                    if _luma_ok:
+                        print(f"[JZL-无限时长] 分段 {i + 1}/{count} 接缝亮度匹配：上段末帧亮度 "
+                              f"{_luma_info['y_start']:.3f} → 本段 {_luma_info['frames']} 帧渐入到 "
+                              f"{_luma_info['y_end']:.3f}（接缝差 {_luma_info['seam_gap']:.3f}，"
+                              f"限幅 ±{_luma_info['max_delta']:.2f}、只动亮度）")
+
                 # ★ 每段解码完立即 ffmpeg 落盘（拼接保存时额外保留一份无損 WAV，供最后音频统一编码）
                 _wav_keep = None
                 if _merge_wavs is not None and audio is not None:
@@ -3995,6 +4350,12 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
 
                 # ★ 衔接源：本段一采 latent 转 CPU 留一份给下一段（二采不影响它）
                 prev_latent = first_samples.to("cpu") if hasattr(first_samples, "to") else first_samples
+                # ★ 接缝亮度匹配参考：只记「本段**落盘后**末帧的平均亮度」一个标量（零内存开销）
+                if image is not None and hasattr(image, "shape") and int(image.shape[0]) > 0:
+                    try:
+                        prev_luma = _seam_frame_luma(image[-1])
+                    except Exception:
+                        prev_luma = None
 
                 # ★ 释放该段全部显存/内存（跑 N 段与跑 1 段占用不叠加）
                 try:
@@ -4016,8 +4377,11 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                     err += (f"\n  [JZL提示] CUDA 运行时错误（非内核不匹配），诊断：{_gpu_diag_hint()}\n"
                             f"  可能原因：驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、或某算子非法参数"
                             f"（如 attention 后端/参考张量）。完整堆栈已打印到上方日志，请按其定位。")
+                _attn_hint = _attention_diag_hint(err)
+                if _attn_hint:
+                    err += _attn_hint
                 errors.append(f"第{i + 1}段生成失败：{err}")
-                print(f"[JZL-无限时长] 第{i + 1}段生成失败：{err}")
+                _log_seg_error("无限时长", i + 1, err)
 
         # 采样种子回写：randomize 时把第 1 段实际种子回传前端
         if seed_mode == "randomize" and first_seed is not None:
@@ -4113,12 +4477,12 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
                     display_name="画幅比例", tooltip="画幅比例（分辨率按 MP×1024² 公式自动计算，对齐倍数固定 32）"),
                 io.Float.Input("megapixels", display_name="百万像素（MP）", default=0.4, min=0.1, max=16.0, step=0.1,
                     tooltip="总像素数（MP），画幅×MP 决定分辨率"),
-                io.String.Input("duration", display_name="每段视频时长(秒,可区间)", default="5-5",
-                    tooltip="每段视频时长（秒）"),
+                io.Combo.Input("duration", options=list(SEGMENT_DURATION_CHOICES), default=SEGMENT_DURATION_DEFAULT,
+                    display_name="每段视频时长", tooltip="每段视频时长（秒）：固定 4~15 秒 或 区间"),
                 io.Float.Input("scale_factor", display_name="参考数值放大", default=1.0, min=1.0, max=5.0, step=0.1,
                     tooltip="参考图放大系数"),
-                io.Int.Input("video_count", display_name="生成视频数量", default=1, min=1, max=48,
-                    tooltip="生成视频数量（分段数，支持 1~48 任意值；统一控制：提示词拆解段数）"),
+                io.Combo.Input("video_count", options=list(VIDEO_COUNT_CHOICES), default=VIDEO_COUNT_DEFAULT,
+                    display_name="生成视频数量", tooltip="生成视频数量：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数；也可固定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段（统一控制：提示词拆解段数）"),
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.05,
                     tooltip="二采（Ref2va）放大倍数，从「Latent放大参数」输出给下游二采放大节点"),
                 # ③提示词：剧本处理器参数（主界面显示）
@@ -4171,12 +4535,14 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
             return "no-manager"
 
     @classmethod
-    def execute(cls, run_mode="故事拆解模式", video_count=6, aspect_ratio="16:9 (Widescreen)",
+    def execute(cls, run_mode="故事拆解模式", video_count=VIDEO_COUNT_DEFAULT, aspect_ratio="16:9 (Widescreen)",
                 megapixels=1.0, duration="5-5", scale_factor=1.0, display_info="",
                 story_style="热血战斗", story_name="", upscale_scale=1.5,
                 external_prompt=None,
                 internal_prompt=None, manager_settings="",
                 clip=None, vae=None, audio_vae=None, model=None) -> io.NodeOutput:
+        _vc_auto = _parse_video_count(video_count)[0] == "auto"   # 「剧情决定」标记（manager 建后写入）
+        video_count = _vc_count(video_count)     # 「剧情决定」→ 占位 6（拆解后按实际分段数覆盖）
         run_mode = _normalize_run_mode(run_mode)
         pure_prompt = run_mode == "仅提示词输出"
         expand_mode = run_mode == "故事扩写模式"
@@ -4196,6 +4562,7 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
                                  ui={"manager_error": "必须填写「故事名称」后才能生成"})
 
         manager = _parse_node_manager_settings(manager_settings)
+        manager["_jzl_auto_count"] = _vc_auto          # 「剧情决定」标记（供 _run_script_processor/日志用）
         duration_lo, duration_hi, duration_desc = _parse_duration_spec(duration)
         enhance = manager.get("enhance") or {}
         assets_cfg = manager.get("assets") or {}
@@ -4214,7 +4581,8 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
             llm_seed = int(torch.randint(0, 0x7fffffffffffffff, (1,)).item())
         else:
             llm_seed = current_seed
-        print(f"[JZL-Mini] 运行模式={run_mode} | LLM种子={llm_seed}({seed_control}) | 共{max(1, min(48, int(video_count or 6)))}段")
+        print(f"[JZL-Mini] 运行模式={run_mode} | LLM种子={llm_seed}({seed_control}) | 共"
+              f"{'剧情决定' if manager.get('_jzl_auto_count') else str(_vc_count(video_count)) + ' 段'}")
 
         # ── 纯文本模式提前返回（不编码/不生成，直接经「已拆解剧本」端口输出文本）──
         # 故事扩写模式：只扩写正文；仅提示词输出：拆解+增强。
@@ -4240,7 +4608,7 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
                     gen_dir=gen_dir)
             else:
                 print(f"[JZL-Mini] 仅提示词输出：按「拆解模式(Decompose)」拆解 + 增强（纯文本，不编码）")
-                _pcount = max(1, min(48, int(video_count)))
+                _pcount = _vc_count(video_count)
                 processed, err = _run_script_processor(
                     prompt_input, manager, _pcount, story_style, story_name, duration, prompt_lang, llm_seed,
                     ref_image_intro=ri, ref_video_intro=rv, ref_audio_intro=ra,
@@ -4268,12 +4636,20 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
 
         width, height = _resolve_gen_size(aspect_ratio, megapixels)
         length = _resolve_length(duration_hi)
-        count = max(1, min(48, int(video_count)))
+        count = video_count
 
         ref_image_intro, ref_video_intro, ref_audio_intro, slot_to_asset = _build_asset_intro(assets_cfg)
         JZL_SLOT_MAP.update(slot_to_asset)
         enable_scene, enable_props, enable_video, enable_audio = _detect_enables(prompt_input, assets_cfg)
 
+        # 故事拆解 / 故事扩写：输入必须是自然语言故事；含六段式标签（已拆解提示词）→ 报错终止
+        if run_mode in ("故事拆解模式", "故事扩写模式"):
+            _nl_err = _check_natural_language_input(prompt_input)
+            if _nl_err:
+                print(f"[JZL-Mini] ❌ {_nl_err}（已终止）")
+                return io.NodeOutput(model, vae, audio_vae, upscale_scale, [None], [None], prompt_input or "",
+                                     block_execution=f"❌ {_nl_err}",
+                                     ui={"manager_error": _nl_err})
         # ① 故事拆解（剧本处理器）
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         gen_dir = None
@@ -4303,8 +4679,16 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
                 return io.NodeOutput(model, vae, audio_vae, upscale_scale, [None], [None], prompt_input or "",
                                      block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
 
-        if passthrough and not has_shots:
-            count = 1
+        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        if passthrough:
+            _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
+                                                      auto_count=bool(manager.get("_jzl_auto_count")), tag="Mini")
+            if _pt_err:
+                print(f"[JZL-Mini] ❌ {_pt_err}（已终止）")
+                return io.NodeOutput(model, vae, audio_vae, upscale_scale, [None], [None], prompt_input or "",
+                                     block_execution=f"❌ {_pt_err}",
+                                     ui={"manager_error": _pt_err})
+            count = _pt_n
 
         # 调度指令规范化 + 场景槽位校正 + 幻想素材清理（与 Pro 一致）
         prompt_input = _normalize_dispatch_slots(prompt_input, slot_to_asset)
@@ -4320,6 +4704,8 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
 
         # ── 分段 + 全部段编码（列表输出，方便多段视频生成）──
         shots = re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', prompt_input or "", re.DOTALL)
+        if manager.get("_jzl_auto_count") and shots:
+            count = max(1, min(SEGMENT_COUNT_MAX, len(shots)))   # 「剧情决定」：以实际拆解出的分段数为准
         if not shots and prompt_input and prompt_input.strip():
             shots = [prompt_input.strip()]
 

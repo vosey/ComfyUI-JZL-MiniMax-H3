@@ -13,6 +13,7 @@ import re
 # ═══════════════════════════════════════════════════════════════
 
 STORY_STYLES = {
+    "禁用风格": ("中性基线：不套用任何风格侧重，纯按剧情与镜头语言偏好分配篇幅（见 styles/00-禁用风格.md）。"),
     "热血战斗": ("动作重心：招式/对抗/打击反馈占最大篇幅，忠于用户剧情（见 styles/01-热血战斗.md）。"),
     "悬疑惊悚": ("悬念重心：信息差/伏笔/压迫感放大，忠于用户剧情（见 styles/02-悬疑惊悚.md）。"),
     "温馨日常": ("情感重心：微动作/表情/语气/留白为镜头中心，忠于用户剧情（见 styles/03-温馨日常.md）。"),
@@ -38,31 +39,40 @@ SEGMENT_COUNT_OPTIONS = {
 }
 
 
-def _resolve_segment_count(label):
-    """分段数解析：标准标签（「6段」）→ SEGMENT_COUNT_OPTIONS；数字字符串（「6」/「1」）→ 精确整数；否则 4。
+SEGMENT_COUNT_AUTO_LABEL = "剧情决定"
+SEGMENT_COUNT_MAX = 56
 
-    管理器把 video_count 的任意 1-48 精确传给剧本处理器（不限于 4/6/9/12/16/20/24）。
+
+def _resolve_segment_count(label):
+    """分段数解析：标准标签（「6段」）→ SEGMENT_COUNT_OPTIONS；数字字符串/数字 → 精确整数；
+    「剧情决定」→ None（由 LLM 按剧情时间线长度 ÷ 每段时长自动定段数）；其它 → 4。
     """
+    if isinstance(label, str) and label.strip() in (SEGMENT_COUNT_AUTO_LABEL, "自动", "auto"):
+        return None
     if isinstance(label, str) and label in SEGMENT_COUNT_OPTIONS:
         return SEGMENT_COUNT_OPTIONS[label]
     if isinstance(label, str) and label.strip().isdigit():
-        return max(1, min(48, int(label.strip())))
+        return max(1, min(SEGMENT_COUNT_MAX, int(label.strip())))
     if isinstance(label, (int, float)):
-        return max(1, min(48, int(label)))
+        return max(1, min(SEGMENT_COUNT_MAX, int(label)))
     return 4
 def _parse_duration_spec(duration):
-    """时长设置解析：支持 int/float 或字符串 "5"/"5-5"/"5~5"/"4-10"。返回 (lo, hi, desc)。
-    lo==hi 表示每段固定该秒；lo<hi 为区间（拆解时每段按剧情弧线在区间内取值，写进各段 **时长**）。"""
-    v = duration if duration is not None else 8
-    s = str(v).strip()
-    m = re.search(r"^\s*(\d+(?:\.\d+)?)\s*[~\-—]\s*(\d+(?:\.\d+)?)\s*$", s)
+    """时长设置解析：支持新选项「固定N秒」/「A~B秒」，并兼容旧值（int/float 或 "5"/"5-5"/"4-10"/"4~10"）。
+    返回 (lo, hi, desc)。lo==hi 表示每段固定该秒；lo<hi 为区间（拆解时每段按剧情弧线在区间内取值，写进各段 **时长**）。"""
+    s = str(duration if duration is not None else 8).strip()
+    lo = hi = None
+    m = re.search(r"固定\s*(\d+(?:\.\d+)?)\s*秒", s)
     if m:
-        lo = float(m.group(1)); hi = float(m.group(2))
-    else:
+        lo = hi = float(m.group(1))
+    if lo is None:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*[~\-—–－]\s*(\d+(?:\.\d+)?)", s)
+        if m:
+            lo = float(m.group(1)); hi = float(m.group(2))
+    if lo is None:
         try:
             n = float(s); lo = n; hi = n
         except Exception:
-            lo = 8; hi = 8
+            lo = 8.0; hi = 8.0
     lo = max(4.0, min(15.0, lo)); hi = max(lo, min(15.0, hi))
     if lo > hi:
         lo, hi = hi, lo
@@ -130,7 +140,7 @@ def _duration_spec_with_runway(duration, seam_runway=0.0):
 
 SCRIPT_SKELETON_V2 = '''# Role: 顶级短视频编剧 & MiniMax H3 分段提示词工程师
 你是专业的短视频编剧和 MiniMax H3 视频提示词撰写专家。你的任务分两步：
-第一步：把用户故事按「情节」拆解为恰好 {Segment_Count} 个分段——每个分段是一段独立视频片段（时长见 B「限制框架」；区间设置时按剧情弧线给每段实际秒数，写进该段 **时长** 字段）。
+第一步：把用户故事按「情节」拆解为 {Segment_Count} 个分段（段数规则见 B「分段数」）——每个分段是一段独立视频片段（时长见 B「限制框架」；区间设置时按剧情弧线给每段实际秒数，写进该段 **时长** 字段）。
 第二步：把每个分段当成一段独立视频去润色，写出一条可直接送入 MiniMax H3 模型生成视频的完整提示词（六段 Ref2VA + 调度指令，格式见 D）。
 
 这是你的工作契约：A = 你拿到的材料（原材料，用于理解，不得修改）；B = 必须遵守的限制框架（硬约束）；C = 执行与审查流程（严格顺序）；D = 输出格式权威（严格遵循）。
@@ -153,10 +163,13 @@ SCRIPT_SKELETON_V2 = '''# Role: 顶级短视频编剧 & MiniMax H3 分段提示�
 
 ## B. 必须遵守的限制框架（硬约束；逐条核对，违反即失败）
 【任务】{Mode_Instruction}
-【分段数】恰好生成 {Segment_Count} 个分段；每段是一段独立视频片段（**每段的实际生成秒数见下方「时长设定」**，必须写进该段 **时长** 字段）。
+【分段数】{Segment_Count_Spec}
 
 【镜头语言偏好（景别/运镜/切镜/转场/音乐/字数，逐条执行）】
 {Preference_Block}
+
+【自定义润色规范（用户自定义规则，与偏好同等强制，逐条执行；无则忽略本块）】
+{Custom_Rules_Block}
 
 【全局节奏统筹（先按弧线给每段定实际秒数与 [Shot N] 数）】
 {Timing_Plan}
@@ -172,11 +185,18 @@ SCRIPT_SKELETON_V2 = '''# Role: 顶级短视频编剧 & MiniMax H3 分段提示�
    - <Subject N>/<Picture N>/<Video N>/<Audio N> 与 subject_definitions 一致，且与 SCENE/VIDEO/AUDIO_INSTRUCTION.slots 编号严格同源（slots[0]=<Picture 1>…）；
    - 角色/场景/道具 三字段只用素材声明的元素；slots 只写「类型:槽位名」，严禁自造/缩写/用素材名当槽位名；
    - 台词原样在 <d>（保留原语言）；无脑补台词/内心独白/语气词；
-   - 每段开头 0.8 秒内无任何 <d> 台词（第一句台词最早时间 ≥ 0.8 秒）；镜内台词时长与镜头时长匹配（按 4~5 字/秒 估算，放不下则拉长该镜或拆句 <scenetrans>）；
+   - 每段开头 **1 秒**内无任何 <d> 台词（第一句台词最早时间 ≥ 1 秒）；镜内台词时长与镜头时长匹配（按 4~5 字/秒 估算，放不下则拉长该镜或拆句 <scenetrans>）；
    - 每个 [Shot N] 时间戳落在该段时长内、[Shot 1] 无时间戳；
    - 每个 [Shot N] 都写明该镜景别+运镜，且段内不同 [Shot N] 用**不同景别+不同运镜**混合（长视频 4-6 种递进、短视频 2-3 种，随剧情推进变换），严禁整段只复用一种景别或一种运镜；
    - 六段正文语言 = 用户所选输出语言（中文[ZH]=中文、英文[EN]=英文；字段名/标记保持英文），仅 <d>/画面文字保留原语言；
+   - 镜头语言偏好（景别/运镜/切镜/转场/音乐/字数）与自定义润色规范已逐条落实（景别档位、切镜数、转场、字数等均与偏好一致）；
    - retention_analysis 程度标记正确、破折号后列举已定义特征（无「保留」二字）；
+   - **三段复述一致**：subject_definitions（定义特征清单）→ detailed_description（<Subject N> 首次出现复述同一清单）→ retention_analysis（再列举）三处颜色/材质/数量一致，正文无未定义的新外貌/道具/配色；
+   - **风格逐句渗透**：风格声明只用一句（句式「本段为 <媒介/渲染> 的 <风格> 风格」），且每个环境/特效/道具名词都带本风格定语；
+   - **镜内分拍 + 句间因果**：一镜多拍已用空行分拍（每拍「触发→动作→结果」），每句新动作都由上一句因果引发；
+   - **副运动 + 可见事实密度**：每次主体动作带至少 1 处附属物副运动（行囊/衣摆/发丝/道具/烟雾/尘土）；每个 [Shot N] 平均每秒 ≥ 2 个可拍到的事实；
+   - **首帧锚定句式**：有首帧锚点图时 subject_definitions 有 `<Picture N> is the first frame of [Shot 1], showing …` 行、[Shot 1] 起手句「本镜以 <Picture N> 作为第一帧开始」、summary 标签含 `keyframe completion`、retention 首帧图单独一行；
+   - **声音两字段**：overall_soundscape 按事件时间顺序写（主导事件声→环境底噪，带「材质+动作+强度」）；non_diegetic_music 默认 N/A，指定音乐时写「体裁/速度 + 三件乐器（含演奏法）+ matching 画面事件」；
    - 第 2 段起 [Shot 1] 是承接上段末帧的延续画面（时长 = 段首衔接秒数）、其后才有本段新内容；无状态回退/重演上段已演事件。
 
 ## D. 输出格式权威（六段 Ref2VA + 调度指令，严格遵循）
@@ -311,7 +331,25 @@ def build_shot_prompt(
 
     mode_instruction = _mi.get(mode, list(_mi.values())[0] if _mi else "")
     style = _resolve_style(story_style)
-    segment_count = _resolve_segment_count(segment_count_label)
+    segment_count = _resolve_segment_count(segment_count_label)   # None = 「剧情决定」（按剧情时间线自动定段数）
+    if segment_count is None:
+        seg_count_txt = "若干"
+        seg_count_ref = "全部"
+        seg_count_spec = (
+            "**剧情决定（段数由你按剧情时间线长度自动计算）**：\n"
+            "  - 只按**剧情发展的时间线长度**估算整部戏需要演绎的总时长（人物动作/事件推进/对白所需时间之和，**绝不是字数**）；\n"
+            "  - 段数 = 剧情总时长 ÷ 每段时长（四舍五入取整）；**区间时长时优先用足每段时长（取区间上限）**，宁少段、勿多段；\n"
+            "  - 硬约束：段数 ≥ 1 且 ≤ 56；且每段实际时长不得低于区间下限（或固定时长）——**剧情很短时宁可用 1 段长镜，"
+            "绝不允许切成很多短段**（防止短剧情生成超多视频）；\n"
+            "  - 示例：剧情约 60 秒 + 时长区间 4~15 秒 ⇒ 4 段 × 15 秒（**不是** 15 段 × 4 秒）；剧情约 8 秒 ⇒ 1 段；\n"
+            "  - 切分点必须落在剧情时间线的自然节点（事件/场景/情绪转折）上，不得为凑段数硬切；\n"
+            "  - 每段是一段独立视频片段；**每段的实际生成秒数见下方「时长设定」**，必须写进该段 **时长** 字段。"
+        )
+    else:
+        seg_count_txt = str(segment_count)
+        seg_count_ref = str(segment_count)
+        seg_count_spec = (f"恰好生成 {segment_count} 个分段；每段是一段独立视频片段"
+                          f"（**每段的实际生成秒数见下方「时长设定」**，必须写进该段 **时长** 字段）。")
     try:
         seam_runway = max(0.0, float(seam_runway or 0.0))
     except Exception:
@@ -324,7 +362,7 @@ def build_shot_prompt(
 
     # 用 replace 而非 format：rules 文本内含 {视觉描述} 等示意大括号，不能走 format
     rules = (H3_SHOT_RULES_ZH if lang == "zh" else H3_SHOT_RULES_EN)
-    rules = rules.replace("{Segment_Count}", str(segment_count))
+    rules = rules.replace("{Segment_Count}", seg_count_txt)
     rules = rules.replace("{Segment_Duration}", duration_desc)
     rules = rules.replace("{Seam_Runway}", seam_runway_txt)
     rules = rules.replace("{Schedule_Rules}", schedule_rules)
@@ -340,6 +378,9 @@ def build_shot_prompt(
     pref_block = (preference or "").strip()
     if not pref_block:
         pref_block = "- 无额外镜头语言偏好：景别/运镜/切镜/转场/音乐/字数按剧情与「故事风格」自然发挥。"
+
+    # 顶层高权重自定义规范块（§1.6）：完整自定义润色规范文本；无则给占位
+    custom_block = (custom_rules or "").strip() or "- （无自定义润色规范）"
 
     # 全局节奏统筹（§2.5）：时长区间 + 按弧线分摊时长与切镜预算（规则级导演规划）
     if seam_runway > 0:
@@ -371,22 +412,24 @@ def build_shot_prompt(
         "把整部短剧当成一部连续影片来做导演统筹：\n"
         + _dur_line + "\n"
         + f"- 切镜预算：每段 [Shot N] 数量 = 该段时长 ÷ 每镜时长（一镜通常 ≥0.8~1 秒；正常语速对白约 4~5 字/秒）。"
-        "先估算整片可用切镜总量（约 {segment_count} 段时长之和 ÷ 每镜时长），再按剧情弧线把切镜密度分配到各段："
+        "先估算整片可用切镜总量（{segment_count} 段时长之和 ÷ 每镜时长），再按剧情弧线把切镜密度分配到各段："
         "开场段少镜长镜（建立）、中段推进（单段 2~4 镜）、高潮段多镜快切、收束段回落；"
         "对白密集的段自动减镜加长（先保证每句台词+说话人神态+听者反应完整，再补动作/运镜/环境）。"
         "同一动作只切一次，禁止为凑镜数硬切或重复。\n"
         + _seam_line
-    ).format(segment_count=segment_count)
+    ).format(segment_count=seg_count_ref)
 
     return SCRIPT_SKELETON_V2.format(
-        Mode_Instruction=mode_instruction.format(Segment_Count=segment_count),
+        Mode_Instruction=mode_instruction.format(Segment_Count=seg_count_txt),
         Story_Style=style,
-        Segment_Count=segment_count,
+        Segment_Count=seg_count_txt,
+        Segment_Count_Spec=seg_count_spec,
         Segment_Duration=duration_desc,
         Decompose_Rules=_dr.replace("{Seam_Runway}", seam_runway_txt),
         Reference_Intro=reference_intro,
         H3_Shot_Rules=rules,
         Preference_Block=pref_block,
+        Custom_Rules_Block=custom_block,
         Timing_Plan=timing_plan,
         User_Story=user_story,
         User_Tags=user_tags,

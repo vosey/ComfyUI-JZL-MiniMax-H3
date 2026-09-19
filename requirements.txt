@@ -9,3 +9,8 @@
 # imageio-ffmpeg（漫剧资产管理节点「视频」抽帧兜底）
 # 系统已装 ffmpeg 可跳过；没有 ffmpeg 时视频加载会失败，装上即可：
 imageio-ffmpeg
+
+# —— 节点运行时强依赖（ComfyUI 自带环境通常已安装；若缺失会导致插件加载或落盘失败）——
+Pillow      # 图像处理：参考图缩放/缩略图/帧处理（nodes_asset_manager 顶层 import PIL）
+numpy       # 数组运算：视频帧 / 音频波形处理
+# ffmpeg：分段落盘 / 合并 / 视频抽帧必需（优先用上面的 imageio-ffmpeg；系统已装可忽略）
