@@ -833,6 +833,71 @@ def _resolve_upscaler_model(precision="fp32", explicit_model=""):
     return f"minimax_h3_latent_upscaler_3d_{prec}{_ext}"
 
 
+def _upscaler_files():
+    """磁盘上所有 MiniMax H3 latent 放大模型（相对名；含子目录）。"""
+    out = []
+    try:
+        for _n in folder_paths.get_filename_list("latent_upscale_models"):
+            _b = os.path.basename(_n)
+            if _b.startswith("minimax_h3_latent_upscaler_3d") and _b.lower().endswith((".pth", ".safetensors", ".sft")):
+                out.append(_n)
+    except Exception:
+        pass
+    return out
+
+
+def _upscaler_candidates(precision="fp32", explicit_model=""):
+    """二采放大模型候选顺序：
+    ① 用户显式选择的文件（磁盘存在就优先，**不再被精度扫描覆盖**，含自定义模型）；
+    ② 其余候选中按所选精度匹配（顶层文件优先于子目录）；③ 其它。
+    """
+    have = _upscaler_files()
+    cands = []
+    exp = (explicit_model or "").strip()
+    if exp and exp not in ("自动（按精度匹配）", "auto", "自动"):
+        if exp in have or os.path.isfile(exp):
+            cands.append(exp)
+        elif "minimax_h3_latent_upscaler_3d" not in exp:
+            cands.append(exp)          # 自定义模型名：交给官方节点报错
+    _key = {"fp32": "_fp32", "fp16": "_fp16", "bf16": "_bf16"}.get(str(precision or "fp32").strip().lower(), "_fp32")
+    rest = [n for n in have if n not in cands]
+
+    def _rank(n):
+        _base = os.path.basename(n)
+        _top = 0 if os.path.dirname(n) == "" else 1
+        if _key in _base:
+            return _top
+        return 2 + _top
+
+    rest.sort(key=_rank)
+    return cands + rest
+
+
+def _weight_load_error_hint(err, name=""):
+    """权重文件读取失败（不是 zip / 缺 central directory / safetensors 解析失败）时的排查提示；不命中返回空串。"""
+    t = str(err or "")
+    if not any(k in t for k in ("PytorchStreamReader", "central directory", "zip archive",
+                                "unexpected end of file", "Error while deserializing", "safetensors")):
+        return ""
+    lines = [f"  [JZL提示] 放大模型权重读取失败（{name}）：该文件可能下载不完整/已损坏（不是有效的 PyTorch zip 或 safetensors）。"]
+    try:
+        _fs = _upscaler_files()
+        if _fs:
+            lines.append("  磁盘上的候选放大模型：")
+            for _n in _fs:
+                try:
+                    _p = folder_paths.get_full_path("latent_upscale_models", _n)
+                    _mb = (os.path.getsize(_p) / (1024 * 1024)) if _p and os.path.isfile(_p) else -1
+                    lines.append(f"    - {_n}（{_mb:.0f} MB）" if _mb >= 0 else f"    - {_n}")
+                except Exception:
+                    lines.append(f"    - {_n}")
+    except Exception:
+        pass
+    lines.append("  参考大小：fp32.pth ≈ 1287 MB；fp16/bf16.safetensors ≈ 659 MB（明显偏小=没下载完）。")
+    lines.append("  处理：重新下载该权重，或在上方「二次采样 → latent放大模型」下拉里手选其它可用文件。")
+    return "\n" + "\n".join(lines)
+
+
 def _import_upscaler_3d():
     """动态导入 MinimaxH3LatentUpscaler3D（兼容不同安装目录名）。
 
@@ -905,9 +970,10 @@ def _run_second_sampling(model, positive, samples, sample_decode, second, upscal
         _params = set(_inspect.signature(MinimaxH3LatentUpscaler3D.execute).parameters.keys())
     except Exception:
         _params = set()
+    _cands = _upscaler_candidates(second.get("precision") or "fp32", second.get("upscaler_model") or "")
     _up_kwargs = {
         "latent": video_latent,
-        "model_name": _resolve_upscaler_model(second.get("precision") or "fp32", second.get("upscaler_model") or ""),
+        "model_name": _cands[0] if _cands else _resolve_upscaler_model(second.get("precision") or "fp32", second.get("upscaler_model") or ""),
         "mode": {"mode": "scale by multiplier", "scale": float(upscale_scale or 1.0)},
         "align": 32,
         "device": second.get("device") or "cuda",
@@ -920,7 +986,27 @@ def _run_second_sampling(model, positive, samples, sample_decode, second, upscal
         _up_kwargs["enable_temporal_chunking"] = _chunk
     if "force_unload" in _params:
         _up_kwargs["force_unload"] = True
-    up = MinimaxH3LatentUpscaler3D.execute(**_up_kwargs)
+    # 权重读取可能因文件损坏/不完整而失败（PytorchStreamReader zip 错误）→ 自动尝试下一个候选文件
+    up = None
+    _cand_list = _cands or [_up_kwargs["model_name"]]
+    for _ci, _cand in enumerate(_cand_list):
+        _up_kwargs["model_name"] = _cand
+        try:
+            _fp = folder_paths.get_full_path("latent_upscale_models", _cand)
+            _mb = (os.path.getsize(_fp) / (1024 * 1024)) if _fp and os.path.isfile(_fp) else -1
+            print(f"[JZL-二采] 视频latent放大：模型 = {_cand}（{_fp or '未找到文件'}，{_mb:.0f} MB，精度 {_up_kwargs.get('precision')}，倍数 {upscale_scale}）"
+                  if _mb >= 0 else
+                  f"[JZL-二采] 视频latent放大：模型 = {_cand}（未找到文件，精度 {_up_kwargs.get('precision')}，倍数 {upscale_scale}）")
+            up = MinimaxH3LatentUpscaler3D.execute(**_up_kwargs)
+            break
+        except Exception as _e:
+            _hint = _weight_load_error_hint(_e, _cand)
+            if _hint and _ci + 1 < len(_cand_list):
+                print(f"[JZL-二采] ⚠️ 放大模型 {_cand} 读取失败 → 自动尝试下一个候选：{_cand_list[_ci + 1]}")
+                continue
+            raise RuntimeError(f"{_e}{_hint}") from _e
+    if up is None:
+        raise RuntimeError("二采放大模型加载失败（无可用候选文件）")
     up_latent = up.args[0]
 
     # 2.5) ♾️ 无限时长衔接：二采画布被放大，而 positive 里的 keyframe 引导 latent 取自「一采画布」
