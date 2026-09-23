@@ -792,24 +792,86 @@ def _sample_av_custom_sigmas(model, positive, latent, sigmas_text, sampler_name,
     return samples
 
 
+_JZL_UP_MODEL_INFO = {}
+
+
+def _detect_weight_format(p):
+    """探测权重文件真实格式：'zip'（PyTorch .pth）/ 'safetensors' / ''（未知或损坏）。"""
+    try:
+        _sz = os.path.getsize(p)
+        with open(p, "rb") as f:
+            _head = f.read(16)
+    except Exception:
+        return ""
+    if _head[:2] == b"PK":
+        return "zip"
+    try:
+        if len(_head) >= 9:
+            _n = int.from_bytes(_head[:8], "little")
+            if 0 < _n < _sz and _head[8:9] == b"{":
+                return "safetensors"
+    except Exception:
+        pass
+    return ""
+
+
+def _upscaler_file_check(name):
+    """校验 latent 放大模型文件能否被官方加载器读取：返回 (ok, abspath, size, reason, fmt)。
+
+    官方 `_load_raw_sd`：`.safetensors` 走 safetensors.torch.load_file，**其它扩展名一律 torch.load**
+    → 真实格式与扩展名不符（例如 safetensors 内容却叫 .pth）、或文件损坏/半包，都会报
+    PytorchStreamReader failed reading zip archive: failed finding central directory（2026-09-23 云机报障）。
+
+    典型坏文件：Git LFS 指针（几十~几百字节）、下载中断的 .pth（zip 结构不完整）
+    → torch.load 会报 `PytorchStreamReader failed reading zip archive: failed finding central directory`。
+    """
+    try:
+        p = folder_paths.get_full_path("latent_upscale_models", name)
+    except Exception:
+        p = None
+    if not p or not os.path.isfile(p):
+        return (False, str(p or ""), 0, "文件不存在")
+    try:
+        size = os.path.getsize(p)
+    except Exception:
+        size = 0
+    if size < 1024 * 1024:
+        return (False, p, size, f"文件过小（{size} 字节，疑似下载未完成 / Git LFS 指针文件）")
+    low = p.lower()
+    _fmt = _detect_weight_format(p)
+    _want = "safetensors" if low.endswith(".safetensors") else "zip"
+    if _fmt == "":
+        return (False, p, size, "无法识别的权重格式（文件损坏、下载未完成，或不是模型权重）", "")
+    if _fmt == _want:
+        return (True, p, size, "", _fmt)
+    _ext = os.path.splitext(p)[1]
+    if _fmt == "safetensors":
+        return (False, p, size,
+                f"内容是 safetensors 格式，但扩展名是 {_ext}——官方加载器按扩展名判断，会用 torch.load 读它并报 "
+                f"PytorchStreamReader failed；把它改名为 .safetensors 即可直接使用", _fmt)
+    return (False, p, size,
+            f"内容是 PyTorch zip（.pth）格式，但扩展名是 {_ext}——官方加载器会用 safetensors 读它；"
+            f"把它改名为 .pth 即可直接使用", _fmt)
+
+
 def _resolve_upscaler_model(precision="fp32", explicit_model=""):
     """按精度解析 MiniMax H3 latent 放大模型文件名（官方 fp32/fp16/bf16 是同一权重的三套精度格式）。
 
     背景：官方把放大模型按精度拆成三个文件（fp32.pth / fp16.safetensors / bf16.safetensors），
     很多用户只下载其中一套（例如只装了 fp16）→ 若代码锁死加载 fp32.pth 必然 "Model file not found"。
     规则：
-    - 若用户显式指定了非 MiniMax 标准模型（自定义其它放大模型）→ 尊重用户选择，不做精度联动；
-    - 否则（显式是标准 MiniMax 名 / 为空）→ ①先精确扫描磁盘 latent_upscale_models 目录匹配所选精度
-      （'_fp32/_fp16/_bf16' + .pth/.safetensors，兼容子目录/不同扩展名），命中返回磁盘真实文件名；
-      ②精确精度文件缺失 → 回退到磁盘上任意 minimax_h3_latent_upscaler_3d_* 权重（同权重不同精度，配合
-      precision 参数运行等价），并打印提示；③磁盘完全没有 → 兜底返回标准命名并提示需要下载。
+    - 若用户显式指定了非 MiniMax 标准模型（自定义其它放大模型）→ 尊重用户选择；
+    - 候选顺序：显式指定 → 所选精度 → 其它精度（同权重不同精度，配合 precision 参数运行等价）；
+    - ⭐ 每个候选都做**文件可用性校验**（存在性/大小/zip 或 safetensors 结构），跳过损坏或未下载完整的
+      文件（云机常见：Git LFS 指针、下载中断）→ 避免 torch.load 报看不懂的 zip 错误；
+    - 全部候选都不可用：打印每个候选的具体问题，并返回首选名（让官方节点报错，同时我们已打印原因）。
     """
     prec = str(precision or "fp32").strip().lower()
     if prec not in ("fp32", "fp16", "bf16"):
         prec = "fp32"
     exp = (explicit_model or "").strip()
-    if exp and "minimax_h3_latent_upscaler_3d" not in exp:
-        return exp  # 用户自定义非 MiniMax 模型，尊重
+    _key = {"fp32": "_fp32", "fp16": "_fp16", "bf16": "_bf16"}[prec]
+
     try:
         _names = folder_paths.get_filename_list("latent_upscale_models")
     except Exception:
@@ -820,82 +882,67 @@ def _resolve_upscaler_model(precision="fp32", explicit_model=""):
         if (_base.startswith("minimax_h3_latent_upscaler_3d")
                 and _base.lower().endswith((".pth", ".safetensors"))):
             _std.append(_n)
-    _key = {"fp32": "_fp32", "fp16": "_fp16", "bf16": "_bf16"}[prec]
-    for _n in _std:  # ① 精确匹配所选精度
-        if _key in os.path.basename(_n):
-            return _n
-    if _std:  # ② 缺失所选精度 → 回退任意可用 MiniMax 放大模型（同权重不同精度，配合 precision 运行等价）
-        _fb = _std[0]
-        print(f"[JZL-管理器] 未找到 minimax_h3_latent_upscaler_3d_{prec} 权重，自动改用磁盘现有模型：{_fb}（精度参数 {prec} 仍生效）")
-        return _fb
+
+    # 自定义非 MiniMax 模型：尊重用户（但也校验，并给出提示）
+    if exp and "minimax_h3_latent_upscaler_3d" not in exp:
+        _ok, _p, _sz, _why, _fmt = _upscaler_file_check(exp)
+        if _ok:
+            print(f"[JZL-管理器] 二采放大模型（自定义）：{exp}（{_p}，{_sz / 1048576:.1f} MB）")
+        else:
+            print(f"[JZL-管理器] ⚠️ 二采放大模型（自定义）{exp} 校验未通过：{_why} → {_p}")
+        _JZL_UP_MODEL_INFO.clear()
+        _JZL_UP_MODEL_INFO.update({"name": exp, "path": _p, "size": _sz, "bad": not _ok, "why": _why})
+        return exp
+
+    cands = []
+    if exp:
+        cands.append(exp)
+    cands += [n for n in _std if _key in os.path.basename(n)]
+    cands += [n for n in _std if _key not in os.path.basename(n)]
+    _seen = set()
+    cands = [c for c in cands if not (c in _seen or _seen.add(c))]
+
+    _bad = []
+    _fmt_mismatch = []       # 内容正确但扩展名不符 → 提示改名，并作为兵底候选
+    for c in cands:
+        _ok, _p, _sz, _why, _fmt = _upscaler_file_check(c)
+        if _ok:
+            print(f"[JZL-管理器] 二采放大模型：{c}（{_p}，{_sz / 1048576:.1f} MB）")
+            if exp and c != exp:
+                print(f"[JZL-管理器] 指定的放大模型 {exp} 不可用，已自动改用：{c}")
+            elif (not exp) and (_key not in os.path.basename(c)):
+                print(f"[JZL-管理器] 未找到 minimax_h3_latent_upscaler_3d_{prec} 权重，自动改用磁盘现有模型：{c}（精度参数 {prec} 仍生效）")
+            _JZL_UP_MODEL_INFO.clear()
+            _JZL_UP_MODEL_INFO.update({"name": c, "path": _p, "size": _sz, "bad": False, "why": ""})
+            return c
+        if _fmt:
+            _fmt_mismatch.append((c, _p, _sz, _why))
+        _bad.append((c, _p, _sz, _why))
+        print(f"[JZL-管理器] 跳过不可用的放大模型候选：{c} → {_p or '路径解析失败'}"
+              f"（{_sz} 字节）: {_why}")
+
+    if _fmt_mismatch:
+        _c, _p2, _sz2, _why2 = _fmt_mismatch[0]
+        print(f"[JZL-管理器] ⚠️ 放大权重扩展名与内容不符：{_c} → {_p2}（{_sz2} 字节）")
+        print(f"[JZL-管理器]    {_why2}")
+        _JZL_UP_MODEL_INFO.clear()
+        _JZL_UP_MODEL_INFO.update({"name": _c, "path": _p2, "size": _sz2, "bad": True, "why": _why2})
+        return _c
+
+    if _bad:
+        print(f"[JZL-管理器] ⚠️ 放大模型候选全部不可用（共 {len(_bad)} 个）：")
+        for c, p, sz, why in _bad[:6]:
+            print(f"[JZL-管理器]    - {c} → {p or '路径解析失败'}（{sz} 字节）: {why}")
+        print("[JZL-管理器]    请重新下载权重放入 ComfyUI/models/latent_upscale_models/"
+              "（官方三套精度：fp32.pth / fp16.safetensors / bf16.safetensors）")
+        _JZL_UP_MODEL_INFO.clear()
+        _JZL_UP_MODEL_INFO.update({"name": _bad[0][0], "path": _bad[0][1], "size": _bad[0][2],
+                                   "bad": True, "why": _bad[0][3]})
+        return _bad[0][0]
+
     _ext = ".pth" if prec == "fp32" else ".safetensors"
     print(f"[JZL-管理器] 警告: latent_upscale_models 目录没有 minimax_h3_latent_upscaler_3d 模型, 请先下载 {prec} 精度权重放入 ComfyUI/models/latent_upscale_models/")
     return f"minimax_h3_latent_upscaler_3d_{prec}{_ext}"
-
-
-def _upscaler_files():
-    """磁盘上所有 MiniMax H3 latent 放大模型（相对名；含子目录）。"""
-    out = []
-    try:
-        for _n in folder_paths.get_filename_list("latent_upscale_models"):
-            _b = os.path.basename(_n)
-            if _b.startswith("minimax_h3_latent_upscaler_3d") and _b.lower().endswith((".pth", ".safetensors", ".sft")):
-                out.append(_n)
-    except Exception:
-        pass
-    return out
-
-
-def _upscaler_candidates(precision="fp32", explicit_model=""):
-    """二采放大模型候选顺序：
-    ① 用户显式选择的文件（磁盘存在就优先，**不再被精度扫描覆盖**，含自定义模型）；
-    ② 其余候选中按所选精度匹配（顶层文件优先于子目录）；③ 其它。
-    """
-    have = _upscaler_files()
-    cands = []
-    exp = (explicit_model or "").strip()
-    if exp and exp not in ("自动（按精度匹配）", "auto", "自动"):
-        if exp in have or os.path.isfile(exp):
-            cands.append(exp)
-        elif "minimax_h3_latent_upscaler_3d" not in exp:
-            cands.append(exp)          # 自定义模型名：交给官方节点报错
-    _key = {"fp32": "_fp32", "fp16": "_fp16", "bf16": "_bf16"}.get(str(precision or "fp32").strip().lower(), "_fp32")
-    rest = [n for n in have if n not in cands]
-
-    def _rank(n):
-        _base = os.path.basename(n)
-        _top = 0 if os.path.dirname(n) == "" else 1
-        if _key in _base:
-            return _top
-        return 2 + _top
-
-    rest.sort(key=_rank)
-    return cands + rest
-
-
-def _weight_load_error_hint(err, name=""):
-    """权重文件读取失败（不是 zip / 缺 central directory / safetensors 解析失败）时的排查提示；不命中返回空串。"""
-    t = str(err or "")
-    if not any(k in t for k in ("PytorchStreamReader", "central directory", "zip archive",
-                                "unexpected end of file", "Error while deserializing", "safetensors")):
-        return ""
-    lines = [f"  [JZL提示] 放大模型权重读取失败（{name}）：该文件可能下载不完整/已损坏（不是有效的 PyTorch zip 或 safetensors）。"]
-    try:
-        _fs = _upscaler_files()
-        if _fs:
-            lines.append("  磁盘上的候选放大模型：")
-            for _n in _fs:
-                try:
-                    _p = folder_paths.get_full_path("latent_upscale_models", _n)
-                    _mb = (os.path.getsize(_p) / (1024 * 1024)) if _p and os.path.isfile(_p) else -1
-                    lines.append(f"    - {_n}（{_mb:.0f} MB）" if _mb >= 0 else f"    - {_n}")
-                except Exception:
-                    lines.append(f"    - {_n}")
-    except Exception:
-        pass
-    lines.append("  参考大小：fp32.pth ≈ 1287 MB；fp16/bf16.safetensors ≈ 659 MB（明显偏小=没下载完）。")
-    lines.append("  处理：重新下载该权重，或在上方「二次采样 → latent放大模型」下拉里手选其它可用文件。")
-    return "\n" + "\n".join(lines)
 
 
 def _import_upscaler_3d():
@@ -970,10 +1017,9 @@ def _run_second_sampling(model, positive, samples, sample_decode, second, upscal
         _params = set(_inspect.signature(MinimaxH3LatentUpscaler3D.execute).parameters.keys())
     except Exception:
         _params = set()
-    _cands = _upscaler_candidates(second.get("precision") or "fp32", second.get("upscaler_model") or "")
     _up_kwargs = {
         "latent": video_latent,
-        "model_name": _cands[0] if _cands else _resolve_upscaler_model(second.get("precision") or "fp32", second.get("upscaler_model") or ""),
+        "model_name": _resolve_upscaler_model(second.get("precision") or "fp32", second.get("upscaler_model") or ""),
         "mode": {"mode": "scale by multiplier", "scale": float(upscale_scale or 1.0)},
         "align": 32,
         "device": second.get("device") or "cuda",
@@ -986,27 +1032,25 @@ def _run_second_sampling(model, positive, samples, sample_decode, second, upscal
         _up_kwargs["enable_temporal_chunking"] = _chunk
     if "force_unload" in _params:
         _up_kwargs["force_unload"] = True
-    # 权重读取可能因文件损坏/不完整而失败（PytorchStreamReader zip 错误）→ 自动尝试下一个候选文件
-    up = None
-    _cand_list = _cands or [_up_kwargs["model_name"]]
-    for _ci, _cand in enumerate(_cand_list):
-        _up_kwargs["model_name"] = _cand
-        try:
-            _fp = folder_paths.get_full_path("latent_upscale_models", _cand)
-            _mb = (os.path.getsize(_fp) / (1024 * 1024)) if _fp and os.path.isfile(_fp) else -1
-            print(f"[JZL-二采] 视频latent放大：模型 = {_cand}（{_fp or '未找到文件'}，{_mb:.0f} MB，精度 {_up_kwargs.get('precision')}，倍数 {upscale_scale}）"
-                  if _mb >= 0 else
-                  f"[JZL-二采] 视频latent放大：模型 = {_cand}（未找到文件，精度 {_up_kwargs.get('precision')}，倍数 {upscale_scale}）")
-            up = MinimaxH3LatentUpscaler3D.execute(**_up_kwargs)
-            break
-        except Exception as _e:
-            _hint = _weight_load_error_hint(_e, _cand)
-            if _hint and _ci + 1 < len(_cand_list):
-                print(f"[JZL-二采] ⚠️ 放大模型 {_cand} 读取失败 → 自动尝试下一个候选：{_cand_list[_ci + 1]}")
-                continue
-            raise RuntimeError(f"{_e}{_hint}") from _e
-    if up is None:
-        raise RuntimeError("二采放大模型加载失败（无可用候选文件）")
+    try:
+        up = MinimaxH3LatentUpscaler3D.execute(**_up_kwargs)
+    except Exception as _ue:
+        _umsg = str(_ue)
+        if ("PytorchStreamReader" in _umsg) or ("central directory" in _umsg) or ("zip archive" in _umsg):
+            _info = dict(_JZL_UP_MODEL_INFO or {})
+            _p = _info.get("path") or ""
+            _sz = int(_info.get("size") or 0)
+            _why = str(_info.get("why") or "")
+            raise RuntimeError(
+                f"{_umsg}\n"
+                f"  [JZL提示] 这是**放大模型权重文件本身有问题**（torch.load 读不出 zip 结构），不是本节点的 bug：\n"
+                f"    实际加载：{_up_kwargs.get('model_name')}\n"
+                f"    绝对路径：{_p or '（未能解析）'}\n"
+                f"    文件大小：{_sz} 字节（{_sz / 1048576:.2f} MB）\n"
+                f"    {('节点校验结论：' + _why) if _why else '若该文件明显偏小（几百 KB）→ 是 Git LFS 指针 / 下载未完成，请重新下载'}\n"
+                f"    也可在「采样与解码设置」把二采「精度」切到已下载完整的那一套（fp32.pth / fp16.safetensors / bf16.safetensors），"
+                f"或直接指定放大模型文件。") from _ue
+        raise
     up_latent = up.args[0]
 
     # 2.5) ♾️ 无限时长衔接：二采画布被放大，而 positive 里的 keyframe 引导 latent 取自「一采画布」
