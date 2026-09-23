@@ -65,18 +65,26 @@ function hideWidget(node, w) {
     w.__jzlMusicOrigType = w.type;
     w.__jzlMusicOrigComputeSize = w.computeSize;
     w.hidden = true;
+    // Nodes 2.0：可见性看 options.hidden（只改 type/hidden 在 DOM 渲染下不生效）
+    if (!w.options) w.options = {};
+    w.options.hidden = true;
     if (w.inputEl) w.inputEl.style.display = "none";
     if (w.element) w.element.style.display = "none";
     w.type = "hidden";
     w.computeSize = () => [0, -4];
     w.computedHeight = 0;
-    if (w._state) { w._state.hidden = true; w._state.type = "hidden"; w._state.computedHeight = 0; }
+    if (w._state) {
+        w._state.hidden = true; w._state.type = "hidden"; w._state.computedHeight = 0;
+        if (w._state.options) w._state.options.hidden = true;
+    }
     return -h;
 }
 
 function showWidget(w) {
     if (!w || w.type !== "hidden" || !Object.prototype.hasOwnProperty.call(w, "__jzlMusicOrigType")) return 0;
     w.hidden = false;
+    if (!w.options) w.options = {};
+    w.options.hidden = false;
     if (w.inputEl) w.inputEl.style.display = "";
     if (w.element) w.element.style.display = "";
     w.type = w.__jzlMusicOrigType;
@@ -84,7 +92,10 @@ function showWidget(w) {
     else delete w.computeSize;
     delete w.computedHeight;
     const h = w.__jzlMusicRowH || 26;
-    if (w._state) { w._state.hidden = false; w._state.type = w.type; delete w._state.computedHeight; }
+    if (w._state) {
+        w._state.hidden = false; w._state.type = w.type; delete w._state.computedHeight;
+        if (w._state.options) w._state.options.hidden = false;
+    }
     delete w.__jzlMusicOrigType;
     delete w.__jzlMusicOrigComputeSize;
     return h;
@@ -143,6 +154,15 @@ function syncFold(node) {
         delta += advanced ? showWidget(w) : hideWidget(node, w);
     }
     if (delta !== 0) adjustHeight(node, delta);
+    refreshWidgets(node);
+}
+
+// Nodes 2.0：在 onNodeCreated 阶段改可见性时，只改 type/hidden/options.hidden 不会让 DOM 重渲染。
+// 实测：触发 node:slot-label:changed（内部事件）会让 Vue 侧重新抽取节点数据，可见性立刻生效。
+function refreshWidgets(node) {
+    try { if (node && Array.isArray(node.widgets)) node.widgets = node.widgets.slice(); } catch (_) {}
+    try { node?.graph?.trigger?.("node:slot-label:changed", { nodeId: node.id, slotType: 2 }); } catch (_) {}
+    try { node?.setDirtyCanvas?.(true, true); } catch (_) {}
 }
 
 function sync(node) {

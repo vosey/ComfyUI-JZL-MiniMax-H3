@@ -44,6 +44,8 @@ function setupDynamicOutputs(node) {
             const idx = displays.length + 1;
             const res = ComfyWidgets["STRING"](node, `显示_${idx}`, ["STRING", { multiline: true }], app);
             const dw = res.widget;
+            // Nodes 2.0：只读要走 options.read_only（Vue 部件没有 inputEl 可改样式）
+            try { if (dw.options) dw.options.read_only = true; } catch (_) {}
             if (dw.inputEl) {
                 dw.inputEl.readOnly = true;
                 dw.inputEl.style.backgroundColor = "#2a2a2a";

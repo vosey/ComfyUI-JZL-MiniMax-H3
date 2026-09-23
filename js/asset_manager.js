@@ -955,6 +955,7 @@ function createReshootSection(ctx) {
     segRow.append(segPrev, segLabel, segNext, segTag);
     // 提示词显示窗（可编辑，默认显示段号对应段的完整提示词）
     const editWrap = el("div", "position:relative;width:100%;");
+    editWrap.setAttribute("data-capture-wheel", "true");   // 同主提示词框：聚焦后滚轮归本控件，不被画布抢走缩放
     const edit = document.createElement("textarea");
     edit.spellcheck = false;
     edit.style.cssText = "width:100%;height:190px;box-sizing:border-box;background:#161616;color:#ddd;border:1px solid #444;border-radius:5px;padding:6px 8px;font-size:12px;resize:none;outline:none;overflow-y:auto;white-space:pre-wrap;word-break:break-word;line-height:1.5;";
@@ -3825,6 +3826,10 @@ app.registerExtension({
                 // 关键：无条件强制布局高度为 0（原生 widget 没有 computeSize，必须无条件赋值）
                 w.computeSize = () => [0, -4];
             }
+            // Nodes 2.0：上面是在 onNodeCreated 阶段改的可见性，仅改 type/hidden/options.hidden 不会让 DOM 立刻重渲染
+            // （实测：触发 node:slot-label:changed 内部事件即可刷新节点数据）
+            try { if (Array.isArray(self.widgets)) self.widgets = self.widgets.slice(); } catch (_) {}
+            try { self.graph?.trigger?.("node:slot-label:changed", { nodeId: self.id, slotType: 2 }); } catch (_) {}
 
             // 2. 单个 DOM widget：按钮区 + 生成参数(节点表面) + 视频数量 + 加速模式 + 提示词输入
             ensureManagerStyle();
@@ -3905,6 +3910,10 @@ app.registerExtension({
             promptBox.addEventListener("mousedown", (e) => e.stopPropagation());
             // 右上角悬浮：复制全部文本 / 放大编辑
             const promptWrap = el("div", "position:relative;flex:1 1 auto;display:flex;flex-direction:column;min-height:60px;");
+            // Nodes 2.0：告知前端「滚轮归本控件」（官方判定：e.target.closest('[data-capture-wheel="true"]')
+            // 且 document.activeElement 在该元素内 —— 见前端 settingStore 的 wheelCapturedByFocusedElement）。
+            // 不加这个标记时，滚轮会被前端转发给画布（实测：框 scrollTop 不变、画布缩放 0.382→0.347）。
+            promptWrap.setAttribute("data-capture-wheel", "true");
             promptWrap.appendChild(promptBox);
             const pActions = el("div", "position:absolute;top:4px;right:4px;display:flex;gap:4px;opacity:0;transition:opacity .15s;z-index:6;");
             const pCopy = el("button", "width:24px;height:24px;border-radius:4px;border:1px solid #555;background:rgba(30,30,30,.92);color:#ccc;font-size:12px;cursor:pointer;line-height:1;padding:0;", "📋");
@@ -4086,6 +4095,11 @@ app.registerExtension({
                         const minDom = btnRows * 40 + 10 + 16 + 72 + 22 + assetsH + reshootH + 20;  // 按钮N行 + gap + 信息行 + 提示词min + 资产窗标题 + 重拍区 + padding
                         const y = (self.widgets || []).find((w) => w.name === "jzl_manager")?.y;
                         const need = (Number.isFinite(y) ? y : 220) + minDom;
+                        // ⚠️ Nodes 2.0：节点高度由 DOM 内容决定（多行素材会自动掉高），
+                        //    而 2.0 里 widget.y 会被前端重算（实测可达 1300+），
+                        //    用 y + minDom 反推节点高度会把节点凭空顶高（实测拖完松手被顶到 1573）
+                        //    → 2.0 下直接不做这个 setSize。
+                        if ((() => { try { return app?.ui?.settings?.getSettingValue?.("Comfy.VueNodes.Enabled") === true; } catch (_) { return false; } })()) return;
                         if (self.size && need > (self.size[1] || 0) + 1) {
                             self.setSize([self.size[0], need]);
                             self.setDirtyCanvas?.(true, true);
@@ -4113,6 +4127,192 @@ app.registerExtension({
             container.appendChild(reshootSection.body);
             self.__reshootBody = reshootSection.body;
             self.__reshootRefresh = reshootSection.refresh;
+
+            // ── Nodes 2.0 面板布局适配（DOM 渲染）──────────────────────────────
+            // 2.0 下节点高度由 DOM 内容决定：容器 style 里的 height:100% 解析不到确定高度，
+            // 提示词框（flex:1）会跟着文本一路长高（实测 60 行 → 框 972px、节点 1647px），
+            // 于是「没有滚动条、内容把节点撑爆」。这里给提示词区一个确定高度，
+            // 文本框的 overflow-y:auto 才有边界；默认框高 280，用户拖大/拖小节点时框跟着变。
+            const IS_NODES2_LAYOUT = (() => {
+                try { return app?.ui?.settings?.getSettingValue?.("Comfy.VueNodes.Enabled") === true; } catch (_) { return false; }
+            })();
+            // 用户在设置里切换「Nodes 2.0」开关时**不会刷新页面**，所以判定不能只在初始化时做一次
+            // （旧写法缓存成常量：切回经典模式后 px 固定高度仍然生效 → 用户报「高度被锁死」）。
+            const isNodes2Now = () => {
+                try { return app?.ui?.settings?.getSettingValue?.("Comfy.VueNodes.Enabled") === true; } catch (_) { return false; }
+            };
+            // 上限实际取消：原来是 900，用户把节点拉得比 900 还高时输入框就不再跟着长（报障 ①）。
+            // 下拉时的高度同时被指针位移约束，不存在跑飞风险，这里给一个名义上限即可。
+            const PROMPT_H2_MIN = 280, PROMPT_H2_MAX = 100000, PROMPT_H2_DEFAULT = 280;
+            const origH2 = { wrap: null, box: null };      // 首次改写前的原样（切回经典模式要原样还原）
+            const applyPromptH2 = (h) => {
+                if (!origH2.wrap) {
+                    origH2.wrap = { height: promptWrap.style.height, minHeight: promptWrap.style.minHeight, flex: promptWrap.style.flex };
+                    origH2.box = { height: promptBox.style.height, maxHeight: promptBox.style.maxHeight, flex: promptBox.style.flex };
+                }
+                promptWrap.style.flex = "0 0 auto";
+                promptWrap.style.height = h + "px";
+                promptWrap.style.minHeight = h + "px";
+                promptBox.style.flex = "0 0 auto";
+                promptBox.style.height = h + "px";
+                promptBox.style.maxHeight = h + "px";
+            };
+            // 切回经典（canvas）模式：把行内样式还原成面板原本的值，交回原有的 flex 满高布局
+            const restorePromptH2 = () => {
+                try {
+                    if (!origH2.wrap) return;
+                    promptWrap.style.height = origH2.wrap.height;
+                    promptWrap.style.minHeight = origH2.wrap.minHeight;
+                    promptWrap.style.flex = origH2.wrap.flex;
+                    promptBox.style.height = origH2.box.height;
+                    promptBox.style.maxHeight = origH2.box.maxHeight;
+                    promptBox.style.flex = origH2.box.flex;
+                } catch (_) {}
+            };
+            // 滚动条鼠标滚轮：2.0 下节点就在画布 DOM 里，滚轮会被画布的缩放处理抢走
+            //（实测：在提示词框上滚轮 → 框 scrollTop 不变、画布 scale 0.382→0.347）。
+            // 这里在面板层拦下「确实能滚」的滚轮事件；已经到顶/到底时放行，保留画布缩放手感。
+            const wheelCanScroll2 = (t, dy) => {
+                let el = t;
+                while (el && el !== container.parentElement) {
+                    let cs;
+                    try { cs = getComputedStyle(el); } catch (_) { break; }
+                    const oy = cs.overflowY;
+                    if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight + 1) {
+                        if (dy > 0 && el.scrollTop + el.clientHeight < el.scrollHeight - 1) return true;
+                        if (dy < 0 && el.scrollTop > 0) return true;
+                        return false;
+                    }
+                    el = el.parentElement;
+                }
+                return false;
+            };
+            try {
+                container.addEventListener("wheel", (e) => {
+                    if (wheelCanScroll2(e.target, e.deltaY)) e.stopPropagation();
+                }, true);
+            } catch (_) {}
+            // ⚠️ 高度口径踩过的坑（都实测过）：
+            //   ① 「节点高度 − 面板顶部偏移 − 面板其余内容」→ 容器**下方**还有一片 DOM
+            //      （原生 widget 行 + 高级输入按钮，实测约 233px）没被计入，公式系统性偏大 → 顶到上限 900。
+            //   ② 「节点高度增量」跟随 → 2.0 下写框高会把节点撑高，增量被当成用户拖拽 → 自激到 900。
+            //   ③ 「container.clientHeight − scrollHeight」→ 内容比容器矮时 scrollHeight 被钳到 clientHeight，
+            //      差值恒为 0 → 拖大节点输入框纹丝不动。
+            //   ④ 引导阶段（节点刚创建的那几十毫秒）节点高度会临时远大于内容（实测 --node-height 还是 510、
+            //      容器 822、内容只有 311）→ 只要在引导期做「填满空白」，默认值就被顶到上限 900。
+            // 现方案：默认固定 280；用户拖尺寸手柄时**用指针位移实时改框高**
+            // （不能等拖完再按节点高度算：2.0 下节点高度被内容撑住、不允许小于内容，
+            //  不主动缩内容的话用户往回拖根本拖不动 —— 实测节点卡在内容高度）。
+            // 拖完之后再用「容器剩余空白」把可能的零头补齐（该口径写一次即收敛）。
+            let sized2 = false, userSized2 = false, dragState2 = null;
+            let relayoutForNodes2 = () => {};
+            let hookHandle2Ref = null;
+            const onDragMove2 = (e) => {
+                if (!dragState2) return;
+                try {
+                    const scale = Number(app?.canvas?.ds?.scale) || 1;
+                    const d = (e.clientY - dragState2.y) / scale * dragState2.sign;
+                    const boxH = promptWrap.offsetHeight || PROMPT_H2_DEFAULT;
+                    const h = Math.max(PROMPT_H2_MIN, Math.min(PROMPT_H2_MAX, Math.round(dragState2.box + d)));
+                    if (Math.abs(boxH - h) > 1) applyPromptH2(h);
+                } catch (_) {}
+            };
+            const onDragEnd2 = () => {
+                dragState2 = null;
+                userSized2 = true;
+                try {
+                    window.removeEventListener("pointermove", onDragMove2, true);
+                    window.removeEventListener("pointerup", onDragEnd2, true);
+                    window.removeEventListener("pointercancel", onDragEnd2, true);
+                } catch (_) {}
+                setTimeout(() => { try { relayoutForNodes2(); } catch (_) {} }, 80);
+            };
+            try {
+                hookHandle2Ref = () => {
+                    const nodeEl2 = container.closest ? container.closest("[data-node-id]") : null;
+                    if (!nodeEl2 || nodeEl2.__jzlHandleHook2) return;
+                    nodeEl2.__jzlHandleHook2 = true;
+                    nodeEl2.addEventListener("pointerdown", (e) => {
+                        const hd = (e.target && e.target.closest) ? e.target.closest('[aria-label*="调整大小"]') : null;
+                        if (!hd) return;
+                        const corner = (hd.getAttribute("data-corner") || "").toUpperCase();
+                        if (corner.indexOf("N") < 0 && corner.indexOf("S") < 0) return;   // 只处理能改高度的角
+                        dragState2 = {
+                            y: e.clientY,
+                            box: promptWrap.offsetHeight || PROMPT_H2_DEFAULT,
+                            sign: corner.indexOf("N") >= 0 ? -1 : 1,      // 拖上边时指针向上 = 节点变高
+                        };
+                        window.addEventListener("pointermove", onDragMove2, true);
+                        window.addEventListener("pointerup", onDragEnd2, true);
+                        window.addEventListener("pointercancel", onDragEnd2, true);
+                    }, true);
+                };
+                hookHandle2Ref();
+                [0, 150, 500, 1200].forEach((d) => setTimeout(hookHandle2Ref, d));
+            } catch (_) {}
+            relayoutForNodes2 = () => {
+                try {
+                    if (!isNodes2Now()) {                // 切回经典模式：撤销 px 固定高度，恢复原有 flex 布局
+                        if (sized2) { sized2 = false; restorePromptH2(); }
+                        return;
+                    }
+                    if (!container.isConnected) return;
+                    if (!sized2) {                       // 首次：固定默认高度（280）
+                        sized2 = true;
+                        applyPromptH2(PROMPT_H2_DEFAULT);
+                        return;
+                    }
+                    if (dragState2) return;              // 拖拽进行中由指针位移接管
+                    // 拖完之后不再做「填满剩余空白」：2.0 下节点高度会被前端/其它布局代码临时抬高
+                    // （实测松手 200ms 后节点被顶到 1573），一旦去填就会被顶到上限，
+                    // 而且再也缩不回来（节点不允许小于内容）→ 用户会遇到「拖回去也不变小」。
+                    // 高度完全由用户拖拽（指针位移）决定，最稳。
+                } catch (_) {}
+            };
+            {
+                // 2.0 开关是运行时可切的（不需要刷新页面）：轮询确认模式，
+                // 切到 2.0 → 挂手柄监听 + 应用 px 高度；切回经典 → 撤掉 px 高度恢复 flex 布局
+                let mode2 = IS_NODES2_LAYOUT;
+                const modeTimer2 = setInterval(() => {
+                    try {
+                        const now = isNodes2Now();
+                        if (now === mode2) {
+                            if (now && typeof hookHandle2Ref === "function") hookHandle2Ref();
+                            return;
+                        }
+                        mode2 = now;
+                        if (now) { sized2 = false; try { hookHandle2Ref?.(); } catch (_) {} relayoutForNodes2(); }
+                        else { sized2 = false; restorePromptH2(); }
+                    } catch (_) {}
+                }, 1000);
+                const __onRemoved2 = self.onRemoved;
+                self.onRemoved = function () {
+                    try { clearInterval(modeTimer2); } catch (_) {}
+                    return __onRemoved2?.apply(this, arguments);
+                };
+            }
+            self.__jzlRelayout2 = relayoutForNodes2;
+            {
+                // 两种模式都装调度：经典模式下 relayoutForNodes2 会直接返回（零开销）
+                if (IS_NODES2_LAYOUT) self.setSize?.([self.size?.[0] || 600, Math.max(Number(self.size?.[1]) || 0, 480)]);
+                [0, 50, 150, 400, 900, 1600].forEach((d) => setTimeout(relayoutForNodes2, d));
+                // ⚠️ 重排绝不能在 ResizeObserver 回调里同步执行："写高度 → 布局变 → observer 又触发"
+                // 会刷出 "ResizeObserver loop completed with undelivered notifications"（实测节点拖拽时 6 条）。
+                // 丢到下一帧 + 同帧去重后警告完全消失，收敛行为不变。
+                let raf2 = 0;
+                const deferRelayout2 = () => {
+                    if (raf2) return;
+                    raf2 = requestAnimationFrame(() => { raf2 = 0; relayoutForNodes2(); });
+                };
+                self.__jzlRelayoutDefer2 = deferRelayout2;
+                try { new ResizeObserver(deferRelayout2).observe(container); } catch (_) {}
+                const __origOnResize2 = self.onResize;
+                self.onResize = function () {
+                    const r = __origOnResize2?.apply(this, arguments);
+                    deferRelayout2();
+                    return r;
+                };
+            }
 
             // 缓存资产名并渲染资产显示窗；内部提示词重新渲染成着色 token 并同步到 internal_prompt
             const refreshAssets = () => {
@@ -4618,6 +4818,9 @@ function setupVideoViewerNode(self) {
             w.computeSize = () => [0, -4];
         }
     }
+    // Nodes 2.0：同上的刷新（仅改可见性数据不会立刻重渲染）
+    try { if (Array.isArray(self.widgets)) self.widgets = self.widgets.slice(); } catch (_) {}
+    try { self.graph?.trigger?.("node:slot-label:changed", { nodeId: self.id, slotType: 2 }); } catch (_) {}
     // 剧本（由磁盘最后一次生成文件填充：开启增强=已增强剧本，未开启=故事拆解；复制/编辑基于它）；当前故事初值 = 上次持久化的 story_name
     self.__viewerScript = "";
     self.__viewerSource = "";   // 剧本来源：已增强剧本 / 故事拆解

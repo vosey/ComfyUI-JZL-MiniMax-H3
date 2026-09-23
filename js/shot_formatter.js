@@ -62,7 +62,13 @@ app.registerExtension({
                     origCb?.apply?.(this, arguments);
                     muteUpstream(self, value);
                     const bt = self.widgets?.find(w => w.name === "选择要重拍的分段");
-                    if (bt?.inputEl) bt.inputEl.style.display = value ? "inline-block" : "none";
+                    // Nodes 2.0：按钮是 Vue 部件，visibility 只能靠 hidden/options.hidden（没有 inputEl）
+                    if (bt) {
+                        if (!bt.options) bt.options = {};
+                        bt.hidden = !value;
+                        bt.options.hidden = !value;
+                        if (bt.inputEl) bt.inputEl.style.display = value ? "inline-block" : "none";
+                    }
                 };
             }
 
@@ -86,15 +92,24 @@ app.registerExtension({
                             let wPath = self.widgets?.find(w => w.name === "_reshoot_path");
                             if (!wPath) {
                                 wPath = self.addWidget("string", "_reshoot_path", "", () => {});
-                                wPath.inputEl.style.display = "none";
+                                if (!wPath.options) wPath.options = {};
+                                wPath.options.hidden = true;
+                                wPath.hidden = true;
+                                if (wPath.inputEl) wPath.inputEl.style.display = "none";
                             }
                             wPath.value = data.path;
-                            wPath.inputEl.value = data.path;
+                            if (wPath.inputEl) wPath.inputEl.value = data.path;
+                            else if (wPath.element && "value" in wPath.element) wPath.element.value = data.path;
                             app.graph?.setDirtyCanvas?.(true, true);
                         }
                     }).catch(() => {});
                 });
-                btn.inputEl.style.display = wMode?.value ? "inline-block" : "none";
+                if (btn) {
+                    if (!btn.options) btn.options = {};
+                    btn.options.hidden = !wMode?.value;
+                    btn.hidden = !wMode?.value;
+                    if (btn.inputEl) btn.inputEl.style.display = wMode?.value ? "inline-block" : "none";
+                }
             }, 200);
 
             return r;

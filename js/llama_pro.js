@@ -134,6 +134,9 @@ function syncAdvancedWidgets(node, { adjustHeight = true } = {}) {
     node._widgetSlotsDirty = true;
     node.setDirtyCanvas?.(true, true);
     node.graph?.setDirtyCanvas?.(true, true);
+    // Nodes 2.0：改完可见性要触发一次前端重渲染（只改 type/hidden/options.hidden 不会立刻生效）
+    try { if (Array.isArray(node.widgets)) node.widgets = node.widgets.slice(); } catch (_) {}
+    try { node.graph?.trigger?.("node:slot-label:changed", { nodeId: node.id, slotType: 2 }); } catch (_) {}
 }
 
 // ── 注册扩展 ──

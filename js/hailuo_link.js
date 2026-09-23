@@ -17,7 +17,12 @@ const HAILUO_TYPES = new Set(["JZL_HailuoH3VideoParams", "JZL_HailuoH3VideoParam
 function dispatch(w, val) {
     if (!w) return;
     const el = w.element || w.inputEl;
-    if (!el) return;
+    // Nodes 2.0：combo/number 是 Vue 组件，没有 element 可直接派发 → 写 value + 走 callback
+    if (!el) {
+        if (w.value !== val) w.value = val;
+        try { w.callback?.(val); } catch (_) {}
+        return;
+    }
     el.value = val;
     // 只触发原生事件让 ComfyUI 统一更新 value 和 callback；不手动调 callback，避免双重触发
     const evt = el.tagName === "SELECT" ? "change" : "input";

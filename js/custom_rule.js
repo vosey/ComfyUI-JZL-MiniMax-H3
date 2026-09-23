@@ -19,6 +19,9 @@ function setHidden(widget, hidden) {
         widget.__origComputeSize = widget.computeSize;
     }
     widget.hidden = hidden;
+    // Nodes 2.0：可见性看 options.hidden（只看 widget.hidden / type="hidden" 是藏不住的）
+    if (!widget.options) widget.options = {};
+    widget.options.hidden = hidden;
     if (hidden) {
         widget.computeSize = () => [0, -4];
         if (widget.inputEl) widget.inputEl.style.display = "none";
@@ -28,7 +31,10 @@ function setHidden(widget, hidden) {
         if (widget.inputEl) widget.inputEl.style.display = "";
         if (widget.element) widget.element.style.display = "";
     }
-    if (widget._state) widget._state.hidden = hidden;
+    if (widget._state) {
+        widget._state.hidden = hidden;
+        if (widget._state.options) widget._state.options.hidden = hidden;
+    }
 }
 
 function syncCustomRuleVisibility(node) {
@@ -36,6 +42,9 @@ function syncCustomRuleVisibility(node) {
     const on = toggle ? asBoolean(toggle.value) : false;
     setHidden(getWidget(node, "custom_rule_path"), !on);
     setHidden(getWidget(node, "选择自定义规则文件"), !on);
+    // Nodes 2.0：改完可见性要触发一次前端重渲染（只改 type/hidden/options.hidden 不会立刻生效）
+    try { if (Array.isArray(node.widgets)) node.widgets = node.widgets.slice(); } catch (_) {}
+    try { node.graph?.trigger?.("node:slot-label:changed", { nodeId: node.id, slotType: 2 }); } catch (_) {}
     node.setDirtyCanvas?.(true, true);
 }
 

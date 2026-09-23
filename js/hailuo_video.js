@@ -43,6 +43,8 @@ app.registerExtension({
                 if (!wDisp || !wDur) continue;
 
                 // 显示窗样式：只读 + 绿色等宽
+                // Nodes 2.0：只读要用 widget.options.read_only；Vue 部件没有 element 可改样式
+                try { if (wDisp.options) wDisp.options.read_only = true; } catch (_) {}
                 const el = wDisp.inputEl || wDisp.element;
                 if (el && el.style && el.style.backgroundColor !== "rgb(34, 34, 34)") {
                     el.readOnly = true;

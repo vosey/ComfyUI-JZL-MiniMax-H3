@@ -71,8 +71,10 @@ app.registerExtension({
                     if (!(list instanceof Array)) list = [list];
                     for (const l of list) {
                         const w = ComfyWidgets["STRING"](this, "text_" + (this.widgets?.length ?? 0), ["STRING", { multiline: true }], app).widget;
-                        w.inputEl.readOnly = true;
-                        w.inputEl.style.opacity = 0.6;
+                        // Nodes 2.0：Vue 部件可能没有 inputEl/element，禁止裸访问（否则整段 onExecuted 抛错）
+                        try { if (w.options) w.options.read_only = true; } catch (_) {}
+                        if (w.inputEl) { w.inputEl.readOnly = true; w.inputEl.style.opacity = 0.6; }
+                        else if (w.element) { try { w.element.readOnly = true; w.element.style.opacity = 0.6; } catch (_) {} }
                         w.value = l;
                     }
                 }
