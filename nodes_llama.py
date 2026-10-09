@@ -849,12 +849,24 @@ class JZL_MiniMax_ScriptProcessor:
 
     @staticmethod
     def _call_api(config, system_prompt, user_msg):
-        """根据 API 配置调用大模型 API，返回生成文本。"""
+        """根据 API 配置调用大模型 API，返回生成文本。
+
+        user_msg 可为字符串，也可为 OpenAI 多模态 content 数组（识图：text + image_url）。
+        仅 OpenAI 兼容协议支持数组；Anthropic / Gemini 会自动降级为纯文本（丢弃参考图）并打印提示。
+        """
         try:
             cfg = json.loads(config) if isinstance(config, str) else (config or {})
         except Exception:
             return "[API 配置错误] 无法解析 API 配置 JSON"
         provider = cfg.get("provider", "")
+        if isinstance(user_msg, list):
+            from .vision_utils import has_images, flatten_user_content
+            if has_images(user_msg):
+                if ("Anthropic" in provider) or ("Gemini" in provider):
+                    print(f"[JZL-API] ⚠️ {provider} 暂不支持识图（仅 OpenAI 兼容协议的 image_url）→ 已丢弃参考图，按纯文本调用")
+                    user_msg = flatten_user_content(user_msg)
+                else:
+                    print("[JZL-API] 已附带参考图（多模态识图消息）")
         model = (cfg.get("model") or "").strip()
         api_key = (cfg.get("api_key") or "").strip()
         base_url = (cfg.get("base_url") or "").strip()
@@ -880,7 +892,7 @@ class JZL_MiniMax_ScriptProcessor:
                 enable_scene, enable_props, enable_video, enable_audio,
                 seed, force_offload, save_states,
                 llm_backend="local", llama_model=None, parameters=None, api_config=None, preference=None, custom_rule_path=None, gen_dir=None,
-                seam_runway=0.0):
+                seam_runway=0.0, vision_images=None):
         """seam_runway：「无限时长」节点传入的段首衔接跑道（秒），0 = 未启用衔接。
         启用时第 2 段起的**生成时长 = 设定时长 + 跑道**（跑道承接上段末帧、成片裁掉 ⇒ 落盘 = 设定时长），
         会写进「**时长**」字段要求与 user 消息（见 presets/script.py::_duration_spec_with_runway）。
@@ -926,9 +938,21 @@ class JZL_MiniMax_ScriptProcessor:
                        "绝不切成很多短段）" if _auto_count else f"请生成恰好 {segment_count} 个分段")
         user_msg = f"{_seg_clause}，{_dur_clause}，输出 [SHOT_START]...[SHOT_END] 完整块（分段信息 + 六段提示词 + 调度指令）。"
 
+        # 识图（开启「拆解识图」时由管理器传入与故事同名的参考图）
+        #   本地：需 mmproj + chat_handler（未配置自动跳过）；在线 API：需选择视觉模型（如 deepseek-v4-flash-vision-exp）
+        _vimgs = list(vision_images or [])
+        _vu = None
+        if _vimgs:
+            from . import vision_utils as _vu
+            if not _vu.vision_local_ready(llm_backend, (llama_model if isinstance(llama_model, dict) else {}) or {}):
+                _vimgs = []
+            else:
+                system_prompt = system_prompt + _vu.vision_note(_vimgs)
+        _user_content = _vu.vision_user_content(user_msg, _vimgs) if (_vimgs and _vu) else user_msg
+
         if "api" in str(llm_backend) and api_config:
             print("[JZL-API] 使用在线 API 生成，跳过本地模型加载")
-            result = self._call_api(api_config, system_prompt, user_msg)
+            result = self._call_api(api_config, system_prompt, _user_content)
         elif "local" in str(llm_backend) and llama_model is not None:
             if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != llama_model:
                 print("[JZL-llama] 开始加载模型...")
@@ -938,7 +962,7 @@ class JZL_MiniMax_ScriptProcessor:
                 _params.pop("present_penalty", None)
                 _params.pop("state_uid", None)
                 output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
-                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_msg}],
+                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": _user_content}],
                     seed=seed, **_params)
                 result = output["choices"][0]["message"]["content"]
             except Exception as e:

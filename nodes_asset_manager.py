@@ -281,7 +281,9 @@ MANAGER_DEFAULTS = {
     },
     "assets": {"images": [], "videos": [], "audios": []},
     "enhance": {
-        "story_decompose": True,
+        "story_decompose": True,        # 固定开启（面板已移除该项；旧配置为 False 也按开启处理）
+        "vision_decompose": False,      # 开启拆解识图（参考素材同名图片交给 LLM）
+        "vision_expand": False,         # 开启扩写识图
         "enabled": False,
         "llm_backend": "在线API [api]",
         "force_offload": False,
@@ -2483,15 +2485,24 @@ def _llm_local_config(enhance):
     return custom_config, parameters
 
 
-def _llm_chat(enhance, system_prompt, user_msg, seed):
-    """按 enhance 配置调用 LLM（本地/API），返回生成文本。"""
+def _llm_chat(enhance, system_prompt, user_msg, seed, images=None):
+    """按 enhance 配置调用 LLM（本地/API），返回生成文本。
+
+    images: [(类型, 素材名, data_uri)] —— 非空时走多模态识图；本地未配置视觉模块会自动跳过图片。
+    """
     from .llama_backend import LLAMA_CPP_STORAGE
     from .nodes_llama import JZL_MiniMax_ScriptProcessor
+    from . import vision_utils as _vu
+
+    _imgs = list(images or [])
+    if _imgs and not _vu.vision_local_ready(enhance.get("llm_backend"), enhance.get("llm") or {}):
+        _imgs = []
+    _user_content = _vu.vision_user_content(user_msg, _imgs) if _imgs else user_msg
 
     if "api" in str(enhance.get("llm_backend", "")):
         api_cfg = enhance.get("api") or {}
         return JZL_MiniMax_ScriptProcessor._call_api(
-            json.dumps(api_cfg, ensure_ascii=False), system_prompt, user_msg)
+            json.dumps(api_cfg, ensure_ascii=False), system_prompt, _user_content)
 
     custom_config, parameters = _llm_local_config(enhance)
     if not custom_config["model"]:
@@ -2505,7 +2516,7 @@ def _llm_chat(enhance, system_prompt, user_msg, seed):
         _params.pop("state_uid", None)
         output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
             messages=[{"role": "system", "content": system_prompt},
-                      {"role": "user", "content": user_msg}],
+                      {"role": "user", "content": _user_content}],
             seed=seed, **_params)
         return output["choices"][0]["message"]["content"]
     except Exception as e:
@@ -2597,8 +2608,16 @@ def _run_story_expander(story, manager, story_style, story_name, prompt_lang, se
     system_prompt = build_expand_prompt(lang, style_text, expand_words,
                                         expand_source=expand_source, material_intro=material_intro)
 
+    # 扩写识图：命中「参考素材管理」里与故事同名的 角色/场景/道具 图片 → 一并交给 LLM（无命中自动跳过）
+    _vimgs = []
+    if enhance.get("vision_expand"):
+        from . import vision_utils as _vu
+        _vimgs = _vu.collect_vision_images(manager.get("assets") or {}, story)
+        if _vimgs:
+            system_prompt = system_prompt + _vu.vision_note(_vimgs)
+
     # 与拆解/增强共享 seed/生成后控制；强制卸载统一由外部 _llm_finish 处理
-    output = _llm_chat(enhance, system_prompt, (story or "").strip(), seed)
+    output = _llm_chat(enhance, system_prompt, (story or "").strip(), seed, images=_vimgs)
     if output.startswith(("[错误]", "[API 错误]", "[API 配置错误]", "[LLM 错误]")):
         return (story or "").strip(), output
     expanded = output.strip()
@@ -2658,6 +2677,11 @@ def _run_script_processor(story, manager, video_count, story_style, story_name, 
 
     print(f"[JZL-剧本] 直接调用 JZL_MiniMax_ScriptProcessor | 模式={mode} | 分段={'剧情决定' if _vc_auto else str(count) + '段'} | "
           f"风格「{story_style}」 | 故事「{story_name or ''}」 | 后端={'API' if is_api else '本地'} | 增强={'开' if enhance_enabled else '关'}")
+    # 拆解识图：命中「参考素材管理」里与故事同名的 角色/场景/道具 图片 → 一并交给 LLM（无命中自动跳过）
+    _vimgs = []
+    if enhance.get("vision_decompose"):
+        from . import vision_utils as _vu
+        _vimgs = _vu.collect_vision_images(manager.get("assets") or {}, story)
     script_output, _bus = JZL_MiniMax_ScriptProcessor().execute(
         mode=mode,
         story_name=(story_name or "").strip(),
@@ -2683,6 +2707,7 @@ def _run_script_processor(story, manager, video_count, story_style, story_name, 
         custom_rule_path=custom_rule_text or None,
         gen_dir=gen_dir,
         seam_runway=seam_runway,
+        vision_images=_vimgs or None,
     )
     if script_output.startswith(("[错误]", "[API 错误]", "[API 配置错误]", "[LLM 错误]")):
         return story, script_output
@@ -3149,7 +3174,7 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         # 每次运行归入一个新批次：output/jzl/{故事名}/第NNNNN次生成/（拆解+增强共用同一批次）
         gen_dir = None
-        if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
+        if not passthrough and not has_shots and prompt_input:
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             prompt_input, err = _run_script_processor(
@@ -3671,7 +3696,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                                      ui={"manager_error": _nl_err})
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         gen_dir = None
-        if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
+        if not passthrough and not has_shots and prompt_input:
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             prompt_input, err = _run_script_processor(
@@ -4181,7 +4206,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                   f"本节点会再裁掉段首 {seam_window_cfg + seam_settle} 帧跑道 → 落盘 = 生成 − 跑道。"
                   f"若要落盘 = 设定时长，请把每段 **时长** 写成「设定时长 + {seam_runway_sec:.2f} 秒」")
         gen_dir = None
-        if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
+        if not passthrough and not has_shots and prompt_input:
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             prompt_input, err = _run_script_processor(
@@ -4783,7 +4808,7 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
         # ① 故事拆解（剧本处理器）
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         gen_dir = None
-        if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
+        if not passthrough and not has_shots and prompt_input:
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             prompt_input, err = _run_script_processor(

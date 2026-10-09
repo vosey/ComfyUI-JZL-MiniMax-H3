@@ -1,36 +1,54 @@
 import { app } from "../../scripts/app.js";
 
 // ============================================================
-// JZL_MiniMaxMusicLyricsEditor — 官方段落标签快捷插入
-//   点击按钮 → 在当前光标处插入标签并另起一行
+// JZL_MiniMaxMusicLyricsEditor — 官方段落标签 + 人声角色标注
+//   符号规范来源：MiniMax-Music3 README.md
+//     「Lyrics define the words to be sung and may include explicit
+//       section tags such as [Intro], [Verse], [Pre-Chorus], [Chorus],
+//       [Post-Chorus], [Bridge], [Instrumental], [Solo], and [Outro]」
+//   ⚠ 「人声角色」组为社区惯例，官方文档未定义语法；段落标签
+//     与歌词文本必须在同一行会降低识别率，故插入时强制独占一行。
 // ============================================================
 
 const NODE_TYPE = "JZL_MiniMaxMusicLyricsEditor";
 const TEXT_WIDGET = "lyrics_text";
 const PICKER_ID = "jzl-lyrics-tag-picker";
 
-const TAGS = [
-    ["[前奏][Intro]", "[Intro]"],
-    ["[主歌][Verse]", "[Verse]"],
-    ["[主歌1][Verse 1]", "[Verse 1]"],
-    ["[主歌2][Verse 2]", "[Verse 2]"],
-    ["[主歌3][Verse 3]", "[Verse 3]"],
-    ["[预副歌][Pre-Chorus]", "[Pre-Chorus]"],
-    ["[副歌][Chorus]", "[Chorus]"],
-    ["[副歌1][Chorus 1]", "[Chorus 1]"],
-    ["[副歌2][Chorus 2]", "[Chorus 2]"],
-    ["[后副歌][Post-Chorus]", "[Post-Chorus]"],
-    ["[桥段][Bridge]", "[Bridge]"],
-    ["[钩子][Hook]", "[Hook]"],
-    ["[间奏][Instrumental]", "[Instrumental]"],
-    ["[独奏][Solo]", "[Solo]"],
-    ["[舞曲间奏桥][Instrumental dance bridge]", "[Instrumental dance bridge]"],
-    ["[分解][Breakdown]", "[Breakdown]"],
-    ["[分解转副歌][Breakdown to drums-Chorus]", "[Breakdown to drums-Chorus]"],
-    ["[全员副歌][All in Chorus]", "[All in Chorusar Break]"],
-    ["[分解][Breakdown]", "[Breakdown]"],
-    ["[最终副歌][Final Chorus]", "[Final Chorus]"],
-    ["[尾奏][Outro]", "[Outro]"],
+// 官方 README 明列的 9 个段落标签
+const OFFICIAL_TAGS = [
+    ["[前奏] Intro", "[Intro]"],
+    ["[主歌] Verse", "[Verse]"],
+    ["[预副歌] Pre-Chorus", "[Pre-Chorus]"],
+    ["[副歌] Chorus", "[Chorus]"],
+    ["[后副歌] Post-Chorus", "[Post-Chorus]"],
+    ["[桥段] Bridge", "[Bridge]"],
+    ["[器乐间奏] Instrumental", "[Instrumental]"],
+    ["[独奏] Solo", "[Solo]"],
+    ["[尾奏] Outro", "[Outro]"],
+];
+
+// 编号 / 终段变体（官方示例仅用 [Verse]，编号为常见扩展写法）
+const EXTRA_TAGS = [
+    ["[主歌1] Verse 1", "[Verse 1]"],
+    ["[主歌2] Verse 2", "[Verse 2]"],
+    ["[副歌1] Chorus 1", "[Chorus 1]"],
+    ["[副歌2] Chorus 2", "[Chorus 2]"],
+    ["[最终副歌] Final Chorus", "[Final Chorus]"],
+];
+
+// 人声角色标注（社区惯例，官方未文档化）—— 配合双人节点做男女对唱 / 合唱
+//   ⚠️ 官方预处理（comfy/ldm/minimax_music/prompt.py）只把 [方括号] 当标签，
+//      圆括号 (Singer A): 不会被识别，会被当成歌词内容唱出来 → 一律用 [ ]。
+//   kind="block"  → 独占一行的段落标签
+//   kind="inline" → 光标处行内插入（真实预处理会把 [标签] 自动拆到独立行）
+const VOCAL_TAGS = [
+    ["段落·男声 [Verse: Male Vocal]", "[Verse: Male Vocal]", "block"],
+    ["段落·女声 [Verse: Female Vocal]", "[Verse: Female Vocal]", "block"],
+    ["段落·对唱 [Chorus: Duet]", "[Chorus: Duet]", "block"],
+    ["段落·合唱 [Chorus: Full Choir]", "[Chorus: Full Choir]", "block"],
+    ["行·角色A [Singer A]", "[Singer A] ", "inline"],
+    ["行·角色B [Singer B]", "[Singer B] ", "inline"],
+    ["行·齐唱 [Together]", "[Together] ", "inline"],
 ];
 
 function getLyricsWidget(node) {
@@ -60,7 +78,7 @@ function bindCursorTracking(w) {
     }
 }
 
-function insertTag(node, w, tag) {
+function insertTag(node, w, tag, inline) {
     bindCursorTracking(w);
     const ta = findTextarea(w);
     const text = String(w.value ?? "");
@@ -79,8 +97,9 @@ function insertTag(node, w, tag) {
     if (!Number.isFinite(start) || start < 0) start = text.length;
     if (!Number.isFinite(end) || end < start) end = start;
 
-    const prefix = start > 0 && text[start - 1] !== "\n" ? "\n" : "";
-    const inserted = prefix + tag + "\n";
+    // 段落标签独占一行；行级角色标注在光标处行内插入
+    const prefix = (!inline && start > 0 && text[start - 1] !== "\n") ? "\n" : "";
+    const inserted = inline ? tag : prefix + tag + "\n";
     const next = text.slice(0, start) + inserted + text.slice(end);
     const pos = start + inserted.length;
 
@@ -107,6 +126,36 @@ function closeTagPicker() {
 
 let pickerEscHandler = null;
 
+function makeButton(node, w, item) {
+    const [label, tag, kind] = item;
+    const inline = kind === "inline";
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.style.cssText = "padding:7px 6px;border:1px solid #555;border-radius:6px;background:#2a2a2e;color:#eee;cursor:pointer;font-size:12px;line-height:1.25;text-align:left;";
+    b.addEventListener("mouseenter", () => { b.style.background = "#3a3a40"; });
+    b.addEventListener("mouseleave", () => { b.style.background = "#2a2a2e"; });
+    b.addEventListener("click", () => { insertTag(node, w, tag, inline); closeTagPicker(); });
+    if (inline) b.style.borderColor = "#6a5acd";
+    return b;
+}
+
+function addGroup(panel, title, note, items, node, w, accent) {
+    const h = document.createElement("div");
+    h.textContent = title;
+    h.style.cssText = `color:${accent || "#9ad"};font-size:12px;font-weight:600;margin:10px 0 6px;`;
+    panel.appendChild(h);
+    if (note) {
+        const n = document.createElement("div");
+        n.textContent = note;
+        n.style.cssText = "color:#999;font-size:11px;margin:-3px 0 6px;line-height:1.35;";
+        panel.appendChild(n);
+    }
+    const grid = document.createElement("div");
+    grid.style.cssText = "display:grid;grid-template-columns:repeat(3,1fr);gap:6px;";
+    for (const item of items) grid.appendChild(makeButton(node, w, item));
+    panel.appendChild(grid);
+}
+
 function showTagPicker(node, w) {
     closeTagPicker();
     const overlay = document.createElement("div");
@@ -115,25 +164,27 @@ function showTagPicker(node, w) {
     overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeTagPicker(); });
 
     const panel = document.createElement("div");
-    panel.style.cssText = "background:#1b1b1f;border:1px solid #444;border-radius:10px;padding:14px;max-width:640px;width:92%;box-shadow:0 10px 40px rgba(0,0,0,.6);";
+    panel.style.cssText = "background:#1b1b1f;border:1px solid #444;border-radius:10px;padding:14px;max-width:700px;width:92%;max-height:86vh;overflow:auto;box-shadow:0 10px 40px rgba(0,0,0,.6);";
 
     const title = document.createElement("div");
-    title.textContent = "添加段落标签（插入到当前光标处）";
-    title.style.cssText = "color:#eee;font-size:14px;font-weight:600;margin-bottom:10px;";
+    title.textContent = "添加元素（插入到当前光标处）";
+    title.style.cssText = "color:#eee;font-size:14px;font-weight:600;margin-bottom:4px;";
     panel.appendChild(title);
 
-    const grid = document.createElement("div");
-    grid.style.cssText = "display:grid;grid-template-columns:repeat(3,1fr);gap:6px;";
-    for (const [label, tag] of TAGS) {
-        const b = document.createElement("button");
-        b.textContent = label;
-        b.style.cssText = "padding:7px 6px;border:1px solid #555;border-radius:6px;background:#2a2a2e;color:#eee;cursor:pointer;font-size:12px;line-height:1;";
-        b.addEventListener("mouseenter", () => { b.style.background = "#3a3a40"; });
-        b.addEventListener("mouseleave", () => { b.style.background = "#2a2a2e"; });
-        b.addEventListener("click", () => { insertTag(node, w, tag); closeTagPicker(); });
-        grid.appendChild(b);
-    }
-    panel.appendChild(grid);
+    const sub = document.createElement("div");
+    sub.textContent = "段落标签会独占一行并自动换行；行级角色标注直接插在光标处，请接着写歌词。";
+    sub.style.cssText = "color:#999;font-size:11px;margin-bottom:8px;line-height:1.35;";
+    panel.appendChild(sub);
+
+    addGroup(panel, "① 官方段落标签（MiniMax 官方 README 明列）", null,
+        OFFICIAL_TAGS, node, w, "#8fd18f");
+    addGroup(panel, "② 编号 / 终段变体（官方示例的扩展写法）", null,
+        EXTRA_TAGS, node, w, "#9ad");
+    addGroup(panel, "③ 人声角色 —— 对唱 / 合唱（社区惯例，官方未文档化）",
+        "⚠️ 只有 [方括号] 会被识别为标签；用 (Singer A): 这种圆括号写法会被当成歌词唱出来！" +
+        "段落标签标注整段由谁唱；[Singer A] 插在句首可逐句指定角色。",
+        VOCAL_TAGS, node, w, "#e0a96d");
+
     overlay.appendChild(panel);
     document.body.appendChild(overlay);
 

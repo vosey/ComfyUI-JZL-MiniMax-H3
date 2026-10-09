@@ -1800,6 +1800,22 @@ function showVideoPreview(path) {
     document.body.appendChild(overlay);
 }
 
+// 字母编号分配：同一类型（已启用、type 相同）中**第一个未被占用的字母** A-Z；全占用返回 ""（后端会兜底自动分配）
+function nextFreeLetter(list, type) {
+    const used = new Set();
+    (list || []).forEach((it) => {
+        if (!it || it.enabled === false) return;
+        if ((it.type || "") !== (type || "")) return;
+        const L = String(it.letter || "").trim().toUpperCase();
+        if (L) used.add(L);
+    });
+    for (let i = 0; i < 26; i++) {
+        const L = String.fromCharCode(65 + i);
+        if (!used.has(L)) return L;
+    }
+    return "";
+}
+
 function makeAssetCard(kind, index, item, list, onEdit, onDelete, isLast, refreshAll) {
     const refreshAllFn = refreshAll || (() => {});
     const row = el("div", "display:flex;align-items:center;gap:8px;margin:5px 0;padding:6px 8px;background:var(--comfy-menu-bg,#232323);border:1px solid var(--border-color,#3a3a3a);border-radius:6px;");
@@ -1837,12 +1853,7 @@ function makeAssetCard(kind, index, item, list, onEdit, onDelete, isLast, refres
     const renderLetters = () => {
         const used = usedLetters();
         letterSel.innerHTML = "";
-        // 空白项「—」= 未指定编号（生成时后端按类型自动分配 A/B/C…）；新增默认空白，不占编号、不顶掉前面的
-        const blank = el("option", "", "—");
-        blank.value = "";
-        blank.title = "未指定编号（生成时按类型自动分配）";
-        if (!(item.letter || "").trim()) blank.selected = true;
-        letterSel.append(blank);
+        // 编号必选（不再提供「—」空白项）：新增/丢失的编号由 nextFreeLetter 自动补「靠前的未被占用字母」
         // 26 字母全部显示；已被同类其他素材占用的置灰禁用（可见但不可选），切换/换编号后实时刷新
         const cur = (item.letter || "").trim().toUpperCase();
         for (let i = 0; i < 26; i++) {
@@ -2151,7 +2162,13 @@ function renderAssetSection(c, kind, list, title) {
     };
     const renderList = () => {
         box.innerHTML = "";
+        let _letterFixed = false;
         list.forEach((item, i) => {
+            // 编号丢失/未指定（如音频偶尔丢号）→ 自动补「靠前的未被占用字母」（同类型内唯一），并回写保存
+            if (!String(item.letter || "").trim()) {
+                const _L = nextFreeLetter(list, item.type || "");
+                if (_L) { item.letter = _L; _letterFixed = true; }
+            }
             const isLast = i === list.length - 1;
             const card = makeAssetCard(kind, i, item, list, fireEdit, () => {
                 list.splice(i, 1);
@@ -2170,11 +2187,13 @@ function renderAssetSection(c, kind, list, title) {
         const addBtn = el("button", "margin-top:4px;width:100%;padding:6px;background:#2a3a4a;color:#9fc3e8;border:1px dashed #5b9bd5;border-radius:6px;font-size:12px;cursor:pointer;", `+ 添加${KIND_LABEL[kind]}`);
         addBtn.classList.add("jzl-asset-add");
         addBtn.addEventListener("click", () => {
-            list.push({ type: (ASSET_TYPES_BY_KIND[kind] || ASSET_TYPES)[0], name: "", path: "", enabled: true, letter: "" });
+            const _t0 = (ASSET_TYPES_BY_KIND[kind] || ASSET_TYPES)[0];
+            list.push({ type: _t0, name: "", path: "", enabled: true, letter: nextFreeLetter(list, _t0) });
             renderList();
             fireEdit();
         });
         box.appendChild(addBtn);
+        if (_letterFixed) setTimeout(() => { try { fireEdit(); } catch (_) {} }, 0);   // 补号后立即持久化
     };
     renderList();
     c.append(box);
@@ -2655,7 +2674,9 @@ function defaultSettings() {
         },
         assets: { images: [], videos: [], audios: [] },
         enhance: {
-            story_decompose: true,
+            story_decompose: true,          // 固定开启（面板已隐藏该项；后端也强制开启）
+            vision_decompose: false,        // 开启拆解识图（同名参考图交给 LLM）
+            vision_expand: false,           // 开启扩写识图
             enabled: false,
             llm_backend: "在线API [api]",
             force_offload: false,
@@ -2671,7 +2692,7 @@ function defaultSettings() {
             },
             api: {
                 provider: "OpenAI 兼容 (OpenAI/DeepSeek/Qwen/GLM/Kimi/Ollama/vLLM/LM Studio)",
-                model: "deepseek-v4-flash", api_key: "", base_url: "https://api.deepseek.com/v1",
+                model: "deepseek-v4-flash-vision-exp", api_key: "", base_url: "https://api.deepseek.com/v1",
                 temperature: 0.6, max_tokens: 81920, thinking: "disabled",
             },
             preference: {
@@ -2697,7 +2718,7 @@ function defaultSettings() {
             },
             second: {
                 enabled: false,
-                upscaler_model: "minimax_h3_latent_upscaler_3d_fp32.pth",
+                upscaler_model: "",
                 device: "cuda", precision: "fp32",
                 sampler: "euler", scheduler: "simple", steps: 3, denoise: 0.3,
                 sigmas_mode: "scheduler",
@@ -2859,22 +2880,22 @@ function renderPromptPanel(c, s, d, node) {
     renderAutoSave(c, s);
 
     // ── 输出语言（最顶优先选择；读写 manager_settings.enhance.prompt_lang，随工作流保存）──
-    c.append(makeSectionTitle("输出语言"));
+    c.append(makeSectionTitle("LLM 语言"));
     c.append(field("输出语言", selectControl(["中文 [ZH]", "英文 [EN]"], p.prompt_lang || "中文 [ZH]", v => { p.prompt_lang = v; })));
 
-    // ── 开关 ──
-    c.append(makeSectionTitle("开关"));
-    c.append(field("故事拆解", checkboxControl(p.story_decompose !== false, "把故事通过 LLM 拆解为分段提示词", v => { p.story_decompose = v; })));
-    c.append(field("开启增强", checkboxControl(p.enabled === true, "拆解后对每个分段的详细描述再做润色", v => { p.enabled = v; })));
-    c.append(field("强制卸载", checkboxControl(p.force_offload === true, "LLM 用完即卸载（增强开启时等增强后再卸）", v => { p.force_offload = v; })));
+    // ── 开关（「故事拆解」已固定开启，不再在面板暴露）──
+    c.append(makeSectionTitle("LLM 开关"));
+    c.append(field("开启文本增强", checkboxControl(p.enabled === true, "拆解后对每个分段的详细描述再做润色", v => { p.enabled = v; })));
+    c.append(field("开启拆解识图", checkboxControl(p.vision_decompose === true, "故事拆解时识别「参考素材」里的图片", v => { p.vision_decompose = v; })));
+    c.append(field("开启扩写识图", checkboxControl(p.vision_expand === true, "故事扩写时识别「参考素材」里的图片", v => { p.vision_expand = v; })));
 
     // ── 故事扩写设置（📚 故事扩写模式专用）──
     c.append(makeSectionTitle("故事扩写设置"));
     const expandRow = el("div", "display:flex;flex-direction:column;gap:6px;margin-bottom:10px;");
     const expandCbs = [];
     const expandOpts = [
-        { val: "素材", label: "使用参考扩写", tip: "严格按照「参考素材管理」勾选的角色/场景/道具进行扩写" },
-        { val: "自由", label: "自由发挥扩写", tip: "在用户输入故事的基础上，按所选故事风格自由发挥扩写" },
+        { val: "素材", label: "使用参考扩写", tip: "使用「参考素材」中的角色/场景/道具进行故事扩写" },
+        { val: "自由", label: "自由发挥扩写", tip: "在用户故事的基础上，按所选故事风格自由发挥扩写" },
     ];
     const mkExpandCb = (opt) => {
         const lab = el("label", "display:flex;align-items:flex-start;gap:8px;font-size:13px;color:var(--descrip-text,#999);cursor:pointer;");
@@ -2900,7 +2921,7 @@ function renderPromptPanel(c, s, d, node) {
     // 迁移兼容：旧配置无 expand_source → 默认「素材」（初次打开渲染已默认，无需额外处理）
 
     // ── LLM 后端（方形勾选单选：本地 / 在线API，切换只显示对应设置区块；样式与「故事拆解」一致）──
-    c.append(makeSectionTitle("LLM 后端"));
+    c.append(makeSectionTitle("LLM 模型"));
     const backendRow = el("div", "display:flex;align-items:center;gap:16px;min-width:0;");
     const backendCbs = [];
     const mkBackendCb = (val, label) => {
@@ -2934,6 +2955,8 @@ function renderPromptPanel(c, s, d, node) {
     // 关键修复：下拉默认显示第一个模型，但 llm.model 仍为空 → 之前点保存会存成空串触发「未选择本地 LLM 模型」。
     // 打开面板时把「所见即所得」同步进存储：不切换直接保存也会持久化当前显示的模型。
     if (!llm.model && llmModels.length && !llmModels[0].startsWith("（")) llm.model = llmModels[0];
+    // 强制卸载（从「开关」区移入本地 LLM 区；放在模型选择**之前**）
+    localBox.append(field("强制卸载", checkboxControl(p.force_offload === true, "LLM 用完即卸载（增强开启时等增强后再卸）", v => { p.force_offload = v; })));
     localBox.append(field("模型", selectControl(llmModels, llm.model || llmModels[0], v => { llm.model = v; })));
     localBox.append(field("视觉模块 mmproj", selectControl(mmprojModels, llm.mmproj || "None", v => { llm.mmproj = v; })));
     localBox.append(field("Chat Handler", selectControl(chatHandlers, llm.chat_handler || "None", v => { llm.chat_handler = v; })));
@@ -3030,27 +3053,30 @@ function renderPrefPanel(c, s, d, node) {
         "一采后➡️分离latent➡️ 视频latent放大➡️合并latent➡️二次采样",
         v => { sec.enabled = v; })));
     c.append(field("运行设备", selectControl(["cuda", "rocm", "cpu"], sec.device || "cuda", v => { sec.device = v; })));
-    // ── latent 放大模型（磁盘 latent_upscale_models 实时扫描列表；可选「自动」由精度匹配）──
-    // 官方把同一权重拆成 fp32/fp16/bf16 三套独立文件；「自动」= 后端按下方精度扫描对应文件，
-    // 也可显式选择磁盘上任意 latent 放大模型（含自定义模型），选择优先于精度。
-    const upModels = (d && Array.isArray(d.upscaler_models) && d.upscaler_models.length)
-        ? d.upscaler_models
-        : ["minimax_h3_latent_upscaler_3d_fp32.pth", "minimax_h3_latent_upscaler_3d_fp16.safetensors", "minimax_h3_latent_upscaler_3d_bf16.safetensors"];
-    const _AUTO_MODEL = "自动（按精度匹配）";
-    const _curModel = (sec.upscaler_model && upModels.includes(sec.upscaler_model)) ? sec.upscaler_model : _AUTO_MODEL;
-    c.append(field("latent放大模型", selectControl([_AUTO_MODEL, ...upModels], _curModel, v => {
-        sec.upscaler_model = (v === _AUTO_MODEL) ? "" : v;
-        const m = String(v).match(/(fp32|fp16|bf16)/i);  // 显式选标准精度文件 → 同步精度下拉，保持一致
+    // ── latent 放大模型（只读磁盘 latent_upscale_models 目录及其子目录的实时列表：有就是有、没有就是没有）──
+    // 列表来自后端 folder_paths.get_filename_list("latent_upscale_models")（含子目录，返回相对路径）；
+    // 不提供「自动」项、不做任何硬编码兜底（未下载就不显示）；选中项即存储值（所见即所得）。
+    const upModels = (d && Array.isArray(d.upscaler_models)) ? d.upscaler_models : [];
+    const _NO_MODEL = "（未找到放大模型：请把权重放入 models/latent_upscale_models/ 或子目录）";
+    const _miniFirst = upModels.find((n) => /minimax_h3_latent_upscaler_3d/i.test(n));
+    const _curModel = upModels.includes(sec.upscaler_model) ? sec.upscaler_model
+                    : (upModels.length ? (_miniFirst || upModels[0]) : _NO_MODEL);
+    // 旧配置存的空值（"自动"）或已被删除的文件 → 自动落到磁盘上的有效项并写回
+    if (upModels.length && _curModel !== sec.upscaler_model) {
+        sec.upscaler_model = _curModel;
+        const _m0 = String(_curModel).match(/(fp32|fp16|bf16)/i);
+        if (_m0) sec.precision = _m0[1].toLowerCase();
+    }
+    const upSel = selectControl(upModels.length ? upModels : [_NO_MODEL], _curModel, v => {
+        if (!upModels.length) return;
+        sec.upscaler_model = v;
+        const m = String(v).match(/(fp32|fp16|bf16)/i);   // 选到标准精度文件 → 同步精度，保持一致
         if (m) sec.precision = m[1].toLowerCase();
-    })));
-    // 精度 = 决定加载哪个官方权重文件（fp32/fp16/bf16 三套独立文件）；「模型」为自动时按此精度匹配磁盘文件。
-    // 仅当模型为空（自动）或属于标准 MiniMax 名时才交回精度自动匹配；显式自定义模型不被精度覆盖。
-    c.append(field("精度（自动匹配模型）", selectControl(["fp32", "fp16", "bf16"], sec.precision || "fp32", v => {
-        sec.precision = v;
-        if (!sec.upscaler_model || /minimax_h3_latent_upscaler_3d_(fp32|fp16|bf16)/i.test(sec.upscaler_model)) {
-            sec.upscaler_model = "";
-        }
-    })));
+    });
+    if (!upModels.length) { try { upSel.disabled = true; upSel.style.opacity = "0.6"; } catch (_) {} }
+    c.append(field("latent放大模型", upSel));
+    // 精度：仅作为加载精度参数（不再联动清空模型选择——那会把用户的手动选择打回「自动」）
+    c.append(field("精度", selectControl(["fp32", "fp16", "bf16"], sec.precision || "fp32", v => { sec.precision = v; })));
 
     // ── Sigmas 模式（单选：调度器 / 自定义）──
     // 调度器=用 调度器+采样步数+降噪系数 生成 sigmas 二采；自定义=直接用下方输入的自定义 sigmas 序列（对齐 1190 ManualSigmas）
@@ -3264,6 +3290,7 @@ const USAGE_FALLBACK_HTML = `
 </ul>
 <p style="margin:4px 0;">推荐流程：📝 仅提示词输出 调提示词 → 满意后切 🪄 穿透生成模式 用同一份提示词出片。</p>
 <p style="margin:4px 0;">⚠️ <b>输入要求</b>：🛠️ 故事拆解模式 / 📚 故事扩写模式 吃的是<b>自然语言故事</b>；若输入含已拆解标签（<b>===H3_PROMPT===</b>、<b>[SHOT_START]</b>、<b>subject_definitions:</b>、<b>### Video_001</b> 等）会直接报错终止，请改用 <b>🪄 穿透生成模式</b>。</p>
+<p style="margin:4px 0;">🖼️ <b>识图（可选）</b>：大语言模型配置里的「<b>开启拆解识图</b>」「<b>开启扩写识图</b>」会把「参考素材管理」中<b>已启用</b>且<b>与故事同名</b>的图片（角色/场景/道具）一并交给 LLM，让拆解/扩写贴合参考图外观（发型、服装配色、道具造型等）；无同名图片自动跳过。本地模型需先选 <b>mmproj</b> 与 <b>Chat Handler</b>；在线 API 需选视觉模型（默认 <b>deepseek-v4-flash-vision-exp</b>）。</p>
 <p style="margin:4px 0;">⚠️ 穿透生成模式 / 重拍只接受<b>拆解产物</b>：必须含 <b>[SHOT_START]…[SHOT_END]</b> 分段块且每段含 <b>===H3_PROMPT===</b> 六段正文；纯文本故事或手写草稿会被拒绝。段数需与「生成视频数量」匹配（选「<b>剧情决定</b>」则自动跟随剧本段数）；每段块内 <b>**时长**：N</b>（英文提示词为 <b>**Duration**：N</b>）决定该段时长，缺失时按节点「每段视频时长」生成。</p>
 <p style="margin:4px 0;">段数说明：默认「<b>剧情决定</b>」——LLM 先按<b>剧情时间线长度</b>（不是字数）判断需要多少总时长，再按你设定的每段时长自动定段数，避免「选的段数与剧情不匹配」。</p>
 <p style="margin:4px 0;">注：📚 故事扩写模式 / 📝 仅提示词输出 为纯文本模式，会自动静音上游（模型/CLIP/VAE）与除剧本端口外的下游节点，只跑 LLM 文本处理。</p>
@@ -3590,7 +3617,8 @@ function buildModal(node, data, panelId) {
                         const list = kind === "image" ? settings.assets.images : kind === "video" ? settings.assets.videos : settings.assets.audios;
                         const p = await uploadFileObject(file, kind);
                         if (p) {
-                            list.push({ type: (ASSET_TYPES_BY_KIND[kind] || ASSET_TYPES)[0], name: assetNameFromFilename(file.name), path: p, enabled: true, letter: "" });
+                            const _t1 = (ASSET_TYPES_BY_KIND[kind] || ASSET_TYPES)[0];
+                            list.push({ type: _t1, name: assetNameFromFilename(file.name), path: p, enabled: true, letter: nextFreeLetter(list, _t1) });
                             added++;
                         }
                     }

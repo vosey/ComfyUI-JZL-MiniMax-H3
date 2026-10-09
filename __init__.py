@@ -1051,6 +1051,21 @@ async def jzl_reshoot_load(request):
     return web.json_response(data)
 
 
+@PromptServer.instance.routes.get("/jzl/music_recipes")
+async def jzl_music_recipes(request):
+    """返回音乐提示词预设节点的「一键配方」表（单一数据源 = nodes_music._RECIPES）。
+
+    前端拿到后：选定配方 → 自动填值并锁定；选「自定义 / Custom」→ 解锁。
+    """
+    try:
+        return web.json_response({
+            "single": JZL_MiniMaxMusicCaption._RECIPES,
+            "duet": JZL_MiniMaxMusicCaptionDuet._RECIPES,
+        })
+    except Exception as e:
+        return web.json_response({"single": {}, "duet": {}, "error": str(e)}, status=500)
+
+
 @PromptServer.instance.routes.get("/jzl/usage_qr/{name}")
 async def jzl_usage_qr(request):
     """返回 docs 目录下的收款二维码图片（OpenPose 式 FileResponse，不依赖前端静态服务）。
