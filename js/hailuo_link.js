@@ -36,7 +36,7 @@ function syncProcessorToHailuo(graph) {
 
     const wDur = procNodes[0].widgets?.find(w => w.name === "segment_duration");
     if (!wDur) return;
-    const val = Math.max(4, Math.min(15, Math.round(Number(wDur.value)) || 8));
+    const val = Math.max(4, Math.min(60, Math.round(Number(wDur.value)) || 8));
 
     for (const h of haiNodes) {
         if (h._jzl_linked_sync) continue;
@@ -57,7 +57,7 @@ function syncHailuoToProcessor(graph) {
 
     const wHai = haiNodes[0].widgets?.find(w => w.name === "duration");
     if (!wHai) return;
-    const val = Math.max(4, Math.min(15, Math.round(Number(wHai.value)) || 8));
+    const val = Math.max(4, Math.min(60, Math.round(Number(wHai.value)) || 8));
 
     for (const p of procNodes) {
         if (p._jzl_linked_sync) continue;

@@ -15,25 +15,26 @@ const TEXT_WIDGET = "lyrics_text";
 const PICKER_ID = "jzl-lyrics-tag-picker";
 
 // 官方 README 明列的 9 个段落标签
+//   按钮文案 = 中文含义 + 实际标签（插进去的是第二个元素，中文只是给人看的）
 const OFFICIAL_TAGS = [
-    ["[前奏] Intro", "[Intro]"],
-    ["[主歌] Verse", "[Verse]"],
-    ["[预副歌] Pre-Chorus", "[Pre-Chorus]"],
-    ["[副歌] Chorus", "[Chorus]"],
-    ["[后副歌] Post-Chorus", "[Post-Chorus]"],
-    ["[桥段] Bridge", "[Bridge]"],
-    ["[器乐间奏] Instrumental", "[Instrumental]"],
-    ["[独奏] Solo", "[Solo]"],
-    ["[尾奏] Outro", "[Outro]"],
+    ["前奏 [Intro]", "[Intro]"],
+    ["主歌 [Verse]", "[Verse]"],
+    ["预副歌 [Pre-Chorus]", "[Pre-Chorus]"],
+    ["副歌 [Chorus]", "[Chorus]"],
+    ["后副歌 [Post-Chorus]", "[Post-Chorus]"],
+    ["桥段 [Bridge]", "[Bridge]"],
+    ["器乐间奏 [Instrumental]", "[Instrumental]"],
+    ["独奏 [Solo]", "[Solo]"],
+    ["尾奏 [Outro]", "[Outro]"],
 ];
 
 // 编号 / 终段变体（官方示例仅用 [Verse]，编号为常见扩展写法）
 const EXTRA_TAGS = [
-    ["[主歌1] Verse 1", "[Verse 1]"],
-    ["[主歌2] Verse 2", "[Verse 2]"],
-    ["[副歌1] Chorus 1", "[Chorus 1]"],
-    ["[副歌2] Chorus 2", "[Chorus 2]"],
-    ["[最终副歌] Final Chorus", "[Final Chorus]"],
+    ["主歌1 [Verse 1]", "[Verse 1]"],
+    ["主歌2 [Verse 2]", "[Verse 2]"],
+    ["副歌1 [Chorus 1]", "[Chorus 1]"],
+    ["副歌2 [Chorus 2]", "[Chorus 2]"],
+    ["最终副歌 [Final Chorus]", "[Final Chorus]"],
 ];
 
 // 人声角色标注（社区惯例，官方未文档化）—— 配合双人节点做男女对唱 / 合唱

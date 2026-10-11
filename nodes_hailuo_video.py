@@ -36,8 +36,8 @@ class JZL_HailuoH3VideoParams:
                 "multiple": ("INT", {"default": 32, "min": 8, "max": 128, "step": 4}),
                 "frames_display": ("STRING", {"default": "Frames: 0", "multiline": False}),
                 "duration": ("INT", {
-                    "default": 8, "min": 4, "max": 15, "step": 1,
-                    "tooltip": "视频时长 (秒), MiniMax H3 支持 4–15 秒。与「剧本与镜头处理器」的每段视频时长联动"
+                    "default": 8, "min": 4, "max": 60, "step": 1,
+                    "tooltip": "视频时长 (秒), MiniMax H3 支持 4–60 秒。与「剧本与镜头处理器」的每段视频时长联动"
                 }),
                 "scale_factor": ("FLOAT", {
                     "default": 1.0, "min": 1.0, "max": 5.0, "step": 0.1,
@@ -82,8 +82,8 @@ class JZL_HailuoH3VideoParamsPro:
                 "multiple": ("INT", {"default": 32, "min": 8, "max": 128, "step": 4}),
                 "frames_display": ("STRING", {"default": "Frames: 0", "multiline": False}),
                 "duration": ("INT", {
-                    "default": 8, "min": 4, "max": 15, "step": 1,
-                    "tooltip": "视频时长 (秒), MiniMax H3 支持 4–15 秒。与「剧本与镜头处理器」的每段视频时长联动"
+                    "default": 8, "min": 4, "max": 60, "step": 1,
+                    "tooltip": "视频时长 (秒), MiniMax H3 支持 4–60 秒。与「剧本与镜头处理器」的每段视频时长联动"
                 }),
                 "scale_factor": ("FLOAT", {
                     "default": 1.0, "min": 1.0, "max": 5.0, "step": 0.1,

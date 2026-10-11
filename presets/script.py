@@ -73,7 +73,7 @@ def _parse_duration_spec(duration):
             n = float(s); lo = n; hi = n
         except Exception:
             lo = 8.0; hi = 8.0
-    lo = max(4.0, min(15.0, lo)); hi = max(lo, min(15.0, hi))
+    lo = max(4.0, min(60.0, lo)); hi = max(lo, min(60.0, hi))
     if lo > hi:
         lo, hi = hi, lo
     if lo == hi:
@@ -81,7 +81,7 @@ def _parse_duration_spec(duration):
     return (lo, hi, f"{int(lo)}~{int(hi)} 秒区间（每段由你按剧情弧线给实际秒数，写进该段 **时长** 字段）")
 
 
-MODEL_MAX_SEGMENT_SEC = 15.0   # 单段生成上限（秒）——超过它「设定时长 + 段首衔接」无法完整生成
+MODEL_MAX_SEGMENT_SEC = 60.0   # 单段生成上限（秒）——超过它「设定时长 + 段首衔接」无法完整生成
 
 
 def _duration_spec_with_runway(duration, seam_runway=0.0):
@@ -103,7 +103,7 @@ def _duration_spec_with_runway(duration, seam_runway=0.0):
     runway_txt = f"{runway:.2f}".rstrip("0").rstrip(".")
     gen_lo, gen_hi = lo + runway, hi + runway
     capped = gen_hi > MODEL_MAX_SEGMENT_SEC
-    if capped:                       # 单段上限：生成不能超过 15 秒 → 落盘会略短于设定
+    if capped:                       # 单段上限：生成不能超过 60 秒 → 落盘会略短于设定
         gen_hi = MODEL_MAX_SEGMENT_SEC
         gen_lo = min(gen_lo, gen_hi)
     gen_lo_txt = f"{gen_lo:.2f}".rstrip("0").rstrip(".")
@@ -341,7 +341,7 @@ def build_shot_prompt(
             "  - 段数 = 剧情总时长 ÷ 每段时长（四舍五入取整）；**区间时长时优先用足每段时长（取区间上限）**，宁少段、勿多段；\n"
             "  - 硬约束：段数 ≥ 1 且 ≤ 56；且每段实际时长不得低于区间下限（或固定时长）——**剧情很短时宁可用 1 段长镜，"
             "绝不允许切成很多短段**（防止短剧情生成超多视频）；\n"
-            "  - 示例：剧情约 60 秒 + 时长区间 4~15 秒 ⇒ 4 段 × 15 秒（**不是** 15 段 × 4 秒）；剧情约 8 秒 ⇒ 1 段；\n"
+            "  - 示例：剧情约 120 秒 + 时长区间 4~60 秒 ⇒ 2 段 × 60 秒（**不是** 60 段 × 4 秒）；剧情约 8 秒 ⇒ 1 段；\n"
             "  - 切分点必须落在剧情时间线的自然节点（事件/场景/情绪转折）上，不得为凑段数硬切；\n"
             "  - 每段是一段独立视频片段；**每段的实际生成秒数见下方「时长设定」**，必须写进该段 **时长** 字段。"
         )
