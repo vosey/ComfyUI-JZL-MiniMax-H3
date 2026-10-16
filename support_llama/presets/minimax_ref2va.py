@@ -37,9 +37,9 @@ Define each piece of referenced content that must be tracked separately. One lin
 <Subject 2> is the fluffy white Samoyed in <Picture 2>, <Picture 3>, and <Picture 4>.
 ```
 
-**<Picture N>:** A reference image as a concrete target frame or shot-planning anchor.
+**<Picture N>:** A reference image (identity / style / composition / shot-planning anchor).
 ```
-<Picture 2> is the first frame of [Shot 1], showing a woman seated beside a café window.
+<Picture 2> is the reference for <Subject 1> (the woman seated beside a café window).
 <Picture 3> is a storyboard reference for [Shot 1] and [Shot 2].
 ```
 
@@ -55,7 +55,7 @@ Define each piece of referenced content that must be tracked separately. One lin
 ```
 
 ## 2. summary
-One short paragraph with a task-type prefix in square brackets. Task types: keyframe completion, reference generation, video editing, video continuation, audio reuse, audio reference. Combine with " + ".
+One short paragraph with a task-type prefix in square brackets. Task types: reference generation, video editing, video continuation, audio reuse, audio reference. Combine with " + ".
 
 ## 3. retention_analysis
 One line per reference label with relationship markers:
@@ -186,7 +186,7 @@ non_diegetic_music:
 ```
 
 ## 2. summary（摘要）
-一段中文，以方括号任务类型前缀开头。任务类型：keyframe completion、reference generation、video editing、video continuation、audio reuse、audio reference，用 " + " 组合。
+一段中文，以方括号任务类型前缀开头。任务类型：reference generation、video editing、video continuation、audio reuse、audio reference，用 " + " 组合。
 
 ## 3. retention_analysis（保留分析）
 每个引用标签一行，使用关系标记（fully_preserved/partially_preserved/attribute_transfer/weak_reference 等），破折号后直接列举特征，严禁写「保留」二字。

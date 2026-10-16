@@ -385,7 +385,7 @@ class LlamaServerBackend:
             if device is None:
                 print("[JZL-llama] 警告: 未能自动匹配 ComfyUI GPU，llama-server 将使用默认设备")
             else:
-                print(f"[JZL-llama] 自动匹配 ComfyUI GPU '{gpu_name}' → --device {device}")
+                print(f"[JZL-llama] llama-server 设备：{device}（自动匹配 ComfyUI GPU '{gpu_name}'）")
         if device is not None:
             # 纯数字索引（如节点下拉的 "0"/"1"）→ 转成 llama.cpp 设备名（如 ROCm1）
             if str(device).isdigit():
@@ -399,7 +399,6 @@ class LlamaServerBackend:
                     device = resolved
             if device:
                 arguments.extend(["--device", str(device)])
-                print(f"[JZL-llama] 使用 GPU 设备 --device {device}")
 
         process_options = {}
         if self.runtime_spec.platform_name == "windows":

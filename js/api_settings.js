@@ -152,7 +152,7 @@ async function openSettings(node) {
     subtitle.style.cssText = "font-size:12px;color:var(--fg-color,#888);margin-bottom:12px;";
 
     const provider = makeSelect(PROVIDERS, cache.provider);
-    const model = makeInput("text", cache.model, "模型名：deepseek-v4-flash-vision-exp（识图）/ deepseek-v4-pro / gpt-5.5-pro / qwen3.6-max ...");
+    const model = makeInput("text", cache.model, "模型名：deepseek-v4-flash / deepseek-v4-pro / gpt-5.5-pro / qwen3.6-max ...");
     const apiKey = makeInput("password", cache.api_key, "API Key（Ollama/vLLM/LM Studio 本地可留空）");
     apiKey.autocomplete = "new-password";
     const baseUrl = makeInput("text", cache.base_url, "OpenAI 兼容 base_url，留空用默认 https://api.openai.com/v1");

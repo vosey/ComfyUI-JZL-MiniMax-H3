@@ -52,9 +52,11 @@ from .nodes_asset_manager import (
     JZL_MiniMaxAssetManager,
     JZL_MiniMaxAssetManagerMax,
     JZL_MiniMaxAssetManagerInfinite,
+    JZL_MiniMaxAssetManagerShortDrama,
     JZL_MiniMaxAssetManagerMini,
     JZL_MiniMaxVideoSaveDistributor,
     JZL_MiniMaxVideoViewer,
+    JZL_MiniMaxScriptViewer,
     _read_asset_settings,
     _write_asset_settings,
     _read_manager_settings,
@@ -99,9 +101,11 @@ NODE_CLASS_MAPPINGS = {
     "JZL_MiniMaxAssetManager": JZL_MiniMaxAssetManager,
     "JZL_MiniMaxAssetManagerMax": JZL_MiniMaxAssetManagerMax,
     "JZL_MiniMaxAssetManagerInfinite": JZL_MiniMaxAssetManagerInfinite,
+    "JZL_MiniMaxAssetManagerShortDrama": JZL_MiniMaxAssetManagerShortDrama,
     "JZL_MiniMaxAssetManagerMini": JZL_MiniMaxAssetManagerMini,
     "JZL_MiniMaxVideoSaveDistributor": JZL_MiniMaxVideoSaveDistributor,
     "JZL_MiniMaxVideoViewer": JZL_MiniMaxVideoViewer,
+    "JZL_MiniMaxScriptViewer": JZL_MiniMaxScriptViewer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -137,9 +141,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "JZL_MiniMaxAssetManager": "JZL - 🤖 MiniMax-H3短剧导演台Pro",
     "JZL_MiniMaxAssetManagerMax": "JZL - 🤖 MiniMax-H3短剧导演台Max",
     "JZL_MiniMaxAssetManagerInfinite": "JZL - 🤖 MiniMax-H3无限时长",
+    "JZL_MiniMaxAssetManagerShortDrama": "JZL - 🤖 MiniMax-H3短剧导演台",
     "JZL_MiniMaxAssetManagerMini": "JZL - 🤖 MiniMax-H3短剧导演台Mini",
     "JZL_MiniMaxVideoSaveDistributor": "JZL - 💾 视频保存分配",
     "JZL_MiniMaxVideoViewer": "JZL - 🎬 生成视频查看器",
+    "JZL_MiniMaxScriptViewer": "JZL - 📝 生成剧本查看器",
 }
 
 
@@ -523,7 +529,7 @@ async def jzl_manager_get(request):
     try:
         import folder_paths
         from .llama_backend import chat_handlers as _ch
-        from .nodes_asset_manager import _list_models
+        from .nodes_asset_manager import _list_models, _selflift_upscaler_options, _semantic_bridge_adapters
         # 与 schema 下拉同源：优先 sheding.story_styles（含 styles/*.md），缺失才回退 presets.script
         try:
             from .sheding.story_styles import STORY_STYLES as _story_styles, STYLE_LABELS as _style_labels
@@ -542,6 +548,10 @@ async def jzl_manager_get(request):
         story_style_labels = {k: (_style_labels.get(k) or k) for k in story_styles}
         save_dir = os.path.join(folder_paths.get_output_directory(), "jzl")
         upscaler_models = folder_paths.get_filename_list("latent_upscale_models")
+        # SelfLift「放大模型」下拉：none + 磁盘上的 H3 放大模型（含二级子目录）
+        selflift_upscaler_models = _selflift_upscaler_options()
+        # 「生成设定 → 语义修正」适配器下拉：models/semantic_bridge/ 下的 .safetensors
+        semantic_bridge_adapters = _semantic_bridge_adapters()
     except Exception:
         llm_list, mmproj_list, _ch = [], ["None"], ["None"]
         diff_models = clip_models = vae_models = lora_models = []
@@ -549,6 +559,8 @@ async def jzl_manager_get(request):
         story_style_labels = {}
         save_dir = "output/jzl"
         upscaler_models = []
+        selflift_upscaler_models = ["none"]
+        semantic_bridge_adapters = []
     return web.json_response({
         "ok": True,
         "settings": _read_manager_settings(),
@@ -563,6 +575,8 @@ async def jzl_manager_get(request):
         "story_style_labels": story_style_labels,
         "save_dir": save_dir,
         "upscaler_models": upscaler_models,
+        "selflift_upscaler_models": selflift_upscaler_models,
+        "semantic_bridge_adapters": semantic_bridge_adapters,
     })
 
 

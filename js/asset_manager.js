@@ -19,7 +19,10 @@ const MINI_NODE_TYPE = "JZL_MiniMaxAssetManagerMini";
 const MAX_NODE_TYPE = "JZL_MiniMaxAssetManagerMax";
 // ♾️ 无限时长：与 Max 同一套面板/落盘语义，额外多一个「无限时长衔接」设置分区
 const INF_NODE_TYPE = "JZL_MiniMaxAssetManagerInfinite";
+// 🎬 短剧导演台：克隆「无限时长」，按钮改为「2 + 4 + 4」三排（多了「生成设定」「视频参数」两个面板）
+const SHORTDRAMA_NODE_TYPE = "JZL_MiniMaxAssetManagerShortDrama";
 const VIEWER_NODE_TYPE = "JZL_MiniMaxVideoViewer";
+const SCRIPT_VIEWER_NODE_TYPE = "JZL_MiniMaxScriptViewer";
 
 // ── 纯文本模式（仅提示词输出 / 故事扩写模式）自动静音 ─────────────────
 // 上游：model/clip/vae/audio_vae；下游：除「剧本文本输出(已处理剧本/已拆解剧本)」外的其它输出所连节点。
@@ -140,7 +143,15 @@ const OPTIONS = {
         "Anthropic",
         "Google Gemini",
     ],
-    shotSize: ["根据剧情", "随机组合", "远景为主", "全景为主", "中景为主", "近景为主", "特写为主"],
+    shotSize: ["根据剧情", "随机组合", "远景为主", "全景为主", "中景为主", "近景为主", "特写为主", "大特写为主"],
+    // 🔭 视角机位（视角/角度走自然语言注入；官方仅对「运镜」给了封闭词表）
+    angleView: [
+        "根据剧情", "随机组合",
+        "视线平视", "高角度俯拍", "鸟瞰顶视", "低角度仰拍", "虫眼极低", "航拍视角",
+        "第一人称POV", "过肩镜头", "第三人称跟随", "偷窥视角", "监控摄像头", "手机自拍",
+        "正反打", "侧面视角", "背身视角", "四分之三侧", "镜像反射",
+        "斜角荷兰角", "希区柯克变焦", "鱼眼广角", "框中框构图", "长焦压缩视角",
+    ],
     cameraMove: ["根据剧情", "随机组合", "固定机位", "推拉", "摇移", "俯仰", "升降", "环绕", "跟拍", "手持晃动", "旋转", "一镜到底"],
     cutRhythm: ["根据剧情", "随机组合", "一镜到底", "2~5镜", "5~9镜", "9~13镜", "13~18镜"],
     transition: ["随机", "硬切", "叠化", "淡入淡出", "擦除"],
@@ -210,6 +221,8 @@ const PANELS = {
     save_settings: { label: "💾 视频保存设置" },
     help: { label: "📖 节点使用说明" },
     video_manager: { label: "🎬 生成视频管理" },
+    gen_settings: { label: "🎛️ 运行参数设置" },
+    video_params: { label: "🎨 视频参数设置" },
 };
 
 // 节点表面按钮定义（前端 addWidget 添加）
@@ -229,13 +242,15 @@ const KIND_LABEL = { image: "图片", video: "视频", audio: "音频" };
 const ASSET_TYPES_BY_KIND = {
     image: ["角色", "场景", "道具", "自定义"],
     video: ["主体", "运镜", "特效", "其他"],
-    audio: ["音色", "音效", "配乐", "念白", "其他"],
+    audio: ["角色音色", "背景配乐", "念白", "音效", "其他"],
 };
 const ASSET_TYPES = ASSET_TYPES_BY_KIND.image;
 // 资产类型 → 调度槽位类型（与后端 _asset_type_for_slot 一致；「自定义」→「其他」官方识别）
 function slotTypeOf(kind, type) {
     if (kind === "image") return { "角色": "角色", "场景": "场景", "道具": "道具", "自定义": "其他", "分镜": "分镜", "其他": "其他" }[type] || "其他";
-    return kind === "video" ? "视频" : "音频";
+    if (kind === "video") return "视频";
+    // 音频子分类各自独立编号空间 → 各自独立前缀（与后端 _AUDIO_SLOT_PREFIX 一致）
+    return { "角色音色": "音色", "背景配乐": "配乐", "念白": "念白" }[type] || "音频";
 }
 
 let modal = null;
@@ -250,6 +265,94 @@ function setWidgetValue(w, val) {
     w.value = val;
     if (w._state) w._state.value = val;
     w._node?.setDirtyCanvas?.(true, true);
+}
+
+// ── 「生成视频数量」双形态读写 ────────────────────────────────
+// 该参数有两套 schema：下拉（Pro/Max/无限时长/Mini，值形如「剧情决定」/「生成1段」）
+// 与数值（短剧导演台，0 = 剧情决定、1~60 = 固定段数）。跨形态写值会被 ComfyUI 校验拒绝
+// （如把「生成1段」写进 INT → Failed to convert an input value to a INT value），
+// 故统一经这两个助手读写：按 widget 形态自动选「数字」或「生成N段」。
+// ⚠️ 判形态必须**以 widget.type 为准**：不能靠「当前值是不是数字」反推 ——
+// 下拉 widget 恰好被写坏了数字时，那种反推会误判成数值型而放弃自愈。
+function videoCountIsNumeric(w) {
+    if (!w) return false;
+    if (w.type === "number") return true;
+    if (w.type === "combo") return false;
+    // 退化情形（拿不到 type）：看选项列表里有没有「生成N段」这类下拉项
+    const opts = Array.isArray(w.options) ? w.options : (w.options?.values || []);
+    return !opts.some((o) => /生成\d+段|剧情决定/.test(String(o)));
+}
+
+// 下拉型段数选项 → [{n, text}]；用于把任意段数吸附到磁盘/节点实际允许的选项
+function videoCountComboOptions(w) {
+    const opts = Array.isArray(w?.options) ? w.options : (w?.options?.values || []);
+    const out = [];
+    for (const o of opts) {
+        const s = String(o);
+        const m = s.match(/生成(\d+)段/);
+        if (m) out.push({ n: Number(m[1]), text: s });
+    }
+    return out;
+}
+
+// 返回段数：0 = 剧情决定/自动；n = 固定 n 段。两套写法（数字 / 「生成N段」）都能解析。
+function readVideoCount(w) {
+    const raw = String(readWidgetValue(w) ?? "").trim();
+    if (!raw || /剧情决定|自动/.test(raw)) return 0;
+    const m = raw.match(/\d+/);
+    return m ? (Number(m[0]) || 0) : 0;
+}
+
+// 按 widget 形态写入段数：数值型写 Number（并按 min/max 夹取），下拉型写合法选项文本
+// （0 → 「剧情决定」；非 0 → 吸附到最近的「生成N段」选项，避免写入不在选项内的值被校验拒绝）。
+function setVideoCount(w, n) {
+    if (!w) return n;
+    let num = Math.max(0, Math.round(Number(n) || 0));
+    if (videoCountIsNumeric(w)) {
+        const lo = Number.isFinite(Number(w.options?.min)) ? Number(w.options.min) : 0;
+        const hi = Number.isFinite(Number(w.options?.max)) ? Number(w.options.max) : 60;
+        num = Math.min(hi, Math.max(lo, num));
+        setWidgetValue(w, num);
+        return num;
+    }
+    const cand = videoCountComboOptions(w);
+    if (num <= 0 || !cand.length) {
+        setWidgetValue(w, "剧情决定");
+        return "剧情决定";
+    }
+    let best = cand[0];
+    for (const c of cand) {
+        if (Math.abs(c.n - num) < Math.abs(best.n - num)) best = c;
+    }
+    setWidgetValue(w, best.text);
+    return best.text;
+}
+
+// 自愈：旧版工作流可能把下拉用的字符串存进了数值 widget（如 INT 里存「生成1段」）→
+// ComfyUI 校验直接拒绝整个 prompt（重拍/穿透都会失败）。加载与提交前各归一化一次。
+function healVideoCountWidget(node) {
+    const w = (node?.widgets || []).find((x) => x.name === "video_count");
+    if (!w) return false;
+    const raw = readWidgetValue(w);
+    if (videoCountIsNumeric(w)) {
+        // 数值型：非数字（旧工作流存了下拉文本）→ 解析成数字；越界 → 夹取到 min/max。
+        // 两者都会被 ComfyUI 的 INT 校验拒绝（Failed to convert… / 超出范围），故一并归一化。
+        if (typeof raw === "number" && Number.isFinite(raw)) {
+            const lo = Number.isFinite(Number(w.options?.min)) ? Number(w.options.min) : 0;
+            const hi = Number.isFinite(Number(w.options?.max)) ? Number(w.options.max) : 60;
+            if (raw >= lo && raw <= hi) return false;
+            setVideoCount(w, raw);
+            return true;
+        }
+        setVideoCount(w, readVideoCount(w));
+        return true;
+    }
+    // 下拉型：值必须是选项之一，否则吸附回合法选项（数字或非法文本都算）
+    const opts = Array.isArray(w.options) ? w.options : (w.options?.values || []);
+    if (typeof raw === "string" && opts.includes(raw)) return false;
+    if (!opts.length) return false;
+    setVideoCount(w, readVideoCount(w));
+    return true;
 }
 
 // ── @ 引用素材（按节点独立缓存） ─────────────────────────────
@@ -492,6 +595,13 @@ function cacheAssets(node, settings) {
 
 // 槽位（类型+字母）分配：与后端 _build_asset_intro 完全一致
 // 手选字母（A-Z）优先；缺失/非法按类型自动从 A 起顺延；同类同字母冲突顺延下一字母
+// 条目在「素材描述 / 槽位表」里使用的名称（与后端 _asset_display_name 一致）。
+// 「音频 → 角色音色」的名称来自所绑定角色，没有独立名称字段。
+function assetDisplayName(kind, item) {
+    if (kind === "audio" && String(item?.type || "") === "角色音色") return audioVoiceLabel(item);
+    return (item?.name || "").trim();
+}
+
 function buildSlotMap(assets) {
     const map = {};
     const counters = {};
@@ -500,8 +610,7 @@ function buildSlotMap(assets) {
     for (const [kind, key] of kinds) {
         (assets?.[key] || []).forEach((item, i) => {
             if (item?.enabled === false) return;
-            const name = (item?.name || "").trim();
-            if (!name) return;
+            if (!assetDisplayName(kind, item)) return;
             const st = slotTypeOf(kind, item?.type || "");
             if (!st) return;
             let letter = (item?.letter || "").trim().toUpperCase();
@@ -516,6 +625,8 @@ function buildSlotMap(assets) {
             map[`${kind}:${i}`] = slot;
         });
     }
+    // ⭐ 角色音色已回归「音频 → 角色音色」子分类，随 audios 列表统一编号，不再需要单独的 voice: 槽位。
+
     return map;
 }
 
@@ -923,7 +1034,7 @@ function createReshootSection(ctx) {
     const { self, promptBox, ipWidget, resizeNode, isMini, reshootSegWidget, container } = ctx;
 
     // 折叠头
-    const header = el("div", "display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:13px;font-weight:600;color:#e8a87c;border:1px solid #5b9bd5;border-radius:6px;padding:6px 8px;background:#2a2a2a;margin-top:4px;box-sizing:border-box;");
+    const header = el("div", "flex:0 0 auto;display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:13px;font-weight:600;color:#e8a87c;border:1px solid #5b9bd5;border-radius:6px;padding:6px 8px;background:#2a2a2a;margin-top:4px;box-sizing:border-box;");
     const chevron = el("span", "font-size:11px;transition:transform .15s;", "▶");
     header.appendChild(chevron);
     header.appendChild(el("span", "", "🔄 重拍模式"));
@@ -932,7 +1043,7 @@ function createReshootSection(ctx) {
                : "展开后锁定上方提示词；点「运行」只重拍当前选中段（穿透单段）"));
 
     // 主体（默认收起）
-    const body = el("div", "display:none;margin-top:6px;border:1px solid #444;border-radius:6px;padding:8px;background:#222;box-sizing:border-box;");
+    const body = el("div", "flex:0 0 auto;display:none;margin-top:6px;border:1px solid #444;border-radius:6px;padding:8px;background:#222;box-sizing:border-box;");
 
     // 第一行：提示词来源状态显示 + 上传本地 .txt 提示词（重拍提示词与上方主提示词完全独立）
     const selRow = el("div", "display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap;");
@@ -962,16 +1073,14 @@ function createReshootSection(ctx) {
     edit.placeholder = "当前段的完整提示词显示在这里，可在此二度修改…";
     edit.addEventListener("mousedown", (e) => e.stopPropagation());
     editWrap.appendChild(edit);
-    // 右上角悬浮：复制全部文本 / 放大编辑
-    const eActions = el("div", "position:absolute;top:4px;right:4px;display:flex;gap:4px;opacity:0;transition:opacity .15s;z-index:6;");
-    const eCopy = el("button", "width:24px;height:24px;border-radius:4px;border:1px solid #555;background:rgba(30,30,30,.92);color:#ccc;font-size:12px;cursor:pointer;line-height:1;padding:0;", "📋");
+    // 复制 / 放大编辑：放到「重拍视频编号」行右端（编辑框上方外侧），不再悬浮在框内遮挡正文
+    const eActions = el("div", "display:flex;gap:4px;margin-left:auto;z-index:6;");
+    const eCopy = el("button", "width:22px;height:22px;border-radius:4px;border:1px solid #555;background:rgba(30,30,30,.92);color:#ccc;font-size:12px;cursor:pointer;line-height:1;padding:0;", "📋");
     eCopy.title = "复制全部文本";
-    const eZoom = el("button", "width:24px;height:24px;border-radius:4px;border:1px solid #555;background:rgba(30,30,30,.92);color:#ccc;font-size:12px;cursor:pointer;line-height:1;padding:0;", "⛶");
+    const eZoom = el("button", "width:22px;height:22px;border-radius:4px;border:1px solid #555;background:rgba(30,30,30,.92);color:#ccc;font-size:12px;cursor:pointer;line-height:1;padding:0;", "⛶");
     eZoom.title = "放大编辑（打开大界面）";
     eActions.append(eCopy, eZoom);
-    editWrap.appendChild(eActions);
-    editWrap.addEventListener("mouseenter", () => { eActions.style.opacity = "1"; });
-    editWrap.addEventListener("mouseleave", () => { eActions.style.opacity = "0"; });
+    segRow.appendChild(eActions);
     eCopy.addEventListener("mousedown", (e) => e.stopPropagation());
     eCopy.addEventListener("click", (e) => { e.stopPropagation(); copyTextToClipboard(edit.value, "重拍提示词"); });
     eZoom.addEventListener("mousedown", (e) => e.stopPropagation());
@@ -1245,7 +1354,10 @@ function createReshootSection(ctx) {
             return {
                 apply() {
                     if (rmW) setWidgetValue(rmW, "🪄 穿透生成模式");
-                    if (vcW) setWidgetValue(vcW, "生成1段");
+                    // ⭐ 段数写 1 段：按 widget 形态写入（数值型写 1，下拉型写「生成1段」）。
+                    //    跨形态写值会被 ComfyUI 校验拒绝（历史上这里固定写「生成1段」→ 短剧导演台直接报
+                    //    Failed to convert an input value to a INT value）。
+                    setVideoCount(vcW, 1);
                     if (ipWidget) setWidgetValue(ipWidget, single);
                 },
                 restore() {
@@ -1290,23 +1402,22 @@ function createReshootSection(ctx) {
 
 async function loadLists() {
     // 模型/风格等列表仍从后端拉（仅列表，不含节点配置）
+    // ⚠️ 用「默认值 + 后端字段全量透传」的写法：以后后端新增列表字段（如 selflift_upscaler_models /
+    //    semantic_bridge_adapters）前端无需再改这里——曾因漏加一行导致下拉拿不到数据、显示「未找到」并置灰。
+    //    唯一必须排除的是 settings：节点配置要取工作流内的 manager_settings，不能被全局配置覆盖。
+    const fallback = {
+        llm_models: [], mmproj_models: ["None"], chat_handlers: ["None"],
+        diffusion_models: [], clip_models: [], vae_models: [], lora_models: [],
+        story_styles: [], story_style_labels: {}, save_dir: "",
+        upscaler_models: [], selflift_upscaler_models: ["none"], semantic_bridge_adapters: [],
+    };
     try {
         const resp = await api.fetchApi(MANAGER_ENDPOINT);
-        const data = await resp.json().catch(() => ({}));
-        return {
-            llm_models: data?.llm_models || [],
-            mmproj_models: data?.mmproj_models || ["None"],
-            chat_handlers: data?.chat_handlers || ["None"],
-            diffusion_models: data?.diffusion_models || [],
-            clip_models: data?.clip_models || [],
-            vae_models: data?.vae_models || [],
-            lora_models: data?.lora_models || [],
-            story_styles: data?.story_styles || [],
-            save_dir: data?.save_dir || "",
-            upscaler_models: data?.upscaler_models || [],
-        };
+        const data = (await resp.json().catch(() => ({}))) || {};
+        delete data.settings;
+        return { ...fallback, ...data };
     } catch (_) {
-        return { llm_models: [], mmproj_models: ["None"], chat_handlers: ["None"], story_styles: [], save_dir: "", upscaler_models: [] };
+        return { ...fallback };
     }
 }
 
@@ -1352,15 +1463,89 @@ async function loadManager(node) {
         try { const s = JSON.parse(raw); if (s && typeof s === "object") settings = s; } catch (_) {}
     }
     settings = settings || defaultSettings();
+    // 递归补齐缺失键：面板里读的是「?? 默认值」，若对象里根本没这个键，保存时也写不进去 →
+    // 后端只能回退，出现「面板显示 8 步、后端按 4 步跑」这类静默错配（selflift.steps 就踩过）。
+    fillDefaults(settings, defaultSettings());
+    if (migrateLegacyDefaults(settings)) {
+        try { await saveManager(node, settings); } catch (_) {}  // 迁移后立即落盘，避免刷新又变回旧值
+    }
     // 资产归档：把源文件绝对路径素材复制到 input/jzl 并统一为相对路径（原文件删除不影响）
     try { await archiveAssets(node, settings); } catch (_) {}
     return { settings, ...lists };
+}
+
+// 旧默认值 → 新默认值的一次性迁移。返回是否发生了改动。
+// 只改写「与我们上一版内置默认完全相同」的字段（说明用户从未手动改过），避免覆盖用户自己的配置。
+function migrateLegacyDefaults(s) {
+    let changed = false;
+    // ① 旧默认 API 值
+    const LEGACY = [
+        // [路径, 旧默认, 新默认]
+        [["enhance", "api", "model"], "deepseek-v4-flash", "deepseek-flash"],
+        [["enhance", "api", "base_url"], "https://api.deepseek.com/v1", "https://api.deepseek.com"],
+    ];
+    for (const [path, oldVal, newVal] of LEGACY) {
+        let o = s;
+        for (let i = 0; i < path.length - 1 && o; i++) {
+            o = o[path[i]];
+            if (!o || typeof o !== "object") { o = null; }
+        }
+        if (!o) continue;
+        const k = path[path.length - 1];
+        if (o[k] === oldVal) { o[k] = newVal; changed = true; }
+    }
+    // ② 角色音色回归音频分类：把旧配置里挂在「图片 · 角色」上的 voice_path 迁成「音频 · 角色音色」条目
+    if (migrateLegacyVoice(s)) changed = true;
+    return changed;
+}
+
+function migrateLegacyVoice(s) {
+    const a = s?.assets;
+    if (!a || !Array.isArray(a.images)) return false;
+    a.audios = Array.isArray(a.audios) ? a.audios : [];
+    let changed = false;
+    for (const img of a.images) {
+        const vp = String(img?.voice_path || "").trim();
+        if (!vp) continue;
+        const roleName = String(img?.name || "").trim();
+        a.audios.push({
+            type: "角色音色",
+            letter: String(img.voice_letter || "").trim(),
+            character: roleName,
+            name: String(img.voice_name || "").trim() || (roleName ? `${roleName}音色` : ""),
+            description: "",
+            path: vp,
+            enabled: img.enabled !== false,
+        });
+        changed = true;
+        delete img.voice_path;
+        delete img.voice_letter;
+        delete img.voice_name;
+        delete img.voice_name_at;
+    }
+    if (changed) {
+        // 迁移后重新按序补编号：音频三个子分类共用「音频」编号空间，整体去重
+        const used = new Set();
+        a.audios.forEach((it) => {
+            if (it?.enabled === false) return;
+            const L = String(it?.letter || "").trim().toUpperCase();
+            if (/^[A-Z]$/.test(L) && !used.has(L)) { it.letter = L; used.add(L); return; }
+            it.letter = "";
+        });
+        a.audios.forEach((it) => {
+            if (it?.enabled === false || String(it?.letter || "").trim()) return;
+            const free = nextFreeSlotLetter("audio", a, it.type || "");
+            if (free) it.letter = free;
+        });
+    }
+    return changed;
 }
 
 async function saveManager(node, value) {
     const w = node?.widgets?.find((x) => x.name === "manager_settings");
     if (w) setWidgetValue(w, JSON.stringify(value));
     try { node?.__jzlUpdateInfo?.(); } catch (_) {}  // 保存后实时同步节点「实时显示」
+    try { node?.__jzlUpdateDisplay?.(); } catch (_) {}  // 生成详情（含「无限时长：开/关」）同步刷新
     return value;
 }
 
@@ -1670,24 +1855,29 @@ function openTextZoomEditor(title, getText, onSave, node) {
         editor.addEventListener("keyup", syncZoomCaret);
         editor.addEventListener("click", syncZoomCaret);
         // 回车：统一插入 \n 文本，避免 Chrome 生成 <div><br></div> 干扰（根本修复）
+        // 与主提示词框同规则：选区异常时兜底插到末尾，保证「按一次就换行」（旧写法会吞掉第一次回车）
         editor.addEventListener("keydown", (e) => {
-            if (e.key === "Enter" && !e.isComposing) {
-                e.preventDefault();
-                e.stopPropagation();
-                const _sel = window.getSelection();
-                if (_sel && _sel.rangeCount && editor.contains(_sel.anchorNode)) {
-                    const r0 = _sel.getRangeAt(0);
-                    r0.deleteContents();
-                    const tn = document.createTextNode("\n");
-                    r0.insertNode(tn);
-                    const r2 = document.createRange();
-                    r2.setStartAfter(tn);
-                    r2.collapse(true);
-                    _sel.removeAllRanges();
-                    _sel.addRange(r2);
-                    editor.dispatchEvent(new Event("input", { bubbles: true }));
-                }
+            if (e.key !== "Enter" || e.shiftKey) return;
+            if (e.isComposing || e.keyCode === 229) return;   // 输入法组合中：交给输入法
+            e.preventDefault();
+            e.stopPropagation();
+            const _sel = window.getSelection();
+            let r0 = null;
+            if (_sel && _sel.rangeCount && editor.contains(_sel.anchorNode)) {
+                r0 = _sel.getRangeAt(0);
+            } else {
+                r0 = document.createRange();
+                r0.selectNodeContents(editor);
+                r0.collapse(false);
             }
+            r0.deleteContents();
+            const tn = document.createTextNode("\n");
+            r0.insertNode(tn);
+            const r2 = document.createRange();
+            r2.setStartAfter(tn);
+            r2.collapse(true);
+            if (_sel) { _sel.removeAllRanges(); _sel.addRange(r2); }
+            editor.dispatchEvent(new Event("input", { bubbles: true }));
         });
         // 粘贴：统一为含 \n 的 textNode（不生成 br/div）
         editor.addEventListener("paste", (e) => {
@@ -1800,14 +1990,29 @@ function showVideoPreview(path) {
     document.body.appendChild(overlay);
 }
 
-// 字母编号分配：同一类型（已启用、type 相同）中**第一个未被占用的字母** A-Z；全占用返回 ""（后端会兜底自动分配）
-function nextFreeLetter(list, type) {
+// ── 编号的唯一性范围 = **槽位类型**，不是「条目类型」 ──────────────
+// 槽位名（视频A / 音频A）由槽位类型决定：音频的「角色音色 / 背景配乐 / 念白」都映射到「音频」，
+// 所以它们的编号必须整体互斥，否则会出现两个「音频A」（与后端 _build_asset_intro 的计数器不一致）。
+function fullAssetList(kind, assets) {
+    const key = kind === "image" ? "images" : (kind === "video" ? "videos" : "audios");
+    return (assets?.[key]) || [];
+}
+
+function slotTypePeers(kind, assets, item) {
+    const st = slotTypeOf(kind, item?.type || "");
+    return fullAssetList(kind, assets).filter(
+        (it) => it !== item && it?.enabled !== false && slotTypeOf(kind, it?.type || "") === st
+    );
+}
+
+function nextFreeSlotLetter(kind, assets, type) {
     const used = new Set();
-    (list || []).forEach((it) => {
-        if (!it || it.enabled === false) return;
-        if ((it.type || "") !== (type || "")) return;
-        const L = String(it.letter || "").trim().toUpperCase();
-        if (L) used.add(L);
+    const st = slotTypeOf(kind, type || "");
+    fullAssetList(kind, assets).forEach((it) => {
+        if (it?.enabled === false) return;
+        if (slotTypeOf(kind, it?.type || "") !== st) return;
+        const L = String(it?.letter || "").trim().toUpperCase();
+        if (/^[A-Z]$/.test(L)) used.add(L);
     });
     for (let i = 0; i < 26; i++) {
         const L = String.fromCharCode(65 + i);
@@ -1816,71 +2021,40 @@ function nextFreeLetter(list, type) {
     return "";
 }
 
-function makeAssetCard(kind, index, item, list, onEdit, onDelete, isLast, refreshAll) {
+// ⭐ 音频「角色音色」子分类：绑定角色名（图片里的角色），删除/改名时前端联动。
+function audioVoiceLabel(item) {
+    const ch = String(item?.character || "").trim();
+    if (ch) return `${ch}音色`;
+    return String(item?.name || "").trim();
+}
+
+function roleNameList(assets) {
+    return (assets?.images || [])
+        .filter((it) => it?.enabled !== false && String(it?.type || "") === "角色")
+        .map((it) => String(it?.name || "").trim())
+        .filter(Boolean);
+}
+
+// 角色名变化（改名/删除）后，重算所有「音频 · 角色音色」的「指定角色名」下拉选项。
+// 这些下拉在别的分区里，无法靠本分区的重新渲染刷新，故用 DOM 标记统一触发。
+function refreshRoleSels(root) {
+    const r = (root && root.querySelectorAll) ? root : document;
+    r.querySelectorAll("select[data-jzl-role-sync]").forEach((sel) => {
+        try { sel.__jzlRefresh?.(); } catch (_) {}
+    });
+}
+
+function makeAssetCard(kind, index, item, list, onEdit, onDelete, isLast, refreshAll, opts) {
     const refreshAllFn = refreshAll || (() => {});
-    const row = el("div", "display:flex;align-items:center;gap:8px;margin:5px 0;padding:6px 8px;background:var(--comfy-menu-bg,#232323);border:1px solid var(--border-color,#3a3a3a);border-radius:6px;");
+    const isImage = kind === "image";
+    // 图片在「角色/场景/道具」分区里渲染时，类型已由分区决定 → 不再重复显示类型下拉（仅「其他」分区保留，便于改回三类）
+    const showType = !(opts && opts.showType === false);
+    const isRole = isImage && String(item?.type || "") === "角色";
+    const row = el("div", "display:flex;align-items:stretch;gap:8px;margin:5px 0;padding:6px 8px;background:var(--comfy-menu-bg,#232323);border:1px solid var(--border-color,#3a3a3a);border-radius:6px;");
 
-    // 顺序：启用开关 → 类型（先选）→ 编号（字母 A-Z）→ 槽位标签（角色A）
-    const chk = el("input", "width:18px;height:18px;accent-color:#2d9d6f;cursor:pointer;");
-    chk.type = "checkbox";
-    chk.checked = item.enabled !== false;
-    chk.title = "启用/禁用该素材";
-    chk.addEventListener("change", () => { item.enabled = chk.checked; onEdit(); refreshAllFn(); });
-
-    // 类型下拉（放前面，先选类型）
-    const typeSel = el("select", "flex:0 0 62px;background:var(--comfy-input-bg,#1d1d1d);color:var(--fg-color,#ddd);border:1px solid var(--border-color,#444);border-radius:4px;padding:5px 2px;font-size:12px;");
-    for (const t of (ASSET_TYPES_BY_KIND[kind] || ASSET_TYPES)) {
-        const o = el("option", "", t);
-        if (t === item.type) o.selected = true;
-        typeSel.append(o);
-    }
-
-    // 字母编号（A-Z）：同一类型已被其他素材占用的字母隐藏，防止同类同编号
-    const letterSel = el("select", "width:42px;background:var(--comfy-input-bg,#1d1d1d);color:var(--fg-color,#ddd);border:1px solid var(--border-color,#444);border-radius:4px;padding:4px 1px;font-size:12px;text-align:center;cursor:pointer;");
-    letterSel.title = "编号（26 字母 A-Z，同一类型内唯一）";
-    const usedLetters = () => {
-        const used = new Set();
-        (list || []).forEach((it, idx) => {
-            if (idx === index) return;
-            if (it?.enabled === false) return;
-            if ((it?.type || "") === (item.type || "")) {
-                const L = (it?.letter || "").toUpperCase();
-                if (L) used.add(L);
-            }
-        });
-        return used;
-    };
-    const renderLetters = () => {
-        const used = usedLetters();
-        letterSel.innerHTML = "";
-        // 编号必选（不再提供「—」空白项）：新增/丢失的编号由 nextFreeLetter 自动补「靠前的未被占用字母」
-        // 26 字母全部显示；已被同类其他素材占用的置灰禁用（可见但不可选），切换/换编号后实时刷新
-        const cur = (item.letter || "").trim().toUpperCase();
-        for (let i = 0; i < 26; i++) {
-            const L = String.fromCharCode(65 + i);
-            const o = el("option", "", L);
-            if (L === cur) o.selected = true;
-            if (used.has(L) && L !== cur) o.disabled = true;
-            letterSel.append(o);
-        }
-    };
-    const slotTag = el("span", "font-size:11px;color:#ffd166;white-space:nowrap;flex:0 0 auto;min-width:42px;text-align:center;font-weight:600;", "");
-    const renderSlot = () => {
-        const st = slotTypeOf(kind, item?.type || "");
-        const L = (item?.letter || "").trim().toUpperCase();
-        const tag = L || "?";
-        slotTag.textContent = `${st}${tag}`;
-        slotTag.title = `调度槽位：${st}${tag}（未指定编号时生成自动分配；ref 描述与调度 slots 用）`;
-    };
-    typeSel.addEventListener("change", () => { item.type = typeSel.value; renderLetters(); renderSlot(); onEdit(); refreshAllFn(); });
-    letterSel.addEventListener("change", () => { item.letter = letterSel.value; renderSlot(); onEdit(); refreshAllFn(); });
-    renderLetters();
-    renderSlot();
-
-    row.append(chk, typeSel, letterSel, slotTag);
-
-    // 缩略图：图片预览；音频空槽黑底🎧 / 已选蓝底+试听；视频黑底图标
-    const thumb = el("div", "flex:0 0 44px;width:44px;height:44px;border-radius:5px;border:1px solid var(--border-color,#444);background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden;font-size:18px;");
+    // ── 预览区（固定在每张卡片最前面；图片放大以便一眼看清角色/场景/道具）──
+    const thumbPx = isImage ? 78 : 56;
+    const thumb = el("div", `flex:0 0 ${thumbPx}px;width:${thumbPx}px;height:${thumbPx}px;border-radius:5px;border:1px solid var(--border-color,#444);background:#000;display:flex;align-items:center;justify-content:center;overflow:hidden;font-size:22px;`);
     let imgEl = null;
     let refreshAudio = null;  // 音频试听刷新（kind==="audio" 时赋值）
     let refreshVideo = null;  // 视频已选反馈（kind==="video" 时赋值）
@@ -1908,7 +2082,7 @@ function makeAssetCard(kind, index, item, list, onEdit, onDelete, isLast, refres
         });
     } else if (kind === "audio") {
         // 音频：空槽黑底🎧；已选蓝底 + ▶/⏸ 试听
-        const playBtn = el("button", "width:100%;height:100%;border:none;background:transparent;color:#fff;font-size:16px;cursor:pointer;line-height:1;padding:0;", "🎧");
+        const playBtn = el("button", "width:100%;height:100%;border:none;background:transparent;color:#fff;font-size:20px;cursor:pointer;line-height:1;padding:0;", "🎧");
         thumb.appendChild(playBtn);
         refreshAudio = () => {
             const p = (item.path || "").trim();
@@ -1967,47 +2141,191 @@ function makeAssetCard(kind, index, item, list, onEdit, onDelete, isLast, refres
     }
     row.append(thumb);
 
-    // 名称输入
-    const nameInp = el("input", "flex:0 0 26%;width:0;background:var(--comfy-input-bg,#1d1d1d);color:var(--fg-color,#ddd);border:1px solid var(--border-color,#444);border-radius:4px;padding:6px;font-size:12px;");
+    // ── 右侧：图片用两行（上行=编号/名称/上传；下行=详细描述）；视频·音频保持原一行 ──
+    const right = el("div", "flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:6px;justify-content:center;");
+    const line1 = el("div", "display:flex;align-items:center;gap:6px;min-width:0;");
+    const line2 = isImage ? el("div", "display:flex;align-items:center;gap:6px;min-width:0;") : null;
+
+    // 启用开关
+    const chk = el("input", "flex:0 0 auto;width:18px;height:18px;accent-color:#2d9d6f;cursor:pointer;");
+    chk.type = "checkbox";
+    chk.checked = item.enabled !== false;
+    chk.title = "启用/禁用该素材";
+    chk.addEventListener("change", () => { item.enabled = chk.checked; onEdit(); refreshAllFn(); });
+
+    // 类型下拉（仅在「其他（自定义）」分区显示；各子分类由分区固定类型）
+    const typeSel = el("select", "flex:0 0 58px;background:var(--comfy-input-bg,#1d1d1d);color:var(--fg-color,#ddd);border:1px solid var(--border-color,#444);border-radius:4px;padding:5px 2px;font-size:12px;");
+    for (const t of (ASSET_TYPES_BY_KIND[kind] || ASSET_TYPES)) {
+        const o = el("option", "", t);
+        if (t === item.type) o.selected = true;
+        typeSel.append(o);
+    }
+
+    // 字母编号（A-Z）：同一类型已被其他素材占用的字母置灰，防止同类同编号
+    const letterSel = el("select", "flex:0 0 42px;width:42px;background:var(--comfy-input-bg,#1d1d1d);color:var(--fg-color,#ddd);border:1px solid var(--border-color,#444);border-radius:4px;padding:4px 1px;font-size:12px;text-align:center;cursor:pointer;");
+    letterSel.title = "编号（26 字母 A-Z，同一类型内唯一）";
+    const usedLetters = () => {
+        const used = new Set();
+        // 唯一性范围按槽位类型（音频的三个子分类共用「音频」编号空间；视频同理）
+        slotTypePeers(kind, opts?.assets, item).forEach((it) => {
+            const L = String(it?.letter || "").toUpperCase();
+            if (L) used.add(L);
+        });
+        return used;
+    };
+    const renderLetters = () => {
+        const used = usedLetters();
+        letterSel.innerHTML = "";
+        // 编号必选（不再提供「—」空白项）：新增/丢失的编号由 nextFreeLetter 自动补「靠前的未被占用字母」
+        // 26 字母全部显示；已被同类其他素材占用的置灰禁用（可见但不可选），切换/换编号后实时刷新
+        const cur = (item.letter || "").trim().toUpperCase();
+        for (let i = 0; i < 26; i++) {
+            const L = String.fromCharCode(65 + i);
+            const o = el("option", "", L);
+            if (L === cur) o.selected = true;
+            if (used.has(L) && L !== cur) o.disabled = true;
+            letterSel.append(o);
+        }
+    };
+    const slotTag = el("span", "font-size:11px;color:#ffd166;white-space:nowrap;flex:0 0 auto;min-width:42px;text-align:center;font-weight:600;", "");
+    const renderSlot = () => {
+        const st = slotTypeOf(kind, item?.type || "");
+        const L = (item?.letter || "").trim().toUpperCase();
+        const tag = L || "?";
+        slotTag.textContent = `${st}${tag}`;
+        slotTag.title = `调度槽位：${st}${tag}（未指定编号时生成自动分配；ref 描述与调度 slots 用）`;
+    };
+    typeSel.addEventListener("change", () => { item.type = typeSel.value; renderLetters(); renderSlot(); onEdit(); refreshAllFn(); });
+    letterSel.addEventListener("change", () => { item.letter = letterSel.value; renderSlot(); onEdit(); refreshAllFn(); });
+    renderLetters();
+    renderSlot();
+
+    // 名称输入（「角色音色」的名称由绑定角色决定 → 不显示名称框，见下方 characterSel）
+    const nameInp = el("input", "flex:1 1 120px;width:0;min-width:80px;background:var(--comfy-input-bg,#1d1d1d);color:var(--fg-color,#ddd);border:1px solid var(--border-color,#444);border-radius:4px;padding:6px;font-size:12px;");
     nameInp.type = "text";
-    nameInp.placeholder = "名称（如：孙悟空）";
+    nameInp.placeholder = isRole ? "角色名（如：孙悟空）" : (kind === "image" ? "名称（如：龟仙屋）" : "名称（如：孙悟空）");
     nameInp.value = item.name || "";
-    nameInp.addEventListener("change", () => { item.name = nameInp.value.trim(); onEdit(); });
+    nameInp.addEventListener("change", () => {
+        const old = item.name;
+        item.name = nameInp.value.trim();
+        // 角色改名 → 联动画像音色的绑定角色名 + 刷新跨分区的「指定角色名」下拉
+        if (isRole && old !== item.name) {
+            syncVoiceCharacter(old, item.name);
+            refreshRoleSels(nameInp.closest("section.jzl-modal") || document);
+        }
+        onEdit();
+    });
+    // 角色改名/删除时，把「音频 → 角色音色」里绑定的旧角色名跟着改（删角色则回退「未指定」）
+    function syncVoiceCharacter(oldName, newName) {
+        const from = String(oldName || "").trim();
+        if (!from) return;
+        (opts?.assets?.audios || []).forEach((a) => {
+            if (String(a?.type || "") !== "角色音色") return;
+            if (String(a?.character || "").trim() === from) a.character = String(newName || "").trim();
+        });
+    }
 
     // 详细描述输入（路径只由「上传素材」按钮设置，不再显示路径输入框）
     const descInp = el("input", "flex:1 1 120px;width:0;background:var(--comfy-input-bg,#1d1d1d);color:var(--fg-color,#ccc);border:1px solid var(--border-color,#444);border-radius:4px;padding:6px;font-size:11px;");
     descInp.type = "text";
-    descInp.placeholder = "详细描述（如：黑色刺猬头、橙色龟仙流武道服…）";
+    descInp.placeholder = isImage ? "图片详细描述（如：黑色刺猬头、橙色龟仙流武道服…）" : "详细描述";
     descInp.value = item.description || "";
     descInp.addEventListener("change", () => { item.description = descInp.value.trim(); onEdit(); });
 
+    // ⭐ 音频「角色音色」子分类：指定角色名（未指定 + 图片里的角色名列表）。
+    //    角色被改名 → 选项文字联动（syncVoiceCharacter 已同步本条的 character）；
+    //    角色被删除 → 本项自动回退「未指定」，避免留下悬空引用。
+    let characterSel = null;
+    let syncCharacterSel = null;
+    if (kind === "audio" && String(item.type || "") === "角色音色") {
+        characterSel = el("select", "flex:0 1 132px;min-width:92px;background:var(--comfy-input-bg,#1d1d1d);color:var(--fg-color,#ddd);border:1px solid var(--border-color,#444);border-radius:4px;padding:5px 2px;font-size:12px;");
+        characterSel.title = "指定该音色属于哪个角色（选项来自「图片 · 角色」里的角色名；角色改名会联动）";
+        syncCharacterSel = () => {
+            const names = roleNameList(opts?.assets);
+            let cur = String(item.character || "").trim();
+            if (cur && !names.includes(cur)) { item.character = ""; cur = ""; }   // 角色已被删除/改名 → 回退未指定
+            // 角色互斥：已被**其他**「角色音色」占用的角色不可再选（可见但置灰，与编号下拉一致）
+            const taken = new Set();
+            (opts?.assets?.audios || []).forEach((a) => {
+                if (a === item) return;
+                if (String(a?.type || "") !== "角色音色") return;
+                if (a?.enabled === false) return;
+                const ch = String(a?.character || "").trim();
+                if (ch) taken.add(ch);
+            });
+            characterSel.innerHTML = "";
+            for (const n of ["", ...names]) {
+                const isTaken = n && taken.has(n) && n !== cur;
+                const o = el("option", "", n ? (isTaken ? `${n}（已被其他音色占用）` : n) : "未指定");
+                o.value = n;
+                if (n === cur) o.selected = true;
+                if (isTaken) o.disabled = true;
+                characterSel.append(o);
+            }
+        };
+        syncCharacterSel();
+        characterSel.dataset.jzlRoleSync = "1";
+        characterSel.__jzlRefresh = syncCharacterSel;
+        // 打开下拉前重算选项：角色刚被改名/删除时也能即时反映（值本身由 syncVoiceCharacter/删除钩子联动）
+        characterSel.addEventListener("mousedown", (e) => { e.stopPropagation(); syncCharacterSel(); });
+        characterSel.addEventListener("change", () => {
+            item.character = characterSel.value;
+            onEdit();
+            refreshRoleSels(characterSel.closest("section.jzl-modal") || document);  // 角色被占用 → 其他音色下拉同步置灰
+            refreshAllFn();
+        });
+    }
+
+    // 上传 / 替换：有素材显示「替换素材」，无素材显示「上传素材」
     const pickBtn = el("button", "flex:0 0 auto;background:#2a4a6a;color:#cfe3f7;border:1px solid #5b9bd5;border-radius:4px;padding:6px 8px;font-size:12px;cursor:pointer;", "上传素材");
-    pickBtn.title = "选择文件";
+    const refreshPickLabel = () => {
+        const has = !!String(item.path || "").trim();
+        pickBtn.textContent = has ? "替换素材" : "上传素材";
+        pickBtn.title = has ? "重新选择文件替换当前素材（名称/描述/类型/编号保留）" : "选择文件";
+    };
     pickBtn.addEventListener("click", async () => {
         const p = await chooseFile(kind);
         if (p) {
             item.path = p;
-            // 名称留空时自动以文件名命名（去扩展名）
-            if (!(item.name || "").trim()) {
+            // 名称留空时自动以文件名命名（去扩展名）；「角色音色」的名称来自角色，不自动填名
+            const autoName = !(characterSel);
+            if (autoName && !(item.name || "").trim()) {
                 const autoNm = assetNameFromFilename(String(p || "").split(/[\\/]/).pop());
                 if (autoNm) { item.name = autoNm; if (nameInp) nameInp.value = autoNm; }
             }
-            refreshThumb(); if (refreshAudio) refreshAudio(); if (typeof refreshVideo === "function") refreshVideo(); onEdit();
+            refreshThumb(); if (refreshAudio) refreshAudio(); if (typeof refreshVideo === "function") refreshVideo();
+            refreshPickLabel(); onEdit();
         }
     });
+    refreshPickLabel();
 
-    row.append(nameInp, descInp, pickBtn);
+    // 删除槽位：每张卡片都可删（排序已支持任意顺序，无需限制在末位）
+    const delBtn = el("button", "flex:0 0 auto;background:transparent;color:#e08a8a;border:1px solid #844;border-radius:4px;padding:6px 8px;font-size:12px;cursor:pointer;", "删除槽位");
+    delBtn.title = "删除该槽位";
+    delBtn.addEventListener("click", onDelete);
 
-    // 删除按钮：仅最后一个槽位显示（防止中间删除导致顺序错乱）
-    if (isLast) {
-        const delBtn = el("button", "flex:0 0 auto;background:transparent;color:#e08a8a;border:1px solid #844;border-radius:4px;padding:6px 8px;font-size:12px;cursor:pointer;", "删除槽位");
-        delBtn.title = "删除此槽位（只允许删除最后一个）";
-        delBtn.addEventListener("click", onDelete);
-        row.append(delBtn);
+    // ── 组装 ──
+    const isVoice = !!(characterSel);
+    // 图片（角色/场景/道具）：第一行 = 编号 + 名称 + 上传/替换 + 删除槽位；第二行 = 详细描述
+    if (isImage) {
+        line1.append(chk);
+        if (showType) line1.append(typeSel);
+        line1.append(letterSel, slotTag, nameInp, pickBtn, delBtn);
+        line2.append(descInp);
+        right.append(line1, line2);
+    } else {
+        // 视频 / 音频：预览已前置；音频「角色音色」用「指定角色名」代替名称框
+        line1.append(chk);
+        if (showType) line1.append(typeSel);
+        line1.append(letterSel, slotTag);
+        if (isVoice) line1.append(characterSel, descInp, pickBtn, delBtn);
+        else line1.append(nameInp, descInp, pickBtn, delBtn);
+        right.append(line1);
     }
+    row.append(right);
 
-    // 拖放替换：把文件拖到本素材「缩略图」窗口范围 → 仅替换素材文件（保留名称/简介/类型/编号/启用）
-    thumb.title = `${thumb.title || "缩略图"}（拖文件到此窗口可替换素材）`;
+    // 拖放替换：把文件拖到本素材「预览」窗口范围 → 仅替换素材文件（保留名称/简介/类型/编号/启用）
+    thumb.title = `${thumb.title || "预览"}（拖文件到此窗口可替换素材）`;
     thumb.addEventListener("dragover", (e) => {
         const _files = e.dataTransfer && e.dataTransfer.files;
         if (!_files || !_files.length) return;   // 内部排序拖动：不拦截，交由区块插入式排序处理
@@ -2025,13 +2343,14 @@ function makeAssetCard(kind, index, item, list, onEdit, onDelete, isLast, refres
         e.stopPropagation();
         const file = files[0];
         const fkind = detectAssetKindByFile(file);
-        if (fkind !== kind) { notify(`类型不符：缩略图为${KIND_LABEL[kind]}，拖入的是${KIND_LABEL[fkind || "未知"]}`, "warning"); return; }
+        if (fkind !== kind) { notify(`类型不符：预览为${KIND_LABEL[kind]}，拖入的是${KIND_LABEL[fkind || "未知"]}`, "warning"); return; }
         const p = await uploadFileObject(file, kind);
         if (p) {
             item.path = p;   // 仅替换素材文件，名称/简介/类型/编号/启用均保留
             refreshThumb();
             if (refreshAudio) refreshAudio();
             if (typeof refreshVideo === "function") refreshVideo();
+            refreshPickLabel();
             onEdit();
             notify(`已替换 ${KIND_LABEL[kind]} 素材（保留名称与简介）`, "success");
         }
@@ -2041,13 +2360,25 @@ function makeAssetCard(kind, index, item, list, onEdit, onDelete, isLast, refres
     return row;
 }
 
-function renderAssetSection(c, kind, list, title) {
+// subType 非空时本区块只显示该类型的素材（图片大分类下的「角色/场景/道具」小分类）；
+// 增删改与拖拽排序一律作用在 parentList 上，view 只负责显示过滤。
+function renderAssetSection(c, kind, list, title, subType, opts) {
     const fireEdit = () => c.dispatchEvent(new Event("change", { bubbles: true }));
     c.append(makeSectionTitle(title));
     const box = el("div", "");
+    const inView = (it) => (opts && typeof opts.inViewFn === "function")
+        ? !!opts.inViewFn(it)
+        : (!subType || String(it?.type || "") === subType);
+    const view = () => (list || []).filter(inView);
+    // 把本类型的条目按新顺序重排回 parentList，其他类型条目位置不变
+    const applyOrder = (newOrder) => {
+        const pos = [];
+        list.forEach((it, i) => { if (inView(it)) pos.push(i); });
+        pos.forEach((at, k) => { if (k < newOrder.length) list[at] = newOrder[k]; });
+    };
     // ── 拖拽排序（插入式）：拖起某素材 → 该卡片淡蓝高亮；拖到任意两素材之间 → 出现虚线占位框（与素材栏等大）→ 松开即插入 ──
-    let dragFrom = -1;       // 被拖素材原 index
-    let dropIndex = -1;      // 插入位置（0..len，相对当前 list）
+    let dragFrom = -1;       // 被拖素材原 index（相对 view）
+    let dropIndex = -1;      // 插入位置（0..len，相对 view）
     let dragEl = null;       // 被拖卡片元素
     let ghost = null;        // 虚线占位框
     let floatEl = null;      // 跟随鼠标的被拖素材浮动克隆（拖拽时可见）
@@ -2103,31 +2434,23 @@ function renderAssetSection(c, kind, list, title) {
             floatEl.style.boxShadow = "0 10px 28px rgba(0,0,0,.5)";
             floatEl.style.transform = "scale(1.02)";
             floatEl.style.width = dragEl.offsetWidth ? dragEl.offsetWidth + "px" : "auto";
-            floatEl.style.cursor = "grabbing";
-            floatEl.style.background = "var(--comfy-menu-bg,#232323)";
-            // 浮动克隆里的控件禁用交互（防误触/样式跳动），input/select 只读外观保持
-            floatEl.querySelectorAll("input,select,button,textarea").forEach((elc) => { elc.disabled = true; });
+            const r0 = dragEl.getBoundingClientRect();
+            floatEl.style.left = (e.clientX - r0.width / 2) + "px";
+            floatEl.style.top = (e.clientY - 14) + "px";
             document.body.appendChild(floatEl);
         }
         if (floatEl) {
-            floatEl.style.left = (e.clientX + 14) + "px";
-            floatEl.style.top = (e.clientY + 12) + "px";
+            const r0 = dragEl.getBoundingClientRect();
+            floatEl.style.left = (e.clientX - r0.width / 2) + "px";
+            floatEl.style.top = (e.clientY - 14) + "px";
         }
     };
     const onDocMove = (e) => {
         if (!_down) return;
-        if (!_drag) {
-            if (Math.abs(e.clientX - _sx) < 5 && Math.abs(e.clientY - _sy) < 5) return;  // 阈值内=点击
-            _drag = true;
-            if (dragEl) { try { dragEl.style.background = "#3f6fa8"; dragEl.style.opacity = "0.55"; } catch (_) {} }
-        }
-        if (e.cancelable) e.preventDefault();
-        // 拖到容器边缘自动滚动（c = 滚动容器）
-        try {
-            const r = c.getBoundingClientRect();
-            if (e.clientY < r.top + 40) c.scrollTop -= 16;
-            else if (e.clientY > r.bottom - 40) c.scrollTop += 16;
-        } catch (_) {}
+        if (!_drag && (Math.abs(e.clientX - _sx) > 4 || Math.abs(e.clientY - _sy) > 4)) _drag = true;
+        if (!_drag) return;
+        e.preventDefault();
+        if (dragEl) { dragEl.style.opacity = "0.35"; dragEl.style.background = "#2b3a4a"; }
         ensureFloat(e);
         placeGhost(e.clientY);
     };
@@ -2151,30 +2474,44 @@ function renderAssetSection(c, kind, list, title) {
     };
     const commitMove = () => {
         if (dragFrom < 0) return;
-        let to = (dropIndex >= 0) ? dropIndex : list.length;
+        const vs = view();
+        let to = (dropIndex >= 0) ? dropIndex : vs.length;
         if (dragFrom < to) to = to - 1;
-        const moved = list.splice(dragFrom, 1)[0];
-        if (to > list.length) to = list.length;
-        list.splice(to, 0, moved);
+        const moved = vs.splice(dragFrom, 1)[0];
+        if (to > vs.length) to = vs.length;
+        vs.splice(to, 0, moved);
+        applyOrder(vs);
         clearDrag();
         renderList();
         fireEdit();
     };
     const renderList = () => {
         box.innerHTML = "";
+        const vs = view();
         let _letterFixed = false;
-        list.forEach((item, i) => {
-            // 编号丢失/未指定（如音频偶尔丢号）→ 自动补「靠前的未被占用字母」（同类型内唯一），并回写保存
+        vs.forEach((item, i) => {
+            // 编号丢失/未指定（如音频偶尔丢号）→ 自动补「靠前的未被占用字母」（同槽位类型内唯一），并回写保存
             if (!String(item.letter || "").trim()) {
-                const _L = nextFreeLetter(list, item.type || "");
+                const _L = nextFreeSlotLetter(kind, opts?.assets, item.type || "");
                 if (_L) { item.letter = _L; _letterFixed = true; }
             }
-            const isLast = i === list.length - 1;
-            const card = makeAssetCard(kind, i, item, list, fireEdit, () => {
-                list.splice(i, 1);
+            const isLast = i === vs.length - 1;
+            const card = makeAssetCard(kind, i, item, vs, fireEdit, () => {
+                const at = list.indexOf(item);
+                if (at >= 0) list.splice(at, 1);
+                // 删除「图片 · 角色」时，音频「角色音色」里指向该角色的绑定回退为「未指定」
+                if (kind === "image" && String(item?.type || "") === "角色") {
+                    const gone = String(item?.name || "").trim();
+                    if (gone) {
+                        (opts?.assets?.audios || []).forEach((a) => {
+                            if (String(a?.type || "") === "角色音色" && String(a?.character || "").trim() === gone) a.character = "";
+                        });
+                    }
+                    refreshRoleSels(box.closest("section.jzl-modal") || document);
+                }
                 renderList();
                 fireEdit();
-            }, isLast, renderList);
+            }, isLast, renderList, opts);
             card.classList.add("jzl-asset-card");
             card.style.cursor = "grab";
             // 行首拖拽把手（明确按住此区排序，避免误触控件）
@@ -2184,11 +2521,12 @@ function renderAssetSection(c, kind, list, title) {
             card.addEventListener("mousedown", (e) => cardDown(e, i, card));
             box.append(card);
         });
-        const addBtn = el("button", "margin-top:4px;width:100%;padding:6px;background:#2a3a4a;color:#9fc3e8;border:1px dashed #5b9bd5;border-radius:6px;font-size:12px;cursor:pointer;", `+ 添加${KIND_LABEL[kind]}`);
+        const _addLabel = subType ? `+ 添加${subType}` : `+ 添加${KIND_LABEL[kind]}`;
+        const addBtn = el("button", "margin-top:4px;width:100%;padding:6px;background:#2a3a4a;color:#9fc3e8;border:1px dashed #5b9bd5;border-radius:6px;font-size:12px;cursor:pointer;", _addLabel);
         addBtn.classList.add("jzl-asset-add");
         addBtn.addEventListener("click", () => {
-            const _t0 = (ASSET_TYPES_BY_KIND[kind] || ASSET_TYPES)[0];
-            list.push({ type: _t0, name: "", path: "", enabled: true, letter: nextFreeLetter(list, _t0) });
+            const _t0 = subType || (ASSET_TYPES_BY_KIND[kind] || ASSET_TYPES)[0];
+            list.push({ type: _t0, name: "", path: "", enabled: true, letter: nextFreeSlotLetter(kind, opts?.assets, _t0) });
             renderList();
             fireEdit();
         });
@@ -2356,24 +2694,35 @@ function setupInternalPrompt(node, box, ipWidget) {
     box.addEventListener("keyup", () => { rememberCaret(box); promptCaretPos = caretOffset(box); });
     box.addEventListener("click", () => { rememberCaret(box); promptCaretPos = caretOffset(box); });
     // 回车：统一插入「\n」文本（不生成 Chrome 的 <div><br></div>），保证 DOM 只有 textNode+token
-    box.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" && !e.isComposing) {
-            e.preventDefault();
-            e.stopPropagation();
-            const _sel = window.getSelection();
-            if (_sel && _sel.rangeCount && box.contains(_sel.anchorNode)) {
-                const r0 = _sel.getRangeAt(0);
-                r0.deleteContents();
-                const tn = document.createTextNode("\n");
-                r0.insertNode(tn);
-                const r2 = document.createRange();
-                r2.setStartAfter(tn);
-                r2.collapse(true);
-                _sel.removeAllRanges();
-                _sel.addRange(r2);
-                box.dispatchEvent(new Event("input", { bubbles: true }));
-            }
+    // ⚠️ 必须「无条件插入」：旧写法是 preventDefault() 之后才判断选区是否在框内，条件不满足时
+    //    既没换行、又吞掉了浏览器默认换行 → 表现为「第一次回车没反应，要按两次」。
+    //    现在选区异常（焦点在框外/无 range）时兜底插到末尾，保证按一次就换行。
+    const insertNewline = () => {
+        const _sel = window.getSelection();
+        let r0 = null;
+        if (_sel && _sel.rangeCount && box.contains(_sel.anchorNode)) {
+            r0 = _sel.getRangeAt(0);
+        } else {
+            r0 = document.createRange();
+            r0.selectNodeContents(box);
+            r0.collapse(false);
         }
+        r0.deleteContents();
+        const tn = document.createTextNode("\n");
+        r0.insertNode(tn);
+        const r2 = document.createRange();
+        r2.setStartAfter(tn);
+        r2.collapse(true);
+        if (_sel) { _sel.removeAllRanges(); _sel.addRange(r2); }
+        syncInternal();
+        box.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    box.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" || e.shiftKey) return;   // Shift+Enter 与 Enter 都换行
+        if (e.isComposing || e.keyCode === 229) return; // 输入法组合中：交给输入法（避免吞掉选词回车）
+        e.preventDefault();
+        e.stopPropagation();
+        insertNewline();
     });
     box.addEventListener("change", syncInternal);
     // 粘贴：阻止 ComfyUI 画布把剪贴板里的「节点 JSON」粘贴到画布，只插入纯文本到提示词
@@ -2639,11 +2988,17 @@ function seedControlRow(p, fieldKey = "seed", modeKey = "seed_control", labelTex
     const g = el("div", "display:flex;align-items:center;gap:12px;margin-bottom:10px;");
     const lab = el("label", "flex:0 0 160px;font-size:13px;color:var(--descrip-text,#999);white-space:nowrap;", labelText);
     const i = el("input", "flex:1;min-width:0;");
-    i.type = "number";
-    i.value = p[fieldKey] ?? 0;
-    i.min = 0; i.max = 0xffffffffffffffff; i.step = 1;
-    i.className = "jzl-input";
-    i.addEventListener("change", () => { p[fieldKey] = Math.round(parseFloat(i.value) || 0); });
+    // 种子是 64 位整数（可达 9.2e18，> Number.MAX_SAFE_INTEGER）→ 用 text 存字符串，避免精度丢失/显示异常
+    i.type = "text";
+    i.inputMode = "numeric";
+    i.value = (p[fieldKey] === undefined || p[fieldKey] === null) ? "0" : String(p[fieldKey]);
+    i.className = "jzl-input jzl-count-input";
+    i.placeholder = "0 = 随机（运行后回填真实种子）";
+    i.addEventListener("change", () => {
+        const v = String(i.value || "").replace(/[^0-9]/g, "");
+        p[fieldKey] = v === "" ? 0 : v;      // 以字符串保存（Python int() 可直接解析）
+        i.value = String(p[fieldKey]);
+    });
     const ctrl = el("button", "flex:1 1 0;min-width:0;background:#b45309;color:#fff;border:1px solid #d97706;border-radius:4px;padding:6px 10px;font-size:12px;cursor:pointer;white-space:nowrap;text-align:center;");
     const curKey = () => (SEED_CONTROL_LABEL[p[modeKey]] ? p[modeKey] : "randomize");
     const render = () => {
@@ -2661,6 +3016,22 @@ function seedControlRow(p, fieldKey = "seed", modeKey = "seed_control", labelTex
     return g;
 }
 
+// 递归补齐缺失键（用户值优先，只在键缺失/为 null 时填默认值）。
+// 必须递归：只按顶层键合并的话，旧配置里的 sample_decode 会整块盖掉默认值，
+// 导致后加的键（selflift.steps / second.tiling_tiles …）永远不存在 →
+// 面板显示的是「?? 默认值」，保存时却写不进去 → 后端只能回退，出现「面板 8 步、后端 4 步」。
+function fillDefaults(target, defaults) {
+    for (const [k, dv] of Object.entries(defaults || {})) {
+        const tv = target[k];
+        if (tv === undefined || tv === null) {
+            target[k] = (dv && typeof dv === "object") ? JSON.parse(JSON.stringify(dv)) : dv;
+        } else if (dv && typeof dv === "object" && !Array.isArray(dv) && typeof tv === "object" && !Array.isArray(tv)) {
+            fillDefaults(tv, dv);
+        }
+    }
+    return target;
+}
+
 function defaultSettings() {
     return {
         auto_save: true,
@@ -2673,10 +3044,10 @@ function defaultSettings() {
             common: { clip: "", video_vae: "", audio_vae: "" },
         },
         assets: { images: [], videos: [], audios: [] },
+        // 「生成设定 → 语义修正」：语义桥（内部调用内置副本，不依赖用户另装该节点包）
+        semantic_bridge: { enabled: false, adapter: "", alpha: 0.10, magnitude_match: "per_token" },
         enhance: {
-            story_decompose: true,          // 固定开启（面板已隐藏该项；后端也强制开启）
-            vision_decompose: false,        // 开启拆解识图（同名参考图交给 LLM）
-            vision_expand: false,           // 开启扩写识图
+            story_decompose: true,
             enabled: false,
             llm_backend: "在线API [api]",
             force_offload: false,
@@ -2692,11 +3063,12 @@ function defaultSettings() {
             },
             api: {
                 provider: "OpenAI 兼容 (OpenAI/DeepSeek/Qwen/GLM/Kimi/Ollama/vLLM/LM Studio)",
-                model: "deepseek-v4-flash-vision-exp", api_key: "", base_url: "https://api.deepseek.com/v1",
+                model: "deepseek-flash", api_key: "", base_url: "https://api.deepseek.com",
                 temperature: 0.6, max_tokens: 81920, thinking: "disabled",
             },
             preference: {
                 shot_size: "随机组合", camera_move: "随机组合", cut_rhythm: "随机",
+                angle_view: "根据剧情",
                 transition: "随机", music_style: "禁止音乐 / No Music",
                 creative_req: "无特别要求", detail_length: "标准 (350-500字)", custom: "",
             },
@@ -2710,6 +3082,14 @@ function defaultSettings() {
         sample_decode: {
             sampler: "res_multistep", scheduler: "simple", steps: 4, cfg: 1.0,
             seed: 0, seed_mode: "randomize",
+            // 采样分类：常规采样（K采样器 + 可选二采）/ SelfLift采样（内置 SelfLift 渐进分辨率采样）
+            sample_mode: "常规采样",
+            selflift: {
+                // SelfLift 有独立的步数：默认 8（低分辨率前缀 6 + 高分辨率收尾 2），与常规采样的 4 步互不干扰
+                steps: 8,
+                transition_step: 6, lowres_scale: 0.5, rho: 0.6, w_min: 0.5, w_max: 1.0,
+                upscaler_model: "none", upscaler_unload: true, highres_tiling: false,
+            },
             decode_video: "XB-BOX - VAE解码（原版优化）", decode_cleanup: "卸载显存模型",
             infinite: {
                 window: 22, audio_link: true, audio_no_trim: false, settle: 12,
@@ -2723,6 +3103,8 @@ function defaultSettings() {
                 sampler: "euler", scheduler: "simple", steps: 3, denoise: 0.3,
                 sigmas_mode: "scheduler",
                 custom_sigmas: "0.8500, 0.6316, 0.3158, 0.0000",
+                // 二采空间分块（自研 forward 级切块 + 升余弦融合）：关闭 / 自动 / 手动
+                tiling: "关闭", tiling_tiles: 2, tiling_overlap: 128,
             },
         },
     };
@@ -2730,7 +3112,7 @@ function defaultSettings() {
 
 // ── 配置面板 ──────────────────────────────────────────────
 // 槽位类型顺序（与后端 _build_asset_intro 的 _SLOT_TYPE_ORDER 一致）
-const REF_SLOT_ORDER = { "角色": 0, "场景": 1, "道具": 2, "分镜": 3, "其他": 4, "视频": 0, "音频": 0 };
+const REF_SLOT_ORDER = { "角色": 0, "场景": 1, "道具": 2, "分镜": 3, "其他": 4, "视频": 0, "音色": 0, "配乐": 1, "念白": 2, "音频": 3 };
 
 // 按勾选素材生成只读的三路描述文本（供 LLM 拆解/增强使用，与后端 _build_asset_intro 完全一致）
 function buildRefIntro(assets) {
@@ -2739,7 +3121,8 @@ function buildRefIntro(assets) {
     const collect = (kind, key, pool) => {
         ((assets?.[key]) || []).forEach((item, i) => {
             if (item?.enabled === false) return;
-            const name = (item?.name || "").trim();
+            // 名称与槽位表共用 assetDisplayName（「角色音色」的名称来自绑定角色）
+            const name = assetDisplayName(kind, item);
             if (!name) return;
             const st = slotTypeOf(kind, item?.type || "");
             const slot = slotMap[`${kind}:${i}`] || st;
@@ -2839,13 +3222,33 @@ function renderAssetsTools(c, s, build, node) {
 
 function renderAssetsPanel(c, s, mode) {
     const assets = s.assets;
-    // 素材引用提示（生成路径由引用内容自动推断）
-    c.append(el("div", "background:#2b3a4a;border:1px solid #5b9bd5;border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:12px;color:#cfe3f7;", `素材引用上限：图片 ≤9 / 视频 ≤3 / 音频 ≤3（生成路径按引用内容自动推断：有视频→多参考，≥2图→首尾帧，1图→首帧，无→纯文本）`));
+    // 素材引用提示（生成路径固定 ref2va 多参考，无 fl2va 首尾帧/首帧路径）
+    c.append(el("div", "background:#2b3a4a;border:1px solid #5b9bd5;border-radius:6px;padding:8px 12px;margin-bottom:8px;font-size:12px;color:#cfe3f7;", `素材引用上限：图片 ≤9 / 视频 ≤3 / 音频 ≤3（生成路径固定为「多参考生成音视频 REF2VA」：图片=身份参考、音频=音色/配乐/念白参考，音频严格使用上传的文件。没有首尾帧/首帧（fl2va）路径；视频未被引用时，视频与视频音轨端口自动关闭）`));
     c.append(el("div", "background:#1f2a33;border:1px dashed #5b9bd5;border-radius:6px;padding:6px 12px;margin-bottom:8px;font-size:12px;color:#9fc3e8;", `🖱 可直接把图片/视频/音频文件拖拽到本面板上传，自动按文件名命名素材（也可点卡片「上传素材」）。`));
 
-    renderAssetSection(c, "image", assets.images, "🖼️ 图片");
-    renderAssetSection(c, "video", assets.videos, "🎬 视频");
-    renderAssetSection(c, "audio", assets.audios, "🎧 音频");
+    // 🖼️ 图片大分类 → 「角色」「场景」「道具」三个小分类（各自独立卡片列表与编号；编号逻辑沿用原 A-Z 同类型唯一）。
+    // 「角色」卡片额外带「音色」组（编号与音频区共用 A-Z）；三类都不显示类型下拉（类型由分区决定）。
+    // opts.assets = 完整素材配置：音频卡与角色音色卡需要跨列表计算共享编号占用。
+    renderAssetSection(c, "image", assets.images, "🖼️ 图片 · 角色", "角色", { showType: false, assets });
+    renderAssetSection(c, "image", assets.images, "🖼️ 图片 · 场景", "场景", { showType: false, assets });
+    renderAssetSection(c, "image", assets.images, "🖼️ 图片 · 道具", "道具", { showType: false, assets });
+    // 旧数据的「自定义」等非三类图片：仅在有内容时显示，并保留类型下拉以便改回三类
+    const _imgOthers = (assets.images || []).filter((it) => !["角色", "场景", "道具"].includes(String(it?.type || "")));
+    if (_imgOthers.length) renderAssetSection(c, "image", assets.images, "🖼️ 图片 · 其他（自定义）", "自定义", { showType: true, assets });
+    renderAssetSection(c, "video", assets.videos, "🎬 视频", null, { assets });
+    // 🎧 音频大分类 → 「角色音色」「背景配乐」「念白」三个小分类。
+    // 三者**各自独立编号**（音色A / 配乐A / 念白A），因此各有独立前缀，不会撞出重复槽位名。
+    renderAssetSection(c, "audio", assets.audios, "🎧 音频 · 角色音色", "角色音色", { showType: false, assets });
+    renderAssetSection(c, "audio", assets.audios, "🎧 音频 · 背景配乐", "背景配乐", { showType: false, assets });
+    renderAssetSection(c, "audio", assets.audios, "🎧 音频 · 念白", "念白", { showType: false, assets });
+    // 旧数据的「音效 / 其他」等非三小类音频：仅在有内容时显示，并保留类型下拉以便改回三类
+    const _audOthers = (assets.audios || []).filter((it) => !["角色音色", "背景配乐", "念白"].includes(String(it?.type || "")));
+    if (_audOthers.length) {
+        renderAssetSection(c, "audio", assets.audios, "🎧 音频 · 其他（自定义）", null, {
+            showType: true, assets,
+            inViewFn: (it) => !["角色音色", "背景配乐", "念白"].includes(String(it?.type || "")),
+        });
+    }
 
     // 底部：只读的「传给 LLM 的素材描述」（按勾选素材自动生成，顺序：角色→场景→道具→自定义，字母 A/B/C）
     c.append(makeSectionTitle("📄 传给 LLM 的素材描述（只读，按勾选自动生成）"));
@@ -2880,22 +3283,21 @@ function renderPromptPanel(c, s, d, node) {
     renderAutoSave(c, s);
 
     // ── 输出语言（最顶优先选择；读写 manager_settings.enhance.prompt_lang，随工作流保存）──
-    c.append(makeSectionTitle("LLM 语言"));
+    c.append(makeSectionTitle("输出语言"));
     c.append(field("输出语言", selectControl(["中文 [ZH]", "英文 [EN]"], p.prompt_lang || "中文 [ZH]", v => { p.prompt_lang = v; })));
 
-    // ── 开关（「故事拆解」已固定开启，不再在面板暴露）──
-    c.append(makeSectionTitle("LLM 开关"));
-    c.append(field("开启文本增强", checkboxControl(p.enabled === true, "拆解后对每个分段的详细描述再做润色", v => { p.enabled = v; })));
-    c.append(field("开启拆解识图", checkboxControl(p.vision_decompose === true, "故事拆解时识别「参考素材」里的图片", v => { p.vision_decompose = v; })));
-    c.append(field("开启扩写识图", checkboxControl(p.vision_expand === true, "故事扩写时识别「参考素材」里的图片", v => { p.vision_expand = v; })));
+    // ── 开关 ──
+    c.append(makeSectionTitle("开关"));
+    c.append(field("故事拆解", checkboxControl(p.story_decompose !== false, "把故事通过 LLM 拆解为分段提示词", v => { p.story_decompose = v; })));
+    c.append(field("开启增强", checkboxControl(p.enabled === true, "拆解后对每个分段的详细描述再做润色", v => { p.enabled = v; })));
 
     // ── 故事扩写设置（📚 故事扩写模式专用）──
     c.append(makeSectionTitle("故事扩写设置"));
     const expandRow = el("div", "display:flex;flex-direction:column;gap:6px;margin-bottom:10px;");
     const expandCbs = [];
     const expandOpts = [
-        { val: "素材", label: "使用参考扩写", tip: "使用「参考素材」中的角色/场景/道具进行故事扩写" },
-        { val: "自由", label: "自由发挥扩写", tip: "在用户故事的基础上，按所选故事风格自由发挥扩写" },
+        { val: "素材", label: "使用参考扩写", tip: "严格按照「参考素材管理」勾选的角色/场景/道具进行扩写" },
+        { val: "自由", label: "自由发挥扩写", tip: "在用户输入故事的基础上，按所选故事风格自由发挥扩写" },
     ];
     const mkExpandCb = (opt) => {
         const lab = el("label", "display:flex;align-items:flex-start;gap:8px;font-size:13px;color:var(--descrip-text,#999);cursor:pointer;");
@@ -2921,7 +3323,7 @@ function renderPromptPanel(c, s, d, node) {
     // 迁移兼容：旧配置无 expand_source → 默认「素材」（初次打开渲染已默认，无需额外处理）
 
     // ── LLM 后端（方形勾选单选：本地 / 在线API，切换只显示对应设置区块；样式与「故事拆解」一致）──
-    c.append(makeSectionTitle("LLM 模型"));
+    c.append(makeSectionTitle("LLM 后端"));
     const backendRow = el("div", "display:flex;align-items:center;gap:16px;min-width:0;");
     const backendCbs = [];
     const mkBackendCb = (val, label) => {
@@ -2948,6 +3350,8 @@ function renderPromptPanel(c, s, d, node) {
     // ── 本地 LLM 模型 ──
     const localBox = el("div", "");
     localBox.append(makeSectionTitle("本地 LLM 模型"));
+    // 强制卸载：仅本地模型有意义（在线 API 无「驻留显存」概念）→ 放在本区块首行，选 API 时随区块一起隐藏
+    localBox.append(field("强制卸载", checkboxControl(p.force_offload === true, "LLM 用完即卸载（增强开启时等增强后再卸）", v => { p.force_offload = v; })));
     const llm = p.llm || (p.llm = {});
     const llmModels = (d?.llm_models && d.llm_models.length) ? d.llm_models : ["（未找到本地 LLM 模型）"];
     const mmprojModels = (d?.mmproj_models && d.mmproj_models.length) ? d.mmproj_models : ["None"];
@@ -2955,8 +3359,6 @@ function renderPromptPanel(c, s, d, node) {
     // 关键修复：下拉默认显示第一个模型，但 llm.model 仍为空 → 之前点保存会存成空串触发「未选择本地 LLM 模型」。
     // 打开面板时把「所见即所得」同步进存储：不切换直接保存也会持久化当前显示的模型。
     if (!llm.model && llmModels.length && !llmModels[0].startsWith("（")) llm.model = llmModels[0];
-    // 强制卸载（从「开关」区移入本地 LLM 区；放在模型选择**之前**）
-    localBox.append(field("强制卸载", checkboxControl(p.force_offload === true, "LLM 用完即卸载（增强开启时等增强后再卸）", v => { p.force_offload = v; })));
     localBox.append(field("模型", selectControl(llmModels, llm.model || llmModels[0], v => { llm.model = v; })));
     localBox.append(field("视觉模块 mmproj", selectControl(mmprojModels, llm.mmproj || "None", v => { llm.mmproj = v; })));
     localBox.append(field("Chat Handler", selectControl(chatHandlers, llm.chat_handler || "None", v => { llm.chat_handler = v; })));
@@ -2991,9 +3393,9 @@ function renderPromptPanel(c, s, d, node) {
     apiBox.append(makeSectionTitle("在线 API"));
     const api = p.api || (p.api = {});
     apiBox.append(field("服务商", selectControl(OPTIONS.providers, api.provider || OPTIONS.providers[0], v => { api.provider = v; })));
-    apiBox.append(field("模型", textControl(api.model || "deepseek-v4-flash", "deepseek-v4-flash…", v => { api.model = v; })));
+    apiBox.append(field("模型", textControl(api.model || "deepseek-flash", "deepseek-flash…", v => { api.model = v; })));
     apiBox.append(field("API Key", passwordControl(api.api_key || "", "sk-…（已隐藏）", v => { api.api_key = v; })));
-    apiBox.append(field("Base URL", textControl(api.base_url || "https://api.deepseek.com/v1", "https://api.deepseek.com/v1", v => { api.base_url = v; })));
+    apiBox.append(field("Base URL", textControl(api.base_url || "https://api.deepseek.com", "https://api.deepseek.com", v => { api.base_url = v; })));
     apiBox.append(field("temperature", numberControl(api.temperature ?? 0.6, { min: 0, max: 2, step: 0.01 }, v => { api.temperature = v; })));
     apiBox.append(field("max_tokens", numberControl(api.max_tokens ?? 81920, { min: 1, max: 262144, step: 1 }, v => { api.max_tokens = Math.round(v); })));
     apiBox.append(field("thinking", selectControl(["disabled", "enabled"], api.thinking || "disabled", v => { api.thinking = v; })));
@@ -3021,17 +3423,276 @@ function renderPromptPanel(c, s, d, node) {
     c.append(field("最大尺寸", numberControl(p.max_size ?? 256, { min: 128, max: 16384, step: 64 }, v => { p.max_size = Math.round(v); })));
 }
 
+// ── 共用控件：互斥勾选组（每个选项一行：前面名称、后面勾选与说明；点选即切换，不允许全不选）──
+function checkboxGroup(options, value, onChange) {
+    const box = el("div", "display:flex;flex-direction:column;gap:4px;margin-bottom:10px;");
+    const items = [];
+    for (const o of options) {
+        const val = (typeof o === "object" && o && o.value !== undefined) ? String(o.value) : String(o);
+        const txt = (typeof o === "object" && o && o.label) ? String(o.label) : val;
+        const cb = checkboxControl(String(value) === val, txt, (on) => {
+            const i = cb.querySelector("input");
+            if (!on) { if (i) i.checked = true; return; }   // 单选语义：至少保留一项
+            for (const [, b2, v2] of items) {
+                const i2 = b2.querySelector("input");
+                if (i2) i2.checked = (v2 === val);
+            }
+            onChange(val);
+        });
+        items.push([txt, cb, val]);
+        box.append(cb);
+    }
+    return box;
+}
+
+// ── 共用控件：多宫格方框勾选（选中橙色高亮，与节点内勾选框同色系）──
+// BOX_SEL / BOX_IDLE：选中 / 未选中的边框与底色
+const BOX_SEL = { border: "#f59e0b", bg: "#8a5208", fg: "#fff" };
+const BOX_IDLE = { border: "#555", bg: "#2a2a2a", fg: "#ddd" };
+function _boxPaint(b, on) {
+    const c = on ? BOX_SEL : BOX_IDLE;
+    b.style.borderColor = c.border;
+    b.style.background = c.bg;
+    b.style.color = c.fg;
+}
+function bigBoxGrid(options, value, onChange, cols, height) {
+    const grid = el("div", `display:grid;grid-template-columns:repeat(${cols || 5},1fr);gap:8px;margin-bottom:10px;`);
+    const cells = [];
+    for (const o of options) {
+        const val = String(o);
+        const b = el("button", `height:${height || 26}px;box-sizing:border-box;border-radius:6px;border:2px solid ${BOX_IDLE.border};`
+            + `background:${BOX_IDLE.bg};color:${BOX_IDLE.fg};font-size:13px;font-weight:600;cursor:pointer;`
+            + "display:flex;align-items:center;justify-content:center;white-space:nowrap;overflow:hidden;"
+            + "text-overflow:ellipsis;padding:0 6px;");
+        b.type = "button";
+        b.textContent = val.split(" ")[0];   // 短名（完整名在悬停提示里）
+        b.title = val;
+        b.addEventListener("mousedown", (e) => e.stopPropagation());
+        b.addEventListener("click", () => {
+            for (const [v2, b2] of cells) _boxPaint(b2, v2 === val);
+            onChange(val);
+        });
+        if (val === String(value)) _boxPaint(b, true);
+        cells.push([val, b]);
+        grid.append(b);
+    }
+    return grid;
+}
+
+// ── 共用控件：左右三角步进（◀ 数值 ▶；隐藏原生上下小箭头）──
+function stepperControl(value, opts, onChange) {
+    const o = opts || {};
+    const step = (o.step !== undefined) ? Number(o.step) : 1;
+    const dig = String(step).includes(".") ? String(step).split(".")[1].length : 0;
+    const wrap = el("div", "display:flex;align-items:center;gap:6px;flex:1 1 0;min-width:0;");
+    const mkBtn = (dir) => {
+        const b = el("button", "width:32px;height:30px;flex:0 0 auto;border-radius:5px;border:1px solid #555;"
+            + "background:#2a2a2a;color:#9fd6a4;font-size:13px;line-height:1;cursor:pointer;"
+            + "display:flex;align-items:center;justify-content:center;");
+        b.type = "button";
+        b.textContent = dir < 0 ? "◀" : "▶";
+        b.title = dir < 0 ? `减小 ${step}` : `增大 ${step}`;
+        b.addEventListener("mousedown", (e) => e.stopPropagation());
+        return b;
+    };
+    const left = mkBtn(-1), right = mkBtn(1);
+    const inp = el("input", "flex:1 1 0;min-width:0;text-align:center;");
+    inp.className = "jzl-input jzl-count-input";   // jzl-count-input：隐藏原生上下箭头
+    inp.type = "number";
+    inp.value = value;
+    if (o.min !== undefined) inp.min = o.min;
+    if (o.max !== undefined) inp.max = o.max;
+    inp.step = step;
+    inp.addEventListener("mousedown", (e) => e.stopPropagation());
+    const apply = (raw) => {
+        let n = Number(raw);
+        if (!isFinite(n)) n = (o.min !== undefined) ? o.min : 0;
+        if (o.min !== undefined) n = Math.max(o.min, n);
+        if (o.max !== undefined) n = Math.min(o.max, n);
+        n = Number(Number(n).toFixed(dig));   // 消除 0.30000000000000004 类浮点误差
+        inp.value = n;
+        onChange(n);
+    };
+    left.addEventListener("click", () => apply(Number(inp.value) - step));
+    right.addEventListener("click", () => apply(Number(inp.value) + step));
+    inp.addEventListener("change", () => apply(inp.value));
+    wrap.append(left, inp, right);
+    return wrap;
+}
+
+// ── 弹窗内读写节点表面 widget 的通用辅助（🎬 短剧导演台：运行模式/风格/名称/视频参数）──
+function panelWidgetIO(node) {
+    const wOf = (n) => (node?.widgets || []).find((x) => x.name === n);
+    const cur = (n, dflt) => {
+        const v = readWidgetValue(wOf(n));
+        return (v === undefined || v === null || v === "") ? dflt : v;
+    };
+    const set = (n, v) => {
+        const w = wOf(n);
+        if (!w) return;
+        setWidgetValue(w, v);
+        try { w.callback?.call(w, v); } catch (_) {}
+        try { node?.__jzlUpdateDisplay?.(); } catch (_) {}
+        try { node?.graph?.setDirtyCanvas?.(true, true); } catch (_) {}
+    };
+    const comboOptions = (n, fallback) => {
+        const o = wOf(n)?.options;
+        let arr = [];
+        if (Array.isArray(o)) arr = o;
+        else if (o && Array.isArray(o.values)) arr = o.values;
+        return arr.length ? arr.slice() : (fallback || []);
+    };
+    return { cur, set, comboOptions };
+}
+
 function renderPreferenceSettingsPanel(c, s) {
     const p = s.enhance.preference || (s.enhance.preference = {});
     renderAutoSave(c, s);
-    c.append(field("景别偏好", selectControl(OPTIONS.shotSize, p.shot_size || OPTIONS.shotSize[0], v => { p.shot_size = v; })));
-    c.append(field("运镜偏好", selectControl(OPTIONS.cameraMove, p.camera_move || OPTIONS.cameraMove[0], v => { p.camera_move = v; })));
-    c.append(field("切镜节奏", selectControl(OPTIONS.cutRhythm, p.cut_rhythm || OPTIONS.cutRhythm[0], v => { p.cut_rhythm = v; })));
-    c.append(field("转场偏好", selectControl(OPTIONS.transition, p.transition || OPTIONS.transition[0], v => { p.transition = v; })));
-    c.append(field("音乐风格", selectControl(OPTIONS.music, p.music_style || OPTIONS.music[0], v => { p.music_style = v; })));
-    c.append(field("创作要求", selectControl(OPTIONS.creativeReq, p.creative_req || OPTIONS.creativeReq[0], v => { p.creative_req = v; })));
-    c.append(field("详细描述字数", selectControl(OPTIONS.detailLength, p.detail_length || OPTIONS.detailLength[0], v => { p.detail_length = v; })));
+    // 每组选项改成「多宫格方框勾选」（与 📐 视频参数 同一交互，选中橙色高亮）
+    const rows = [
+        ["🎞️ 景别偏好", "shot_size", OPTIONS.shotSize],
+        ["🔭 视角机位", "angle_view", OPTIONS.angleView],
+        ["🎥 运镜偏好", "camera_move", OPTIONS.cameraMove],
+        ["✂️ 切镜节奏", "cut_rhythm", OPTIONS.cutRhythm],
+        ["🔀 转场偏好", "transition", OPTIONS.transition],
+        ["🎵 音乐风格", "music_style", OPTIONS.music],
+        ["💡 创作要求", "creative_req", OPTIONS.creativeReq],
+        ["📏 详细描述字数", "detail_length", OPTIONS.detailLength],
+    ];
+    for (const [label, key, opts] of rows) {
+        c.append(makeSectionTitle(label));
+        c.append(bigBoxGrid(opts, p[key] || opts[0], v => { p[key] = v; }, 4, 24));
+    }
+    c.append(makeSectionTitle("✍️ 自定义镜头语言"));
     c.append(field("自定义镜头语言", textControl(p.custom || "", "选填。自由描述镜头要求…", v => { p.custom = v; })));
+}
+
+// ── 🎛️ 生成设定（🎬 短剧导演台）：运行模式 / 故事风格（勾选 + 说明）· 故事名称 ──
+// 运行模式注释（每条字数保持一致，便于扫读；与「🤖 大语言模型配置 → 开关」同一形式展示）
+const RUN_MODE_TIPS = {
+    "🛠️ 故事拆解模式": "使用 LLM 模型，对提示词按设定拆解，然后采样生成视频。",
+    "📚 故事扩写模式": "使用 LLM 模型，把故事扩写为丰满正文，只输出文本不生成视频。",
+    "🪄 穿透生成模式": "跳过 LLM 模型，直接用现有提示词，进行采样生成视频。",
+    "📝 仅提示词输出": "使用 LLM 模型，拆解并增强提示词，只输出剧本不生成视频。",
+};
+
+// 故事风格注释（每条字数保持一致，便于扫读；与运行模式注释同一形式展示）
+const STORY_STYLE_TIPS = {
+    "禁用风格": "不使用预设风格设定参数",
+    "热血战斗": "适合竞技/武侠/修仙/末世",
+    "悬疑惊悚": "适合推理/恐怖/犯罪/悬疑",
+    "温馨日常": "适合生活/亲情/治愈系",
+    "甜宠爽文": "适合都市/言情/逆袭打脸",
+    "宏大奇观": "适合科幻/奇幻/大场面",
+    "乡土喜乐": "适合乡村/喜剧/民俗生活",
+    "歌神舞台": "适合音乐/舞台/歌舞表演",
+};
+
+function renderGenSettingsPanel(c, s, node, d) {
+    const { cur, set, comboOptions } = panelWidgetIO(node);
+    renderAutoSave(c, s);
+
+    // ── 分类顺序：故事名称 → 运行模式 → 故事风格 → 语义修正 ──
+    c.append(makeSectionTitle("故事名称"));
+    c.append(field("故事名称", textControl(String(cur("story_name", "")),
+        "用于保存命名 / output/jzl/{故事名} / 生成视频管理", v => set("story_name", v))));
+
+    // 运行模式：左边模式名称、右边勾选 + 注释（与「大语言模型配置 → 开关」同款），单选、不允许全不选
+    c.append(makeSectionTitle("运行模式"));
+    const modes = comboOptions("run_mode", Object.keys(RUN_MODE_TIPS));
+    const curMode = String(cur("run_mode", ""));
+    const modeBoxes = [];
+    for (const m of modes) {
+        const cb = checkboxControl(curMode === m, RUN_MODE_TIPS[m] || "（无说明）", (on) => {
+            const i = cb.querySelector("input");
+            if (!on) { if (i) i.checked = true; return; }   // 单选语义：至少保留一项
+            for (const [v2, b2] of modeBoxes) {
+                const i2 = b2.querySelector("input");
+                if (i2) i2.checked = (v2 === m);
+            }
+            set("run_mode", m);
+        });
+        modeBoxes.push([m, cb]);
+        c.append(field(m, cb));
+    }
+
+    c.append(makeSectionTitle("故事风格"));
+    // 名称 + 注释（勾选框在前）；未收录的风格只显示名称
+    const styleOpts = comboOptions("story_style", []).map((v) => {
+        const name = String(v);
+        const tip = STORY_STYLE_TIPS[name];
+        return { value: name, label: tip ? `${name}：${tip}` : name };
+    });
+    c.append(checkboxGroup(styleOpts, String(cur("story_style", "")), v => set("story_style", v)));
+
+    // ── 语义修正（语义桥）：勾选决定开启；内部调用内置副本，不依赖用户另装该节点包 ──
+    const sb = s.semantic_bridge || (s.semantic_bridge = { enabled: false, adapter: "", alpha: 0.10, magnitude_match: "per_token" });
+    c.append(makeSectionTitle("语义修正"));
+    c.append(field("开启语义桥", checkboxControl(!!sb.enabled,
+        "增强语义结构和增加提示遵循度（需要 models/semantic_bridge/ 下的适配器）",
+        v => { sb.enabled = !!v; syncSemantic(); })));
+    // 适配器：只读磁盘 models/semantic_bridge/ 的实时列表（含二级子目录）——与上游节点下拉同口径。
+    // 磁盘上一个都没有时不伪造假项，显示说明并置灰（与「二采 latent放大模型」同一策略）。
+    const sbAdapters = (d && Array.isArray(d.semantic_bridge_adapters)) ? d.semantic_bridge_adapters : [];
+    const _SB_NONE = "（未找到适配器：请把 MiniMaxH3_SemanticBridge_v1.safetensors 放入 models/semantic_bridge/）";
+    const sbCur = sbAdapters.includes(sb.adapter) ? sb.adapter : (sbAdapters[0] || _SB_NONE);
+    if (sbAdapters.length && sbCur !== sb.adapter) sb.adapter = sbCur;   // 旧值失效 → 落到磁盘上可用的那个并写回
+    const sbSel = selectControl(sbAdapters.length ? sbAdapters : [_SB_NONE], sbCur, v => {
+        if (!sbAdapters.length) return;
+        sb.adapter = v;
+    });
+    if (!sbAdapters.length) { try { sbSel.disabled = true; sbSel.style.opacity = "0.6"; } catch (_) {} }
+    const fAdapter = field("适配器", sbSel);
+    const fAlpha = field("修正强度 alpha", stepperControl(Number(sb.alpha ?? 0.10), { min: 0, max: 1, step: 0.01 },
+        v => { sb.alpha = v; }));
+    const fMatch = field("幅度匹配", bigBoxGrid(["per_token", "global", "none"], String(sb.magnitude_match || "per_token"),
+        v => { sb.magnitude_match = v; }, 3, 26));
+    const syncSemantic = () => {
+        const on = !!sb.enabled;
+        for (const f of [fAdapter, fAlpha, fMatch]) f.style.display = on ? "flex" : "none";
+    };
+    c.append(fAdapter, fAlpha, fMatch);
+    syncSemantic();
+}
+
+// ── 📐 视频参数（🎬 短剧导演台）：画幅比例 / 百万像素 / 每段时长 / 段数 / 参考与放大 ──
+function renderVideoParamsPanel(c, s, node) {
+    const { cur, set, comboOptions } = panelWidgetIO(node);
+    renderAutoSave(c, s);
+
+    c.append(makeSectionTitle("画幅比例"));
+    c.append(bigBoxGrid(comboOptions("aspect_ratio", OPTIONS.aspectRatio),
+        String(cur("aspect_ratio", "16:9 (Widescreen)")), v => set("aspect_ratio", v), 5, 26));
+
+    c.append(makeSectionTitle("分辨率与时长"));
+    c.append(field("百万像素（MP）", stepperControl(parseFloat(cur("megapixels", 0.4)) || 0.4,
+        { min: 0.1, max: 3.6, step: 0.1 }, v => set("megapixels", v))));
+    c.append(field("每段视频时长", selectControl(comboOptions("duration", ["固定5秒"]),
+        String(cur("duration", "固定5秒")), v => set("duration", v))));
+
+    c.append(makeSectionTitle("生成视频数量"));
+    // 段数双形态：短剧导演台是数值输入（0=剧情决定），Pro/Max/无限时长/Mini 是下拉（剧情决定/生成N段）。
+    // 读写都走 readVideoCount / setVideoCount，避免把数字写进下拉或把「生成N段」写进数值输入。
+    const _vcW = (node?.widgets || []).find((x) => x.name === "video_count");
+    const _vcNum = videoCountIsNumeric(_vcW);
+    const _setVC = (v) => {
+        const val = setVideoCount(_vcW, Math.round(v));
+        try { _vcW?.callback?.call(_vcW, val); } catch (_) {}
+        try { node?.__jzlUpdateDisplay?.(); } catch (_) {}
+        try { node?.graph?.setDirtyCanvas?.(true, true); } catch (_) {}
+    };
+    c.append(field("生成视频数量", stepperControl(readVideoCount(_vcW),
+        { min: 0, max: 60, step: 1 }, _setVC)));
+    c.append(el("div", "font-size:12px;color:var(--descrip-text,#999);margin:-4px 0 10px 172px;line-height:1.7;white-space:pre-line;",
+        "参数：0 = LLM 按剧情时间线长度，自动计算需要生成多少段视频。\n"
+        + "参数：1~60 = 设置固定生成数量，最多支持一次生成60段视频！"
+        + (_vcNum ? "" : "（本节点该参数以下拉形式保存，面板里按数值显示与修改）")));
+
+    c.append(makeSectionTitle("参考与放大"));
+    c.append(field("参考数值放大", stepperControl(parseFloat(cur("scale_factor", 1.0)) || 1.0,
+        { min: 1.0, max: 5.0, step: 0.1 }, v => set("scale_factor", v))));
+    c.append(field("二采latent放大", stepperControl(parseFloat(cur("upscale_scale", 1.0)) || 1.0,
+        { min: 1.0, max: 4.0, step: 0.1 }, v => set("upscale_scale", v))));
 }
 
 function renderPrefPanel(c, s, d, node) {
@@ -3039,20 +3700,60 @@ function renderPrefPanel(c, s, d, node) {
     const sec = p.second || (p.second = {});
     renderAutoSave(c, s);
 
-    // ── 采样（一采）──
-    c.append(makeSectionTitle("采样"));
-    c.append(field("K采样器", selectControl(OPTIONS.samplers, p.sampler || OPTIONS.samplers[0], v => { p.sampler = v; })));
-    c.append(field("调度器", selectControl(OPTIONS.schedulers, p.scheduler || OPTIONS.schedulers[0], v => { p.scheduler = v; })));
-    c.append(field("采样步数", numberControl(p.steps ?? 4, { min: 1, max: 200, step: 1 }, v => { p.steps = Math.round(v); })));
-    c.append(field("降噪系数", numberControl(p.denoise ?? 1.0, { min: 0, max: 1, step: 0.05 }, v => { p.denoise = v; })));
+    // ── 采样分类（切换方式参照「🤖 大语言模型配置 → LLM 后端」：方形勾选单选，切换只显示对应区块）──
+    c.append(makeSectionTitle("采样分类"));
+    const sl = p.selflift || (p.selflift = {
+        steps: 8, transition_step: 6, lowres_scale: 0.5, rho: 0.6, w_min: 0.5, w_max: 1.0,
+        upscaler_model: "none", upscaler_unload: true, highres_tiling: false,
+    });
+    const modeRow = el("div", "display:flex;align-items:center;gap:16px;min-width:0;flex-wrap:wrap;");
+    const modeCbs = [];
+    const mkModeCb = (val, label) => {
+        const lab = el("label", "display:flex;align-items:center;gap:6px;font-size:13px;color:var(--descrip-text,#999);cursor:pointer;");
+        const cb = el("input", "width:18px;height:18px;accent-color:#f59e0b;cursor:pointer;");
+        cb.type = "checkbox";
+        cb.checked = (String(p.sample_mode || "常规采样") === val);
+        cb.addEventListener("change", () => {
+            if (cb.checked) {
+                p.sample_mode = val;
+                modeCbs.forEach((x) => { if (x !== cb) x.checked = false; });
+                syncSampleMode();
+            } else if (modeCbs.every((x) => !x.checked)) {
+                cb.checked = true;   // 保持至少一个选中
+            }
+        });
+        lab.append(cb, el("span", "", label));
+        modeRow.append(lab);
+        modeCbs.push(cb);
+    };
+    c.append(field("采样分类", modeRow));
+    mkModeCb("常规采样", "常规采样：K采样器 + 可选二次采样（现有链路）");
+    mkModeCb("SelfLift采样", "SelfLift采样：低分辨率前缀 → 提升 → 高分辨率收尾（内置 SelfLift，替代二次采样）");
+
+    // 随机种子：常规采样与 SelfLift 采样共用（两种分类下都生效）
+    c.append(makeSectionTitle("随机种子"));
     c.append(seedControlRow(p, "seed", "seed_mode", "随机种子"));
 
+    // 常规采样区块（K 采样器 + 二次采样）
+    const normalBox = el("div", "");
+    // SelfLift 区块
+    const slBox = el("div", "");
+
+    // ── 采样（一采）──
+    normalBox.append(makeSectionTitle("采样"));
+    normalBox.append(field("K采样器", selectControl(OPTIONS.samplers, p.sampler || OPTIONS.samplers[0], v => { p.sampler = v; })));
+    const normSchedSel = selectControl(OPTIONS.schedulers, p.scheduler || OPTIONS.schedulers[0], v => { p.scheduler = v; });
+    normalBox.append(field("调度器", normSchedSel));
+    const normStepsStepper = stepperControl(p.steps ?? 4, { min: 1, max: 200, step: 1 }, v => { p.steps = Math.round(v); });
+    normalBox.append(field("采样步数", normStepsStepper));
+    normalBox.append(field("降噪系数", stepperControl(p.denoise ?? 1.0, { min: 0, max: 1, step: 0.05 }, v => { p.denoise = v; })));
+
     // ── 二次采样（开关 + 设置；不折叠，设置项始终显示；种子与一采共享）──
-    c.append(makeSectionTitle("二次采样"));
-    c.append(field("启用二次采样", checkboxControl(!!sec.enabled,
+    normalBox.append(makeSectionTitle("二次采样"));
+    normalBox.append(field("启用二次采样", checkboxControl(!!sec.enabled,
         "一采后➡️分离latent➡️ 视频latent放大➡️合并latent➡️二次采样",
         v => { sec.enabled = v; })));
-    c.append(field("运行设备", selectControl(["cuda", "rocm", "cpu"], sec.device || "cuda", v => { sec.device = v; })));
+    normalBox.append(field("运行设备", selectControl(["cuda", "rocm", "cpu"], sec.device || "cuda", v => { sec.device = v; })));
     // ── latent 放大模型（只读磁盘 latent_upscale_models 目录及其子目录的实时列表：有就是有、没有就是没有）──
     // 列表来自后端 folder_paths.get_filename_list("latent_upscale_models")（含子目录，返回相对路径）；
     // 不提供「自动」项、不做任何硬编码兜底（未下载就不显示）；选中项即存储值（所见即所得）。
@@ -3074,9 +3775,9 @@ function renderPrefPanel(c, s, d, node) {
         if (m) sec.precision = m[1].toLowerCase();
     });
     if (!upModels.length) { try { upSel.disabled = true; upSel.style.opacity = "0.6"; } catch (_) {} }
-    c.append(field("latent放大模型", upSel));
+    normalBox.append(field("latent放大模型", upSel));
     // 精度：仅作为加载精度参数（不再联动清空模型选择——那会把用户的手动选择打回「自动」）
-    c.append(field("精度", selectControl(["fp32", "fp16", "bf16"], sec.precision || "fp32", v => { sec.precision = v; })));
+    normalBox.append(field("精度", selectControl(["fp32", "fp16", "bf16"], sec.precision || "fp32", v => { sec.precision = v; })));
 
     // ── Sigmas 模式（单选：调度器 / 自定义）──
     // 调度器=用 调度器+采样步数+降噪系数 生成 sigmas 二采；自定义=直接用下方输入的自定义 sigmas 序列（对齐 1190 ManualSigmas）
@@ -3091,13 +3792,13 @@ function renderPrefPanel(c, s, d, node) {
         sigModeRow.append(lab);
         return r;
     };
-    c.append(field("Sigmas模式", sigModeRow));
-    c.append(field("K采样器", selectControl(OPTIONS.samplers, sec.sampler || "euler", v => { sec.sampler = v; })));
+    normalBox.append(field("Sigmas模式", sigModeRow));
+    normalBox.append(field("K采样器", selectControl(OPTIONS.samplers, sec.sampler || "euler", v => { sec.sampler = v; })));
     const fScheduler = field("调度器", selectControl(OPTIONS.schedulers, sec.scheduler || "simple", v => { sec.scheduler = v; }));
-    const fSteps = field("采样步数", numberControl(sec.steps ?? 3, { min: 1, max: 200, step: 1 }, v => { sec.steps = Math.round(v); }));
-    const fDenoise = field("降噪系数", numberControl(sec.denoise ?? 0.3, { min: 0, max: 1, step: 0.05 }, v => { sec.denoise = v; }));
+    const fSteps = field("采样步数", stepperControl(sec.steps ?? 3, { min: 1, max: 200, step: 1 }, v => { sec.steps = Math.round(v); }));
+    const fDenoise = field("降噪系数", stepperControl(sec.denoise ?? 0.3, { min: 0, max: 1, step: 0.05 }, v => { sec.denoise = v; }));
     const fCustom = field("自定义Sigmas", textControl(sec.custom_sigmas || "0.8500, 0.6316, 0.3158, 0.0000", "0.8500, 0.6316, 0.3158, 0.0000", v => { sec.custom_sigmas = v; }));
-    c.append(fScheduler, fSteps, fDenoise, fCustom);
+    normalBox.append(fScheduler, fSteps, fDenoise, fCustom);
     const syncSigMode = () => {
         const custom = (sec.sigmas_mode || "scheduler") === "custom";
         // 注意：field 容器是 flex 布局，恢复显示必须显式设回 "flex"（设 "" 会移除 display 声明，
@@ -3111,6 +3812,151 @@ function renderPrefPanel(c, s, d, node) {
     mkSigRadio("custom", "自定义");
     syncSigMode();
 
+    // ── 二采空间分块（省显存；只在二采生效，一采恒为整画布）──
+    // 自研前向级分块：沿长边切块 → 逐块前向 → 升余弦窗融合回整画布。
+    // 因为采样器每步只调一次前向、拿到的是融合后结果，等价于「每步先融合全部块、再推进」，
+    // 且对任意采样器都成立（不像手写 euler 循环那样只覆盖 euler 系）。
+    const fTileTiles = field("分块数", stepperControl(sec.tiling_tiles ?? 2, { min: 2, max: 8, step: 1 }, v => {
+        sec.tiling_tiles = Math.max(2, Math.round(v));
+    }));
+    // 空间分块：三选一（方形勾选单选，切换方式与「采样分类」「LLM 后端」一致）
+    const TILING_MODES = ["关闭", "自动", "手动"];
+    const tilingRow = el("div", "display:flex;align-items:center;gap:16px;min-width:0;flex-wrap:wrap;");
+    const tilingCbs = [];
+    const mkTilingCb = (val) => {
+        const lab = el("label", "display:flex;align-items:center;gap:6px;font-size:13px;color:var(--descrip-text,#999);cursor:pointer;");
+        const cb = el("input", "width:18px;height:18px;accent-color:#f59e0b;cursor:pointer;");
+        cb.type = "checkbox";
+        cb.checked = (sec.tiling || "关闭") === val;
+        cb.addEventListener("change", () => {
+            if (cb.checked) {
+                sec.tiling = val;
+                tilingCbs.forEach((x) => { if (x !== cb) x.checked = false; });
+                syncTiling();
+            } else if (tilingCbs.every((x) => !x.checked)) {
+                cb.checked = true;   // 保持至少一个选中
+            }
+        });
+        lab.append(cb, el("span", "", val));
+        tilingRow.append(lab);
+        tilingCbs.push(cb);
+    };
+    normalBox.append(field("空间分块", tilingRow));
+    TILING_MODES.forEach(mkTilingCb);
+    const fTileOverlap = field("分块重叠像素", stepperControl(sec.tiling_overlap ?? 128, { min: 0, max: 512, step: 32 }, v => {
+        sec.tiling_overlap = Math.max(0, Math.round(v));
+    }));
+    normalBox.append(fTileTiles);
+    normalBox.append(fTileOverlap);
+    const tilingHint = el("div", "font-size:11px;color:#c9a86a;line-height:1.6;margin:-2px 0 8px;", "");
+    normalBox.append(tilingHint);
+    const syncTiling = () => {
+        const mode = sec.tiling || "关闭";
+        // 勾选状态与配置对齐（防其它代码路径改过 sec.tiling）
+        tilingCbs.forEach((cb, i) => { cb.checked = TILING_MODES[i] === mode; });
+        // 注意：field 容器是 flex 布局，恢复显示必须显式设回 "flex"
+        fTileTiles.style.display = mode === "手动" ? "flex" : "none";
+        fTileOverlap.style.display = mode === "关闭" ? "none" : "flex";
+        if (mode === "关闭") { tilingHint.textContent = ""; return; }
+        tilingHint.textContent = mode === "自动"
+            ? "自动：按可用显存选最少块数（显存够就不分块）。音频不参与分块（每块喂完整音频），视频按升余弦窗融合。"
+            : `手动：固定 ${sec.tiling_tiles ?? 2} 块。块数越多越省显存、但重复计算越多（每块都算一遍完整音频）。`;
+    };
+    syncTiling();
+
+    // ── SelfLift 采样（内置副本，参数对齐「SelfLift Progressive Sampler (MiniMax H3)」节点）──
+    slBox.append(makeSectionTitle("SelfLift 采样"));
+    slBox.append(field("采样器", el("div", "font-size:13px;color:var(--fg-color,#ddd);padding:6px 10px;background:var(--comfy-input-bg,#2a2a2a);border:1px solid var(--border-color,#444);border-radius:4px;", "euler（SelfLift 固定标准 Euler，NFE 数不变）")));
+    const slSchedSel = selectControl(OPTIONS.schedulers, p.scheduler || OPTIONS.schedulers[0], v => { p.scheduler = v; });
+    slBox.append(field("调度器", slSchedSel));
+    const slStepsStepper = stepperControl(Number(sl.steps ?? 8), { min: 2, max: 200, step: 1 }, v => {
+        sl.steps = Math.max(2, Math.round(v)); syncSlHint();
+    });
+    slBox.append(field("采样步数", slStepsStepper));
+    slBox.append(field("CFG", stepperControl(Number(p.cfg ?? 1.0), { min: 0, max: 100, step: 0.1 }, v => { p.cfg = v; })));
+    const fTStep = field("低分辨率步数", stepperControl(Number(sl.transition_step ?? 6), { min: 1, max: 200, step: 1 }, v => {
+        sl.transition_step = Math.max(1, Math.round(v)); syncSlHint();
+    }));
+    slBox.append(fTStep);
+    slBox.append(field("低分辨率缩放", stepperControl(Number(sl.lowres_scale ?? 0.5), { min: 0.25, max: 1, step: 0.05 }, v => { sl.lowres_scale = v; })));
+    // 修正强度上下限：默认值对齐上游 SelfLift 节点（w_min=0.5 / w_max=1.0）
+    slBox.append(field("修正强度下限", stepperControl(Number(sl.w_min ?? 0.5), { min: 0, max: 1, step: 0.05 }, v => { sl.w_min = v; })));
+    slBox.append(field("修正强度上限", stepperControl(Number(sl.w_max ?? 1.0), { min: 0, max: 1, step: 0.05 }, v => { sl.w_max = v; })));
+    // 外部 H3 放大模型：与「二采 latent 放大模型」同一目录（models/latent_upscale_models）——
+    // 列表由后端 _selflift_upscaler_options() 给出：只列名字含 h3 的（含二级子目录，如 MiniMax-H3\xxx.safetensors），
+    // 并带 none（= 纯 SelfLift：nearest 提升 + 像素锚点修正）。后端不可用时本地按 h3 过滤兜底。
+    const _slBackend = (d && Array.isArray(d.selflift_upscaler_models)) ? d.selflift_upscaler_models : null;
+    const slUpH3 = _slBackend ? _slBackend.filter((n) => n !== "none")
+                              : upModels.filter((n) => /h3/i.test(n));
+    const slUpOpts = ["none"].concat(slUpH3);
+    // 旧配置里的值（换目录/改名/只写了文件名）不在选项里 → 自动落到磁盘上可用的那个（与「二采 latent放大模型」同一策略）
+    const slUpCur = slUpOpts.includes(sl.upscaler_model) ? sl.upscaler_model : (slUpH3[0] || "none");
+    sl.upscaler_model = slUpCur;
+    // ⭐ rho 与放大模型联动（上游口径）：
+    //    选了外部放大模型 → rho 应为 0（只用 latent 提升、跳过 VAE 往返；实测过渡 41s → 1.7s）
+    //    放大模型 = none  → rho 应为 0.6（SelfLift-zero 直接路线，官方建议起点）
+    const RHO_WITH_UPSCALER = 0, RHO_SELFLIFT_ONLY = 0.6;
+    const rhoStepper = stepperControl(Number(sl.rho ?? RHO_SELFLIFT_ONLY), { min: 0, max: 1, step: 0.05 }, v => {
+        sl.rho = v; syncSlHint();
+    });
+    const slUpSel = selectControl(slUpOpts, slUpCur, v => {
+        const had = String(sl.upscaler_model || "none");
+        sl.upscaler_model = v;
+        // 只在「两边都是我们推荐的默认值」时才自动改写 rho —— 用户手动调过的值不覆盖
+        const fromDefault = (had === "none") === (Number(sl.rho) === RHO_SELFLIFT_ONLY);
+        if (fromDefault) {
+            sl.rho = (v === "none") ? RHO_SELFLIFT_ONLY : RHO_WITH_UPSCALER;
+            const inp = rhoStepper.querySelector("input");
+            if (inp) inp.value = sl.rho;
+        }
+        syncSlHint();
+    });
+    slBox.append(field("放大模型", slUpSel));
+    slBox.append(field("修正比例 rho", rhoStepper));
+    slBox.append(field("放大后卸载", checkboxControl(sl.upscaler_unload !== false,
+        "放大完立即把放大模型从显存卸载，再进入高分辨率阶段", v => { sl.upscaler_unload = !!v; })));
+    slBox.append(field("高分辨率分块", checkboxControl(!!sl.highres_tiling,
+        "高分辨率（= 二采）阶段切块省显存（只保留首块音频；分块时跳过 TST 诊断）", v => { sl.highres_tiling = !!v; })));
+    const slHint = el("div", "font-size:11px;color:#c9a86a;line-height:1.6;margin:-2px 0 8px;white-space:pre-line;", "");
+    slBox.append(slHint);
+    const syncSlHint = () => {
+        const steps = Math.max(2, Math.round(Number(sl.steps ?? 8)));
+        const ts = Math.max(1, Math.round(Number(sl.transition_step ?? 6)));
+        const msgs = [];
+        if (ts > steps - 1) msgs.push(`⚠️ 低分辨率步数 ${ts} 超出「采样步数 ${steps}」允许范围（1~${steps - 1}），运行时会自动钳制为 ${steps - 1}`);
+        if (Number(sl.rho ?? 0) <= 0 && String(sl.upscaler_model || "none") === "none") msgs.push("⚠️ rho=0 且 放大模型=none 会同时关闭修正与外部提升 → 运行时直接报错，请改其一");
+        else if (Number(sl.rho ?? 0) > 0 && String(sl.upscaler_model || "none") !== "none") msgs.push("ℹ️ rho>0 同时选外部放大模型属于混合实验路径（论文未验证），推荐只用其一");
+        if (!slUpH3.length) msgs.push("ℹ️ models/latent_upscale_models（含二级子目录）下未找到 H3 放大模型 → 只能用 none（纯 SelfLift）");
+        msgs.push(`过渡步数 = 低分辨率 ${Math.min(ts, steps - 1)} 步 + 高分辨率 ${steps - Math.min(ts, steps - 1)} 步`);
+        msgs.push("rho 随放大模型自动联动（选模型→0、none→0.6），手动改过则不再覆盖");
+        msgs.push(`放大模型在「过渡」阶段用一次（低分辨率 → 高清），高分辨率 ${steps - Math.min(ts, steps - 1)} 步 = 二采`);
+        slHint.textContent = msgs.join("\n");
+    };
+    syncSlHint();
+
+    c.append(normalBox, slBox);
+    // 采样分类切换：只显示当前分类对应的区块（常规=采样+二次采样；SelfLift=SelfLift 参数）
+    // 调度器 / 采样步数是两种分类共用的一份配置，但两个区块各渲染了一套控件 →
+    // 切换时把当前配置值同步到即将显示的控件里，避免看到另一套控件留下的旧值
+    const _syncStepper = (wrapEl, v) => { const i = wrapEl?.querySelector("input"); if (i) i.value = v; };
+    const _syncSelect = (selEl, v) => { if (selEl) selEl.value = v; };
+    const syncSampleMode = () => {
+        const isSL = String(p.sample_mode || "常规采样") === "SelfLift采样";
+        normalBox.style.display = isSL ? "none" : "";
+        slBox.style.display = isSL ? "" : "none";
+        if (isSL) {
+            _syncSelect(slSchedSel, p.scheduler || OPTIONS.schedulers[0]);
+            // SelfLift 步数是独立配置（默认 8），不再与常规采样的步数互相镜像
+            if (Number(sl.steps ?? 8) < 2) sl.steps = 2;   // SelfLift 至少 2 步
+            _syncStepper(slStepsStepper, Math.max(2, Math.round(Number(sl.steps ?? 8))));
+            syncSlHint();
+        } else {
+            _syncSelect(normSchedSel, p.scheduler || OPTIONS.schedulers[0]);
+            _syncStepper(normStepsStepper, Number(p.steps ?? 4));
+        }
+    };
+    syncSampleMode();
+
     // ── 解码 ──
     c.append(makeSectionTitle("解码"));
     // 视频解码固定 XB-BOX 优化版（=原版+显存清理，与 1146 一致）；清理选项完整保留
@@ -3118,12 +3964,16 @@ function renderPrefPanel(c, s, d, node) {
     c.append(field("解码前清理", selectControl(OPTIONS.decodeCleanup, p.decode_cleanup || OPTIONS.decodeCleanup[0], v => { p.decode_cleanup = v; })));
     c.append(field("音频解码", el("div", "font-size:13px;color:var(--fg-color,#ddd);padding:6px 10px;background:var(--comfy-input-bg,#2a2a2a);border:1px solid var(--border-color,#444);border-radius:4px;", "VAE解码（音频）")));
 
-    // ── ♾️ 无限时长衔接（仅「JZL - 🤖 MiniMax-H3无限时长」节点显示）──
-    // 后端读取 sample_decode.infinite = { window, audio_no_trim, settle, trim_mode, guide_source, second_guide }
-    const isInfNode = !!node && node.type === INF_NODE_TYPE;
+    // ── ♾️ 无限时长衔接（「JZL - 🤖 MiniMax-H3无限时长」与「🎬 短剧导演台」显示）──
+    // 后端读取 sample_decode.infinite = { enabled, window, audio_no_trim, settle, trim_mode, guide_source, second_guide }
+    const isInfNode = !!node && (node.type === INF_NODE_TYPE || node.type === SHORTDRAMA_NODE_TYPE);
     if (isInfNode) {
-        const inf = p.infinite || (p.infinite = { window: 22, audio_link: true, audio_no_trim: false, luma_match: true });
+        const inf = p.infinite || (p.infinite = { enabled: true, window: 22, audio_link: true, audio_no_trim: false, luma_match: true });
         c.append(makeSectionTitle("无限时长衔接"));
+        // ⭐ 总开关：关闭后本节点按「无衔接」独立生成每一段（等价 Max 语义）
+        c.append(field("启用跨段衔接", checkboxControl(inf.enabled !== false,
+            "开启：第 2 段起用上段 latent 尾部衔接（画面连续）；关闭：每段独立生成（等价 Max）",
+            v => { inf.enabled = v; })));
         // 窗口取值恒为 17m+5（5/22/39/56）：段长恒为 17k+5，两者相减必是 17 的倍数 → 相位自动对齐
         const SEAM_WINDOWS = ["5", "22", "39", "56"];
         const _nearest = (opts, v, dflt) => {
@@ -3206,9 +4056,11 @@ function renderSaveSettingsPanel(c, settings, node, d) {
     const save = settings.save || (settings.save = { mode: "分段保存", auto_save: false, auto_merge: false, auto_merge_delete: false });
     // Max 专用：恒定逐段即时落盘 + 最后读盘拼接（复用 save.mode，仅渲染/语义不同，无逐段落盘开关——Max 总是落盘）
     // 无限时长节点沿用同一套落盘/拼接语义（逐段即时落盘 + 读盘 concat）
-    const isMaxNode = !!node && (node.type === MAX_NODE_TYPE || node.type === INF_NODE_TYPE);
+    const isMaxNode = !!node && (node.type === MAX_NODE_TYPE || node.type === INF_NODE_TYPE || node.type === SHORTDRAMA_NODE_TYPE);
     if (isMaxNode) {
-        c.append(makeSectionTitle(node.type === INF_NODE_TYPE ? "保存设置（无限时长）" : "保存设置（Max）"));
+        const _saveTitle = node.type === INF_NODE_TYPE ? "保存设置（无限时长）"
+            : (node.type === SHORTDRAMA_NODE_TYPE ? "保存设置（短剧导演台）" : "保存设置（Max）");
+        c.append(makeSectionTitle(_saveTitle));
         const mkc = (label, checked, title, on) => field(label, checkboxControl(!!checked, title, on));
         mkc("分段保存（默认）", save.mode !== "拼接保存", "每段生成完立即落盘，输出本次各段 mp4", (v) => { if (v) save.mode = "分段保存"; });
         mkc("拼接保存", save.mode === "拼接保存", "全部段生成后读盘 concat 合并为一个完整视频", (v) => { if (v) save.mode = "拼接保存"; });
@@ -3269,62 +4121,64 @@ function renderSaveSettingsPanel(c, settings, node, d) {
 // ── 📖 节点使用说明面板 ────────────────────────────────
 // 使用说明内置回退 HTML（OpenPose 式内嵌：后端 /jzl/usage_md 不可用时也能显示；完整文档见 docs/USAGE.md）
 const USAGE_FALLBACK_HTML = `
-<div style="font-size:13px;line-height:1.8;color:var(--fg-color,#ddd);">
+<div style="font-size:13px;line-height:1.7;color:var(--fg-color,#ddd);">
 <h3 style="margin:0 0 8px;font-size:16px;font-weight:700;color:var(--fg-color,#eee);border-bottom:1px solid var(--border-color,#444);padding-bottom:4px;">MiniMax-H3 生成管理器 · 使用说明</h3>
-<p style="margin:6px 0;">一个节点完成 <b>剧本分段 → 参考调度 → 编码 → 采样 → 解码</b> 全流程，输出生成总线，无缝对接「视频保存分配」与 VHS 保存，亦支持 ffmpeg 逐段落盘 / 自动合并。</p>
+<p style="margin:6px 0;">一个节点完成 <b>剧本分段 → 参考调度 → 编码 → 采样 → 解码</b> 全流程；支持 ffmpeg 逐段落盘 / 自动合并。</p>
 <h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">一、快速上手</h4>
 <ol style="padding-left:20px;margin:4px 0;">
-<li>添加节点：JZL/MiniMax → <code>JZL - 🤖 MiniMax-H3短剧导演台Pro</code></li>
-<li>接好模型输入：主模型 / CLIP / 视觉VAE / 音频VAE（含视频或音频参考时必须接音频VAE）</li>
-<li>在节点表面 📝 提示词 框输入故事 / 剧本（可用 @ 引用素材）</li>
-<li>点「📁 参考素材管理」上传并配置素材（图片 / 视频 / 音频）</li>
-<li>设置「生成视频数量」（默认「剧情决定」：LLM 按剧情时间线长度 ÷ 每段时长自动定段数；也可手动指定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段）、画幅、每段时长等参数后运行</li>
+<li>添加节点 <b>JZL/MiniMax → JZL - 🤖 MiniMax-H3短剧导演台Pro</b></li>
+<li>接好 <b>主模型 / CLIP / 视觉VAE / 音频VAE</b>（含视频或音频参考时必须接「音频VAE」）</li>
+<li>在 <b>📝 提示词</b> 框写故事 / 剧本（可用 @ 引用素材），并在「📁 参考素材管理」配置素材</li>
+<li>设定参数后运行（「生成视频数量」默认「<b>剧情决定</b>」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数）</li>
 </ol>
-<p style="margin:4px 0;">提示：不接模型也能运行——只做剧本分段 + 调度，不做采样解码。</p>
-<h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">二、运行模式（按你的处境选）</h4>
+<p style="margin:4px 0;">不接模型也能运行：只做剧本分段 + 调度，不采样解码。</p>
+<h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">二、运行模式</h4>
 <ul style="padding-left:20px;margin:4px 0;">
-<li><b>🛠️ 故事拆解模式</b>：<b>你有一个已经满意的故事，想直接生成视频</b> → 选这个。（按情节拆成 N 段；不改剧情、不新增对白）</li>
-<li><b>📚 故事扩写模式</b>：故事太短/太简，想<b>先扩写成丰满正文再拆解</b> → 选这个。（纯文本，不生成视频）</li>
-<li><b>📝 仅提示词输出</b>：<b>你有故事，只想先看看拆解出来的提示词、暂不生成视频</b> → 选这个。（拆解 + 增强后从「已处理剧本」端口输出完整分段剧本；无需接模型）</li>
-<li><b>🪄 穿透生成模式</b>：<b>你已经用「仅提示词输出」拿到满意的提示词</b>，把它粘进提示词框直接生成视频 → 选这个。（跳过 LLM 拆解与增强；<b>必须使用「拆解模式」拆解好的提示词</b>，格式不对会直接报错终止、不生成）</li>
+<li><b>🛠️ 故事拆解模式</b>：已有满意的故事，直接拆段生成视频（不改剧情、不新增对白）</li>
+<li><b>📚 故事扩写模式</b>：故事太短，先扩写成丰满正文（纯文本，不生成视频）</li>
+<li><b>📝 仅提示词输出</b>：只想先看拆解 + 增强后的提示词（纯文本，无需接模型）</li>
+<li><b>🪄 穿透生成模式</b>：已有满意的拆解提示词，直接出片（跳过 LLM 拆解与增强）</li>
 </ul>
-<p style="margin:4px 0;">推荐流程：📝 仅提示词输出 调提示词 → 满意后切 🪄 穿透生成模式 用同一份提示词出片。</p>
-<p style="margin:4px 0;">⚠️ <b>输入要求</b>：🛠️ 故事拆解模式 / 📚 故事扩写模式 吃的是<b>自然语言故事</b>；若输入含已拆解标签（<b>===H3_PROMPT===</b>、<b>[SHOT_START]</b>、<b>subject_definitions:</b>、<b>### Video_001</b> 等）会直接报错终止，请改用 <b>🪄 穿透生成模式</b>。</p>
-<p style="margin:4px 0;">🖼️ <b>识图（可选）</b>：大语言模型配置里的「<b>开启拆解识图</b>」「<b>开启扩写识图</b>」会把「参考素材管理」中<b>已启用</b>且<b>与故事同名</b>的图片（角色/场景/道具）一并交给 LLM，让拆解/扩写贴合参考图外观（发型、服装配色、道具造型等）；无同名图片自动跳过。本地模型需先选 <b>mmproj</b> 与 <b>Chat Handler</b>；在线 API 需选视觉模型（默认 <b>deepseek-v4-flash-vision-exp</b>）。</p>
-<p style="margin:4px 0;">⚠️ 穿透生成模式 / 重拍只接受<b>拆解产物</b>：必须含 <b>[SHOT_START]…[SHOT_END]</b> 分段块且每段含 <b>===H3_PROMPT===</b> 六段正文；纯文本故事或手写草稿会被拒绝。段数需与「生成视频数量」匹配（选「<b>剧情决定</b>」则自动跟随剧本段数）；每段块内 <b>**时长**：N</b>（英文提示词为 <b>**Duration**：N</b>）决定该段时长，缺失时按节点「每段视频时长」生成。</p>
-<p style="margin:4px 0;">段数说明：默认「<b>剧情决定</b>」——LLM 先按<b>剧情时间线长度</b>（不是字数）判断需要多少总时长，再按你设定的每段时长自动定段数，避免「选的段数与剧情不匹配」。</p>
-<p style="margin:4px 0;">注：📚 故事扩写模式 / 📝 仅提示词输出 为纯文本模式，会自动静音上游（模型/CLIP/VAE）与除剧本端口外的下游节点，只跑 LLM 文本处理。</p>
+<p style="margin:4px 0;">推荐流程：📝 仅提示词输出 调提示词 → 满意后切 🪄 穿透生成模式 出片。</p>
+<p style="margin:4px 0;">⚠️ 拆解 / 扩写吃<b>自然语言故事</b>；含已拆解标签（===H3_PROMPT===、[SHOT_START]、subject_definitions:、### Video_001 等）会报错终止，请改用 🪄 穿透生成模式。</p>
+<p style="margin:4px 0;">⚠️ 穿透 / 重拍只接受<b>拆解产物</b>：需含 [SHOT_START]…[SHOT_END] 且每段含 ===H3_PROMPT=== 六段正文，格式不对直接终止；段数需与「生成视频数量」匹配；段内 <b>时长：N</b>（英文 <b>Duration：N</b>）决定该段时长，缺失时回退节点「每段视频时长」。</p>
 <h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">三、素材与参考调度</h4>
 <ul style="padding-left:20px;margin:4px 0;">
-<li>引用上限：图片 ≤9 / 视频 ≤3 / 音频 ≤3，总参考 ≤12（官方上限）</li>
-<li>提示词中用 @素材名 引用，或由调度指令（类型:槽位名）自动匹配</li>
-<li>生成路径按引用自动推断：有视频→多参考(REF2VA)；否则按参考图数量选首尾帧/首帧/纯文本</li>
+<li>上限：图片 ≤9 / 视频 ≤3 / 音频 ≤3，总参考 ≤12（官方上限）</li>
+<li>素材分区：图片 → 角色 / 场景 / 道具；音频 → 角色音色 / 背景配乐 / 念白</li>
+<li>音频三小类<b>各自独立编号</b>（音色A / 配乐A / 念白A）；图片三类、视频各自独立</li>
+<li><b>角色音色</b>：把音频指定给某个角色（描述为 音色A = {角色名}音色）；<b>一个角色只能被一个音色占用</b>；角色改名联动，角色删除回退「未指定」</li>
+<li>用 @素材名 引用，或由调度指令（类型:槽位名）自动匹配</li>
+<li>生成路径固定为<b>多参考（REF2VA）</b>：图片 = 身份参考、音频 = 音色/配乐/念白参考（严格使用你上传的音频文件）；<b>不存在首尾帧 / 首帧（fl2va）路径</b>。视频未被引用时，视频与视频音轨端口自动关闭（避免音频误入音轨通道）</li>
 </ul>
-<h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">四、界面按钮（4×2）</h4>
-<p style="margin:4px 0;">📁 参考素材管理 ｜ 📝 剧本拆解配置 ｜ 🎭 采样解码设置 ｜ 🎯 镜头参数预设 ｜ ➕ 常用提示词元素 ｜ 🎯 参考元素切换 ｜ 💾 视频保存设置 ｜ 📖 节点使用说明</p>
+<h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">四、界面按钮</h4>
+<p style="margin:4px 0;">🎛️ 运行参数设置 ｜ 🎨 视频参数设置 ｜ 📁 参考素材管理 ｜ 🤖 大语言模型配置 ｜ 🎭 采样解码设置 ｜ 🎬 生成视频管理 ｜ ➕ 常用提示词元素 ｜ 🎯 镜头参数预设 ｜ 🎯 参考元素切换 ｜ 📖 节点使用说明</p>
+<p style="margin:4px 0;color:#999;">「🎛️ 运行参数设置」「🎨 视频参数设置」为「🎬 短剧导演台」专用：把运行模式 / 故事风格 / 故事名称、画幅 / 像素 / 时长 / 段数收进面板，节点表面更清爽。</p>
 <ul style="padding-left:20px;margin:4px 0;">
-<li><b>保存模式</b>：分段保存（逐段输出接 VHS）/ 拼接保存（合并为一段再输出）——仅影响下游 VHS</li>
-<li><b>分段视频自动保存</b>：每段跑完立即用 ffmpeg 落盘 mp4 到指定目录，不依赖下游 VHS</li>
-<li><b>分段视频自动合并</b>：把落盘的各段 mp4 按顺序拼接为完整一个视频（无论保存模式）</li>
+<li><b>保存模式</b>：分段保存（逐段输出接 VHS）/ 拼接保存（合并为一段再输出），仅影响下游 VHS</li>
+<li><b>分段视频自动保存</b>：每段跑完立即 ffmpeg 落盘 mp4，不依赖下游 VHS，中途崩溃不丢已生成段落</li>
+<li><b>分段视频自动合并</b>：把落盘的各段按顺序拼成完整视频（未开自动保存时临时落盘，合并后清理）</li>
 </ul>
 <h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">五、采样与解码</h4>
 <ul style="padding-left:20px;margin:4px 0;">
-<li>采样：res_multistep / euler 等 K 采样器；可调 步数 / CFG / 降噪 / 种子</li>
+<li>采样：res_multistep / euler 等 K 采样器，调度器 simple / karras 等，步数 / CFG / 降噪 / 种子可调</li>
 <li>解码：视频 XB-BOX - VAE解码（原版优化）；音频 VAE解码（音频）</li>
-<li>逐段顺序生成：每段「采样→解码→写入总线→（可选落盘）」完成后才进入下一段</li>
+<li><b>解码前清理</b> 卸载显存模型：每段解码前把采样模型退回内存、腾显存给 VAE 解码（对齐 XB-BOX；代价是下一段要重载模型，分段越多越慢）</li>
+<li>逐段顺序生成：每段「采样 → 解码 → 写入总线 →（可选落盘）」完成后才进入下一段</li>
 </ul>
 <h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">六、输出</h4>
 <ul style="padding-left:20px;margin:4px 0;">
 <li><b>图像</b> IMAGE 列表：每段视频帧（分段保存）或拼接后一段（拼接保存）</li>
 <li><b>音频</b> AUDIO 列表：每段音频（与图像一一对应）</li>
-<li><b>已处理剧本</b> STRING：全部 LLM 处理后的剧本文本</li>
-<li>配合「JZL - 💾 视频保存分配」把「生成总线」接上，每组接一个 VHS Video Combine 逐段保存 mp4</li>
+<li><b>已处理剧本</b> STRING：全部 LLM 处理后的文本</li>
 </ul>
 <h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">七、常见问题</h4>
 <ul style="padding-left:20px;margin:4px 0;">
-<li>没有生成视频？检查 CLIP/VAE/model 是否接好；含视频或音频参考还需接 audio_vae</li>
-<li>视频数量改了没生效？确认剧本拆解配置已保存（固定种子时）</li>
-<li>想跑一段存一段？在「💾 视频保存设置」勾选「分段视频自动保存」并填路径</li>
+<li>没生成视频？检查 CLIP / VAE / model 是否接好；含视频或音频参考还需接 audio_vae</li>
+<li>⭐ 报 too many values to unpack (expected 3) / 提示「本段未落盘任何视频」？多为<b>视觉 / 音频 VAE 接反</b>，按提示换口即可</li>
+<li>落盘失败怎么查？控制台给出「❗落盘失败原因」+「❗环境自检报告」路径（output/jzl/_诊断/），把报告发回即可定位</li>
+<li>ffmpeg 不可用？按 imageio-ffmpeg 自带 → PATH → 常见安装目录 查找，都找不到时自动改用 PyAV 编码；「拼接保存」仍需要 ffmpeg</li>
+<li>50 系报 memory_efficient_attention_forward？xformers 未编译 sm120，节点已自动回退 PyTorch SDPA</li>
 </ul>
 </div>
 `;
@@ -3618,7 +4472,7 @@ function buildModal(node, data, panelId) {
                         const p = await uploadFileObject(file, kind);
                         if (p) {
                             const _t1 = (ASSET_TYPES_BY_KIND[kind] || ASSET_TYPES)[0];
-                            list.push({ type: _t1, name: assetNameFromFilename(file.name), path: p, enabled: true, letter: nextFreeLetter(list, _t1) });
+                            list.push({ type: _t1, name: assetNameFromFilename(file.name), path: p, enabled: true, letter: nextFreeSlotLetter(kind, settings.assets, _t1) });
                             added++;
                         }
                     }
@@ -3634,6 +4488,8 @@ function buildModal(node, data, panelId) {
         case "prompt": renderPromptPanel(panelBox, settings, d, node); break;
         case "preference": renderPrefPanel(panelBox, settings, d, node); break;
         case "preference_settings": renderPreferenceSettingsPanel(panelBox, settings); break;
+        case "gen_settings": renderGenSettingsPanel(panelBox, settings, node, d); break;
+        case "video_params": renderVideoParamsPanel(panelBox, settings, node); break;
         case "save_settings": renderSaveSettingsPanel(panelBox, settings, node, d); break;
         case "video_manager": renderVideoManagerPanel(panelBox, node, settings, d); break;
         case "help": renderHelpPanel(panelBox); break;
@@ -3739,6 +4595,13 @@ if (!app.__jzlReshootGraphPatched) {
         app.graphToPrompt = function (...args) {
             const _g = this && this.graph ? this.graph : app.graph;
             const _ns = _g ? (_g._nodes || _g.nodes || []) : [];
+            // ⭐ 提交前归一化「生成视频数量」：旧工作流/旧版前端可能把下拉用的「生成N段」
+            //   存进了短剧导演台的数值输入 → ComfyUI 校验拒绝整个 prompt
+            //   （Failed to convert an input value to a INT value: video_count, 生成1段）。
+            //   这里以 widget 形态为准静默改写为等价合法值（幂等，不改变用户意图）。
+            for (const _n of _ns) {
+                if (_n && typeof _n.healVideoCount === "function") { try { _n.healVideoCount(); } catch (_) {} }
+            }
             const _patches = [];
             for (const _n of _ns) {
                 if (_n && typeof _n.__reshootBuildRunPatch === "function") {
@@ -3784,9 +4647,27 @@ app.registerExtension({
             };
             return;
         }
+        // 📝 生成剧本查看器（独立节点）：剧本显示窗 + 顶部 刷新/复制/编辑/选择剧本（可进子文件夹）
+        if (nodeData?.name === SCRIPT_VIEWER_NODE_TYPE) {
+            const _sOrig = nodeType.prototype.onNodeCreated;
+            nodeType.prototype.onNodeCreated = function () {
+                const _r = _sOrig?.apply(this, arguments);
+                try { setupScriptViewerNode(this); } catch (e) { console.error("[JZL-ScriptViewer]", e); }
+                return _r;
+            };
+            const _sExec = nodeType.prototype.onExecuted;
+            nodeType.prototype.onExecuted = function (msg) {
+                const _r = _sExec?.apply(this, arguments);
+                // 执行后自动同步一次：跟随导演台故事名 → 读最新剧本（优先已增强，否则故事拆解）
+                try { if (this.__scriptRefresh) this.__scriptRefresh(); } catch (_e) {}
+                return _r;
+            };
+            return;
+        }
         const isMini = nodeData?.name === MINI_NODE_TYPE;
-        // 无限时长节点与 Max 共用按钮布局 + 保存/采样解码面板
-        const isMax = nodeData?.name === MAX_NODE_TYPE || nodeData?.name === INF_NODE_TYPE;
+        const isShortDrama = nodeData?.name === SHORTDRAMA_NODE_TYPE;
+        // 无限时长 / 短剧导演台 与 Max 共用按钮布局 + 保存/采样解码面板
+        const isMax = nodeData?.name === MAX_NODE_TYPE || nodeData?.name === INF_NODE_TYPE || isShortDrama;
         if (nodeData?.name !== NODE_TYPE && !isMini && !isMax) return;
         const orig = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
@@ -3798,8 +4679,11 @@ app.registerExtension({
             const _btnOf = (wid) => PANEL_BUTTONS.find((b) => b.widget === wid);
             const buttons = isMini
                 ? PANEL_BUTTONS.filter((b) => b.widget !== "btn_save" && b.widget !== "btn_pref")
-                : (isMax
+                : (isShortDrama
+                    // 🎬 短剧导演台：第一排 2 个（新面板，各占半排）+ 第二排 4 + 第三排 4
                     ? [
+                        { widget: "btn_gen_settings", label: "🎛️ 运行参数设置", panel: "gen_settings", span: 2 },
+                        { widget: "btn_video_params", label: "🎨 视频参数设置", panel: "video_params", span: 2 },
                         _btnOf("btn_assets"),
                         _btnOf("btn_prompt"),
                         _btnOf("btn_pref"),
@@ -3809,7 +4693,18 @@ app.registerExtension({
                         _btnOf("btn_align"),
                         _btnOf("btn_help"),
                     ].filter(Boolean)
-                    : PANEL_BUTTONS);
+                    : (isMax
+                        ? [
+                            _btnOf("btn_assets"),
+                            _btnOf("btn_prompt"),
+                            _btnOf("btn_pref"),
+                            { widget: "btn_video_manager", label: "🎬 生成视频管理", panel: "video_manager" },
+                            _btnOf("btn_elements"),
+                            _btnOf("btn_preference"),
+                            _btnOf("btn_align"),
+                            _btnOf("btn_help"),
+                        ].filter(Boolean)
+                        : PANEL_BUTTONS));
             self.__jzlButtons = buttons;
 
             // 纯文本模式（「仅提示词输出」/「故事扩写模式」）→ 自动静音 上游(model/clip/vae/audio_vae)
@@ -3842,7 +4737,13 @@ app.registerExtension({
             // 1. 隐藏内部存储 widget（internal_prompt）与旧 mode
             const vcWidget = (self.widgets || []).find((w) => w.name === "video_count");
             const ipWidget = (self.widgets || []).find((w) => w.name === "internal_prompt");
-            const hiddenNames = new Set(["mode", "internal_prompt", "manager_settings"]);
+            // 🎬 短剧导演台：运行模式 / 故事风格 / 故事名称 / 生成详情 / 画幅比例~生成数量 全部移入面板 → 节点表面隐藏
+            const hiddenNames = isShortDrama
+                ? new Set(["mode", "internal_prompt", "manager_settings",
+                           "run_mode", "story_style", "story_name", "display_info",
+                           "aspect_ratio", "megapixels", "duration",
+                           "scale_factor", "upscale_scale", "video_count"])
+                : new Set(["mode", "internal_prompt", "manager_settings"]);
             for (const w of self.widgets || []) {
                 if (!w) continue;
                 const nm = w.name || "";
@@ -3862,24 +4763,32 @@ app.registerExtension({
             // 2. 单个 DOM widget：按钮区 + 生成参数(节点表面) + 视频数量 + 加速模式 + 提示词输入
             ensureManagerStyle();
             const container = document.createElement("div");
-            container.style.cssText = "width:100%;height:100%;display:flex;flex-direction:column;gap:6px;padding:8px;box-sizing:border-box;overflow:hidden;";
+            // ⚠️ overflow-y:auto（不是 hidden）：🎬 短剧导演台 比其它导演台多 1 排按钮 + 1 行「生成详情」，
+            // 用户把节点拉矮时若用 hidden，最下面的「重拍模式」会被直接裁掉、滚动也够不着。
+            // 改成可纵向滚动后：高矮都能滚到全部内容（横向仍锁死，避免出现左右滚动条）。
+            container.style.cssText = "width:100%;height:100%;display:flex;flex-direction:column;gap:6px;padding:8px;box-sizing:border-box;overflow-y:auto;overflow-x:hidden;scrollbar-width:thin;";
 
-            // 按钮区（Mini 6 按钮 3 列 2 排；Max 8 按钮 4 列 2 排；Pro 8 按钮 4 列 2 排）
+            // 按钮区（Mini 6 按钮 3 列 2 排；Max 8 按钮 4 列 2 排；Pro 8 按钮 4 列 2 排；短剧导演台 10 按钮 4 列 3 排）
+            // 🎬 短剧导演台按钮更多更密 → 高度 +20%（30→36px）、字号加大，便于点选
+            const btnH = isShortDrama ? 36 : 30;
+            const btnFont = isShortDrama ? 16 : 14;
+            const btnRowH = btnH + 6;   // 行高 = 按钮高 + 行间距（与 gap 一致）
             const btnGrid = document.createElement("div");
             const btnCols = isMax ? 4 : (isMini ? 3 : 4);
             self.__jzlBtnCols = btnCols;
-            btnGrid.style.cssText = `display:grid;grid-template-columns:repeat(${btnCols},1fr);grid-auto-rows:30px;gap:6px;`;
+            btnGrid.style.cssText = `display:grid;grid-template-columns:repeat(${btnCols},1fr);grid-auto-rows:${btnH}px;gap:6px;flex:0 0 auto;`;
             for (const b of buttons) {
                 const btn = document.createElement("button");
                 btn.textContent = b.label;
                 btn.style.cssText = [
-                    "width:100%;", "height:30px;", "box-sizing:border-box;",
+                    "width:100%;", `height:${btnH}px;`, "box-sizing:border-box;",
                     "display:flex;", "align-items:center;", "justify-content:center;",
                     "border-radius:6px;", "border:2px solid #5b9bd5;",
-                    "background:#3a3a3a;", "color:#eee;", "font-size:14px;",
+                    "background:#3a3a3a;", "color:#eee;", `font-size:${btnFont}px;`,
                     "cursor:pointer;", "white-space:nowrap;", "overflow:hidden;", "text-overflow:ellipsis;",
                 ].join("");
                 if (b.widget === "btn_align") { btn.dataset.alignBtn = "1"; self.__btnAlign = btn; }
+                if (b.span) btn.style.gridColumn = `span ${b.span}`;   // 生成设定 / 视频参数：各占半排
                 btn.addEventListener("mousedown", (e) => e.stopPropagation());
                 btn.addEventListener("mouseenter", () => { if (btn.dataset.alignBtn) self.__alignBtnBg?.(true); else btn.style.background = "#4a4a4a"; });
                 btn.addEventListener("mouseleave", () => { if (btn.dataset.alignBtn) self.__alignBtnBg?.(false); else btn.style.background = "#3a3a3a"; });
@@ -3892,10 +4801,27 @@ app.registerExtension({
             }
             container.appendChild(btnGrid);
 
+            let infoRow = null;
+            if (isShortDrama) {
+                // 🎬 短剧导演台：把「生成设定」三项（运行模式/风格/故事名）与「生成详情」显示在节点上
+                // （这些参数在节点表面的原生 widget 已隐藏，改由面板设置、这里只读展示）
+                const genRow = el("div", "flex:0 0 auto;font-size:11px;color:#9fb8d6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:14px;", "");
+                genRow.title = "生成设定（运行模式 / 故事风格 / 故事名称）—— 在「🎛️ 运行参数设置」面板里修改";
+                genRow.addEventListener("mousedown", (e) => e.stopPropagation());
+                container.appendChild(genRow);
+                self.__jzlGenRow = genRow;
+
+                const detailRow = el("div", "flex:0 0 auto;font-size:11px;color:#c9a86a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:14px;", "");
+                detailRow.title = "生成详情（分辨率 / 每段帧数 / 段数 / 无限时长 / 成片总长），只读显示";
+                detailRow.addEventListener("mousedown", (e) => e.stopPropagation());
+                container.appendChild(detailRow);
+                self.__jzlDetailRow = detailRow;
+            }
+
             // 生成信息状态行（实时显示，纯只读；值用绿色高亮；参数保存后自动同步）
             const _jzlValColor = "#9fd6a4";  // 结果值高亮色（区别于标签）
-            const infoRow = el("div", "font-size:11px;color:#c9a86a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:14px;", "");
-            infoRow.title = "当前生成配置（LLM语言/后端/增强 + 一采步数/二采/采样种子），只读显示";
+            infoRow = el("div", "flex:0 0 auto;font-size:11px;color:#c9a86a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:14px;", "");
+            infoRow.title = "当前生成配置（LLM语言/后端/增强 + 采样步数/二采/采样种子），只读显示";
             infoRow.addEventListener("mousedown", (e) => e.stopPropagation());
             container.appendChild(infoRow);
             const _jzlVal = (x) => `<span style="color:${_jzlValColor}">${x}</span>`;
@@ -3911,23 +4837,47 @@ app.registerExtension({
                     const langShort = lang.includes("EN") ? "英文[EN]" : "中文[ZH]";
                     const mode = String(enh.llm_backend || "").includes("api") ? "API" : "本地";
                     const enhOn = enh.enabled ? "开启" : "关闭";
-                    const steps = sd.steps ?? 4;
-                    const secOn = sec.enabled ? "开启" : "关闭";
+                    const _isSL = String(sd.sample_mode || "常规采样") === "SelfLift采样";
+                    // 步数按当前采样分类取：SelfLift 有自己的独立步数（默认 8），未设置时回退共用值
+                    const steps = _isSL ? (sd.selflift?.steps ?? sd.steps ?? 8) : (sd.steps ?? 4);
+                    // SelfLift 模式下二采被跳过（SelfLift 自身即渐进分辨率采样），显示上要说清
+                    const secOn = !sec.enabled ? "关闭" : (_isSL ? "跳过(SelfLift)" : "开启");
                     const seedMode = String(sd.seed_mode || sd.seed_control || "randomize");
-                    const seed = sd.seed ?? 0;
-                    // 随机种：randomize 且尚未生成过（seed 仍为 0）时显示「随机」而非误导性 0；跑一次后回写真实已用种子
-                    const seedTxt = (seedMode === "randomize" && !seed) ? "随机(运行后更新)" : String(seed);
-                    infoRow.innerHTML = `LLM语言：${_jzlVal(langShort)} 丨 LLM模式：${_jzlVal(mode)} 丨 文本增强：${_jzlVal(enhOn)} 丨 一采步数：${_jzlVal(steps)} 丨 二采功能：${_jzlVal(secOn)} 丨 随机种：${_jzlVal(seedTxt)}`;
+                    // 种子以字符串保存（可超 2^53，Number() 会丢精度）→ 直接按字符串显示
+                    const _sTxt = (v) => (v === undefined || v === null || v === "") ? "" : String(v);
+                    const sampSeed = _sTxt(sd.seed);
+                    const llmSeed = _sTxt(enh.seed);
+                    // 随机种：显示「本轮实际用过的种子」——有采样种子优先；纯文本模式（不采样）用 LLM 种子；
+                    // 都没有（随机模式且尚未运行）才显示「随机(运行后更新)」，避免一直停在误导性的 0
+                    const seedTxt = sampSeed || llmSeed || "随机(运行后更新)";
+                    infoRow.innerHTML = `LLM语言：${_jzlVal(langShort)} 丨 LLM模式：${_jzlVal(mode)} 丨 文本增强：${_jzlVal(enhOn)} 丨 采样：${_jzlVal(_isSL ? "SelfLift" : "常规")} 丨 采样步数：${_jzlVal(steps)} 丨 二采功能：${_jzlVal(secOn)} 丨 随机种：${_jzlVal(seedTxt)}`;
+                    // 🎬 短剧导演台：生成设定三项（运行模式 / 故事风格 / 故事名称）同步到节点上的只读行
+                    if (self.__jzlGenRow) {
+                        const _gv = (n) => {
+                            const w = (self.widgets || []).find((x) => x.name === n);
+                            const v = readWidgetValue(w);
+                            return (v === undefined || v === null) ? "" : String(v).trim();
+                        };
+                        let _sbOn = false;
+                        try {
+                            const _cfg = JSON.parse(readWidgetValue((self.widgets || []).find((x) => x.name === "manager_settings")) || "{}");
+                            _sbOn = !!((_cfg.semantic_bridge || {}).enabled);
+                        } catch (_) {}
+                        self.__jzlGenRow.textContent = `生成模式：${_gv("run_mode") || "-"} 丨 风格：${_gv("story_style") || "-"} 丨 故事：${_gv("story_name") || "-"} 丨 语义修正：${_sbOn ? "开" : "关"}`;
+                    }
                 } catch (_) {}
             };
             self.__jzlUpdateInfo = updateInfo;  // 设置面板保存后由 saveManager 触发刷新
 
             // 提示词：内部编辑窗口（DOM 富文本 @ 着色）。可接外部：用节点顶部「提示词·接线」输入框（同 CLIP Text Encode 的左上圆点）连上游文本，连线后以上游为准。
-            const promptLabel = el("div", "font-size:12px;color:#bbb;", "📝 提示词（用 @ 引用素材）");
+            // 📝 提示词标签行：左侧标签/状态，右端放「复制 / 放大编辑」按钮（在框外，不遮挡正文）
+            const promptLabel = el("div", "flex:0 0 auto;display:flex;align-items:center;gap:8px;font-size:12px;color:#bbb;", "📝 提示词（用 @ 引用素材）");
             const alignStatus = el("span", "font-size:11px;margin-left:8px;", "");
             const extStatus = el("span", "font-size:11px;margin-left:8px;color:#8a9fb8;white-space:nowrap;", "⇶ 可接上游文本");
             extStatus.title = "提示词接线：把上游 STRING 文本节点输出拖到节点顶部「提示词·接线」输入框（左上角官方圆点，同 CLIP Text Encode）；连线后运行以上游文本为提示词（未接时用本框内容）";
-            promptLabel.append(alignStatus, extStatus);
+            // 🎬 短剧导演台已移除「提示词·接线」，不再显示接线角标
+            if (isShortDrama) promptLabel.append(alignStatus);
+            else promptLabel.append(alignStatus, extStatus);
             container.appendChild(promptLabel);
             const promptBox = document.createElement("div");
             promptBox.contentEditable = "true";
@@ -3943,15 +4893,14 @@ app.registerExtension({
             // 不加这个标记时，滚轮会被前端转发给画布（实测：框 scrollTop 不变、画布缩放 0.382→0.347）。
             promptWrap.setAttribute("data-capture-wheel", "true");
             promptWrap.appendChild(promptBox);
-            const pActions = el("div", "position:absolute;top:4px;right:4px;display:flex;gap:4px;opacity:0;transition:opacity .15s;z-index:6;");
-            const pCopy = el("button", "width:24px;height:24px;border-radius:4px;border:1px solid #555;background:rgba(30,30,30,.92);color:#ccc;font-size:12px;cursor:pointer;line-height:1;padding:0;", "📋");
+            // 复制 / 放大编辑：放到标签行右端（框外右上角），不再悬浮在框内遮挡正文
+            const pActions = el("div", "display:flex;gap:4px;margin-left:auto;z-index:6;");
+            const pCopy = el("button", "width:22px;height:22px;border-radius:4px;border:1px solid #555;background:rgba(30,30,30,.92);color:#ccc;font-size:12px;cursor:pointer;line-height:1;padding:0;", "📋");
             pCopy.title = "复制全部文本";
-            const pZoom = el("button", "width:24px;height:24px;border-radius:4px;border:1px solid #555;background:rgba(30,30,30,.92);color:#ccc;font-size:12px;cursor:pointer;line-height:1;padding:0;", "⛶");
+            const pZoom = el("button", "width:22px;height:22px;border-radius:4px;border:1px solid #555;background:rgba(30,30,30,.92);color:#ccc;font-size:12px;cursor:pointer;line-height:1;padding:0;", "⛶");
             pZoom.title = "放大编辑（打开大界面）";
             pActions.append(pCopy, pZoom);
-            promptWrap.appendChild(pActions);
-            promptWrap.addEventListener("mouseenter", () => { pActions.style.opacity = "1"; });
-            promptWrap.addEventListener("mouseleave", () => { pActions.style.opacity = "0"; });
+            promptLabel.appendChild(pActions);
             pCopy.addEventListener("mousedown", (e) => e.stopPropagation());
             pCopy.addEventListener("click", (e) => { e.stopPropagation(); copyTextToClipboard(getPromptText(promptBox), "提示词"); });
             pZoom.addEventListener("mousedown", (e) => e.stopPropagation());
@@ -3968,13 +4917,7 @@ app.registerExtension({
             promptBox.__node = self;
             setupInternalPrompt(self, promptBox, ipWidget);
 
-            // 顶部「提示词·接线」widget：占位提示（接线口）；连线后 ComfyUI 会将其转为本节点输入端口
-            try {
-                const _extW2 = (self.widgets || []).find((w) => w.name === "external_prompt");
-                if (_extW2 && _extW2.inputEl) _extW2.inputEl.placeholder = "连接上游文本，留空则用下方大提示词框";
-            } catch (_) {}
-
-            // 外部提示词接线状态角标（onDraw 每帧同步；接入后锁定大提示词框，以上游为准）
+            // 外部提示词接线状态角标（onDraw 每帧同步）
             const updateExt = () => {
                 try {
                     const _inp = (self.inputs || []).find((i) => i.name === "external_prompt");
@@ -4111,7 +5054,7 @@ app.registerExtension({
             [0, 150, 500, 1200].forEach((d) => setTimeout(killGhost, d));
 
             // 资产显示窗（缩略图墙，点击插入 @引用；自动换行，多行时节点同步增高）
-            const windowTitle = el("div", "font-size:12px;color:#bbb;margin-top:2px;", "📁 资产显示窗（点击插入）");
+            const windowTitle = el("div", "flex:0 0 auto;font-size:12px;color:#bbb;margin-top:2px;", "📁 资产显示窗（点击插入）");
             const windowBox = el("div", "min-height:30px;overflow:hidden;flex:0 0 auto;");
             const resizeNodeForContent = () => {
                 requestAnimationFrame(() => {
@@ -4120,7 +5063,7 @@ app.registerExtension({
                         const assetsH = windowBox.scrollHeight || windowBox.offsetHeight || 30;
                         const btnRows = Math.ceil((self.__jzlButtons || PANEL_BUTTONS).length / (self.__jzlBtnCols || 4));
                         const reshootH = (self.__reshootBody && self.__reshootBody.style.display !== "none") ? (self.__reshootBody.offsetHeight || 0) : 0;  // 重拍区展开时计入节点高度
-                        const minDom = btnRows * 40 + 10 + 16 + 72 + 22 + assetsH + reshootH + 20;  // 按钮N行 + gap + 信息行 + 提示词min + 资产窗标题 + 重拍区 + padding
+                        const minDom = btnRows * (btnRowH + 4) + 10 + 16 + 72 + 22 + assetsH + reshootH + 20;  // 按钮N行 + gap + 信息行 + 提示词min + 资产窗标题 + 重拍区 + padding
                         const y = (self.widgets || []).find((w) => w.name === "jzl_manager")?.y;
                         const need = (Number.isFinite(y) ? y : 220) + minDom;
                         // ⚠️ Nodes 2.0：节点高度由 DOM 内容决定（多行素材会自动掉高），
@@ -4373,22 +5316,24 @@ app.registerExtension({
                 const durRaw = ((gv("duration") ?? "固定5秒") + "").trim();
                 const durFix = durRaw.match(/固定\s*(\d+(?:\.\d+)?)\s*秒/);
                 const durM = durRaw.match(/(\d+(?:\.\d+)?)\s*[~\-—–]\s*(\d+(?:\.\d+)?)/);
+                const DUR_MAX = 20;   // 每段时长上限（秒）：选项已扩展到 固定20秒 / 15~20秒 / 4~20秒
                 let dlo, dhi;
                 if (durFix) {
-                    const dv = Math.max(4, Math.min(15, parseFloat(durFix[1]) || 8));
+                    const dv = Math.max(4, Math.min(DUR_MAX, parseFloat(durFix[1]) || 8));
                     dlo = dv; dhi = dv;
                 } else if (durM) {
-                    dlo = Math.max(4, Math.min(15, parseFloat(durM[1]) || 8));
-                    dhi = Math.max(dlo, Math.min(15, parseFloat(durM[2]) || dlo));
+                    dlo = Math.max(4, Math.min(DUR_MAX, parseFloat(durM[1]) || 8));
+                    dhi = Math.max(dlo, Math.min(DUR_MAX, parseFloat(durM[2]) || dlo));
                 } else {
-                    const dv = Math.max(4, Math.min(15, parseFloat(durRaw) || 8));
+                    const dv = Math.max(4, Math.min(DUR_MAX, parseFloat(durRaw) || 8));
                     dlo = dv; dhi = dv;
                 }
                 const vcRaw = String(gv("video_count") ?? "").trim();
-                const vcAuto = /剧情决定|自动/.test(vcRaw);      // 「剧情决定」：段数由 LLM 按剧情时间线自动定
+                // 「剧情决定」：字符串「剧情决定」或数值 0（短剧导演台的 0 = 剧情决定）
+                const vcAuto = /剧情决定|自动/.test(vcRaw) || (/^\d+(\.\d+)?$/.test(vcRaw) && Number(vcRaw) === 0);
                 const count = (vcRaw.match(/\d+/) || [0])[0] * 1 || 6;
-                // 动态参数用范围简写（如 1~56）
-                const cntLo = vcAuto ? 1 : count, cntHi = vcAuto ? 56 : count;
+                // 动态参数用范围简写（如 1~60）
+                const cntLo = vcAuto ? 1 : count, cntHi = vcAuto ? 60 : count;
                 const cntTxt = vcAuto ? `${cntLo}~${cntHi}` : `${count}`;
                 const [wr, hr] = AR_MAP[ar] || [16, 9];
                 const total = mp * 1024 * 1024;
@@ -4443,21 +5388,46 @@ app.registerExtension({
                         out = `分辨率：${W}x${H}丨每段帧数：${fs}（落盘）丨段数：${cntTxt}丨${cutDesc}${genNote}丨成片总长：${tt}`;
                     } catch (_) { /* 解析失败则退回默认文案 */ }
                 }
+                // 🎬 短剧导演台：精简格式（分辨率 / 每段帧数 / 段数 / 无限时长 / 成片总长）
+                if (self.type === SHORTDRAMA_NODE_TYPE) {
+                    let infOn = true;
+                    try {
+                        const _ms = gv("manager_settings");
+                        if (_ms) {
+                            const _cfg = JSON.parse(_ms);
+                            const _inf = (_cfg && _cfg.sample_decode && _cfg.sample_decode.infinite) || {};
+                            infOn = _inf.enabled !== false;
+                        }
+                    } catch (_) {}
+                    const t1 = flo * cntLo, t2 = fhi * cntHi;
+                    const s1 = (t1 / 24).toFixed(2), s2 = (t2 / 24).toFixed(2);
+                    const tt = (flo === fhi && cntLo === cntHi)
+                        ? `${t1} 帧 ≈ ${s1} 秒` : `${t1}~${t2} 帧 ≈ ${s1}~${s2} 秒`;
+                    out = `分辨率：${W}x${H}丨每段帧数：${fs}丨段数：${cntTxt}丨无限时长：${infOn ? "开启" : "关闭"}丨成片总长：${tt}`;
+                }
                 setWidgetValue(disp, out);
+                // DOM 里的「生成详情」紧跟状态行上方（节点表面 display_info 已隐藏）
+                if (self.__jzlDetailRow) self.__jzlDetailRow.textContent = out;
             };
+            self.__jzlUpdateDisplay = updateDisplay;   // 设置面板保存后由 saveManager 触发刷新
             const watchChange = (nm) => {
                 const w = (self.widgets || []).find((x) => x.name === nm);
                 if (!w) return;
                 const orig = w.callback;
                 w.callback = function (...args) {
                     const r = orig ? orig.apply(this, args) : undefined;
-                    setTimeout(updateDisplay, 0);
+                    setTimeout(() => { updateDisplay(); updateInfo(); }, 0);   // 生成详情 + 生成设定行都跟着刷新
                     return r;
                 };
             };
-            ["aspect_ratio", "megapixels", "duration", "video_count"].forEach(watchChange);
+            // 生成设定三项（短剧导演台的 run_mode/story_style/story_name 显示在节点只读行上）
+            ["aspect_ratio", "megapixels", "duration", "video_count",
+             "run_mode", "story_style", "story_name"].forEach(watchChange);
 
             loadManager(self).then((data) => {
+                // ⭐ 段数 widget 自愈：旧工作流可能把下拉用的「生成N段」存进了短剧导演台的数值输入
+                // → ComfyUI 校验会拒绝整个 prompt。加载时静默归一化为该 widget 的合法形态。
+                try { healVideoCountWidget(self); } catch (_) {}
                 cacheAssets(self, data.settings);
                 // 恢复「参考元素切换」保存的状态（显示引用/纯文本），刷新不丢失
                 self.__jzlAlignMode = (data?.settings && data.settings.align_mode === "text") ? "text" : "ref";
@@ -4468,6 +5438,8 @@ app.registerExtension({
                 self.__reshootRefresh?.(data.settings);
             }).catch(() => {});
             self.__jzlRefresh = refreshAssets;  // 弹窗保存资产后实时刷新本节点
+            // 提交前自愈钩子（由 graphToPrompt 包装调用）：段数 widget 形态归一化
+            self.healVideoCount = () => { try { return healVideoCountWidget(self); } catch (_) { return false; } };
 
             // 生成后控制回写：后端返回新 seed → 更新本节点 manager_settings
             const prevOnExecuted = self.onExecuted;
@@ -4481,25 +5453,28 @@ app.registerExtension({
                     // 后端返回的业务错误（如未填故事名称）→ 弹错误提示
                     const merr = unp(message?.manager_error);
                     if (merr) { try { notify(`❌ ${merr}`, "error"); } catch (_) {} }
+                    const _seedTxt = (v) => (v === undefined || v === null || v === "") ? "" : String(v);
                     const su = unp(message?.seed_update) || {};
-                    if (typeof su.seed === "number" && msW) {
+                    const suSeed = _seedTxt(su.seed);
+                    if (suSeed && msW) {
                         const raw = readWidgetValue(msW);
                         let s = {};
                         try { s = raw ? JSON.parse(raw) : {}; } catch (_) {}
                         if (!s.enhance) s.enhance = {};
-                        s.enhance.seed = su.seed;
+                        s.enhance.seed = suSeed;   // 字符串保存：种子可超 2^53，数字会丢精度
                         s.enhance.seed_control = su.seed_control || s.enhance.seed_control || "randomize";
                         setWidgetValue(msW, JSON.stringify(s));
                         updateInfo();
                     }
                     // 采样种子回写（randomize 一采实际种子）→ 面板刷新后显示真实种子
                     const sus = unp(message?.seed_update_sample) || {};
-                    if (typeof sus.seed === "number" && msW) {
+                    const susSeed = _seedTxt(sus.seed);
+                    if (susSeed && msW) {
                         const raw = readWidgetValue(msW);
                         let s = {};
                         try { s = raw ? JSON.parse(raw) : {}; } catch (_) {}
                         if (!s.sample_decode) s.sample_decode = {};
-                        s.sample_decode.seed = sus.seed;
+                        s.sample_decode.seed = susSeed;
                         if (sus.seed_control) s.sample_decode.seed_mode = sus.seed_control;
                         setWidgetValue(msW, JSON.stringify(s));
                         updateInfo();
@@ -4901,25 +5876,9 @@ function setupVideoViewerNode(self) {
         copyTextToClipboard(t, "已处理剧本", "复制成功");
     });
     viewBtn.addEventListener("mousedown", (e) => e.stopPropagation());
-    // Viewer 编辑剧本的资产预览窗数据源：从同图「短剧导演台」（Pro/Max/Mini）节点复制资产缓存（可参考/插入素材）
-    const _MANAGER_TYPES = new Set(["JZL_MiniMaxAssetManager", "JZL_MiniMaxAssetManagerMax", "JZL_MiniMaxAssetManagerInfinite", "JZL_MiniMaxAssetManagerMini"]);
-    const _loadViewerAssets = () => {
-        try {
-            const g = self.graph || (window.app && window.app.graph);
-            if (!g || !g._nodes) return;
-            for (const n of g._nodes) {
-                if (n && _MANAGER_TYPES.has(n.type) && n.__jzlAssets &&
-                    ((n.__jzlAssets.images && n.__jzlAssets.images.length) ||
-                     (n.__jzlAssets.videos && n.__jzlAssets.videos.length) ||
-                     (n.__jzlAssets.audios && n.__jzlAssets.audios.length))) {
-                    self.__jzlAssets = n.__jzlAssets;
-                    return;
-                }
-            }
-        } catch (_) {}
-    };
+    // Viewer 编辑剧本的资产预览窗数据源：从同图「短剧导演台」（Pro/Max/Infinite/Mini）节点同步素材缓存
     viewBtn.addEventListener("click", () => {
-        _loadViewerAssets();   // 打开前先取同图导演台素材 → 编辑界面资产预览窗有内容（复刻重拍模式放大编辑）
+        syncViewerAssetsFromManager(self);   // 打开前先取同图导演台素材 → 编辑界面资产预览窗有内容（复刻重拍模式放大编辑）
         // 无剧本也打开空白编辑界面；保存后写回 __viewerScript（可再复制到别处）
         openTextZoomEditor("📖 已处理剧本（编辑）", () => self.__viewerScript || "", (text) => {
             self.__viewerScript = text || "";
@@ -4962,7 +5921,7 @@ function setupVideoViewerNode(self) {
             const g = self.graph || (window.app && window.app.graph);
             if (!g || !g._nodes) return "";
             for (const n of g._nodes) {
-                if (n && (n.type === MAX_NODE_TYPE || n.type === INF_NODE_TYPE)) {
+                if (n && (n.type === MAX_NODE_TYPE || n.type === INF_NODE_TYPE || n.type === SHORTDRAMA_NODE_TYPE)) {
                     const w = (n.widgets || []).find((x) => x.name === "story_name");
                     if (w) { const v = String(readWidgetValue(w) || "").trim(); if (v) return v; }
                 }
@@ -5074,6 +6033,360 @@ function setupVideoViewerNode(self) {
     self.__viewerSetStory = (story) => {
         const s = String(story || "").trim();
         if (s) { self.__viewerStory = s; _setStoryWidget(s); storySel.value = AUTO_VAL; refresh(); }
+        else autoStories();
+    };
+    autoStories();
+    refresh();
+}
+
+// ── 📝 生成剧本查看器（独立节点 DOM）────────────────────────
+// 自动同步「导演台」的「故事名称」→ 直接读盘 output/jzl/{故事名}/
+// 最后一次生成或增强的剧本（优先「已增强剧本」目录，未增强则「故事拆解」）。
+// 顶部：🔄 刷新目录 / 📋 复制剧本 / 📖 编辑剧本 / 📝 选择剧本（可进子文件夹挑任意剧本文档）。
+// 下方：只读显示窗，直接展示剧本文本全文。
+const SCRIPT_VIEWER_MANAGER_TYPES = new Set([
+    MINI_NODE_TYPE, MAX_NODE_TYPE, INF_NODE_TYPE, SHORTDRAMA_NODE_TYPE, NODE_TYPE,
+]);
+
+// 把同图「导演台」节点的素材缓存搬到查看器节点上，供放大编辑器的「📁 资产显示窗」点击插入 @引用。
+// ① 优先用导演台已缓存的 __jzlAssets（面板渲染时写入，最新）；
+// ② 导演台本次还没缓存（面板没打开过）→ 直接解析它的 manager_settings.widgets 现场取素材。
+// 返回是否取到素材。
+function syncViewerAssetsFromManager(target) {
+    try {
+        const g = target?.graph || (window.app && window.app.graph);
+        if (!g || !g._nodes) return false;
+        const mgrs = g._nodes.filter((n) => n && SCRIPT_VIEWER_MANAGER_TYPES.has(n.type));
+        const nonEmpty = (a) => !!(a && ((a.images || []).length || (a.videos || []).length || (a.audios || []).length));
+        for (const n of mgrs) {
+            if (nonEmpty(n.__jzlAssets)) { target.__jzlAssets = n.__jzlAssets; return true; }
+        }
+        for (const n of mgrs) {
+            const w = (n.widgets || []).find((x) => x.name === "manager_settings");
+            if (!w) continue;
+            try {
+                const st = JSON.parse(readWidgetValue(w) || "{}");
+                if (nonEmpty(st && st.assets)) { target.__jzlAssets = st.assets; return true; }
+            } catch (_) {}
+        }
+    } catch (_) {}
+    return false;
+}
+
+// 「选择剧本」弹窗：在 output/jzl/{故事名} 下浏览，支持进入子文件夹挑选剧本文档。
+// 后端复用 /jzl/fs_list（沙箱在 output/jzl，返回 dirs + files 与 rel 路径）。
+function openScriptPicker(story, currentRel, onPick) {
+    document.querySelectorAll(".jzl-scriptpicker").forEach((m) => m.remove());
+    const SCRIPT_EXT = ["txt", "md"];
+    let cur = String(story || "").replace(/^\/+|\/+$/g, "");
+    const mkBtn = (label, bg, fg) => el("button", `flex:0 0 auto;height:26px;padding:0 10px;border-radius:5px;border:1px solid #5b9bd5;background:${bg || "#3a3a3a"};color:${fg || "#eee"};font-size:12px;cursor:pointer;`, label);
+    const fmtTime = (t) => { try { const d = new Date((Number(t) || 0) * 1000); return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; } catch (_) { return ""; } };
+    const overlay = el("div", "position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:100002;display:flex;align-items:center;justify-content:center;overflow:auto;");
+    overlay.classList.add("jzl-scriptpicker");
+    const box = el("div", "width:760px;max-width:94vw;max-height:88vh;background:var(--comfy-menu-bg,#242424);border:1px solid #555;border-radius:8px;display:flex;flex-direction:column;padding:12px;box-sizing:border-box;box-shadow:0 8px 40px rgba(0,0,0,.5);");
+    const head = el("div", "display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;");
+    head.appendChild(el("span", "font-size:14px;font-weight:600;color:#eee;white-space:nowrap;", "📝 选择剧本"));
+    const pathBox = el("span", "flex:1 1 160px;min-width:0;font-size:12px;color:#9fd6a4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", "");
+    const upBtn = mkBtn("⬆️ 上级");
+    const latestBtn = mkBtn("✨ 最新生成（优先增强）", "#2a4a6a", "#cfe3f7");
+    latestBtn.title = "自动读取该故事编号最大批次：优先「已增强剧本」，未增强则「故事拆解」";
+    const closeBtn = mkBtn("关闭");
+    head.append(pathBox, upBtn, latestBtn, closeBtn);
+    box.appendChild(head);
+    const list = el("div", "flex:1 1 auto;overflow-y:auto;min-height:160px;max-height:70vh;border:1px solid #333;border-radius:5px;background:#1a1a1a;padding:6px;");
+    box.appendChild(list);
+    box.appendChild(el("div", "font-size:11px;color:#888;margin-top:6px;white-space:pre-wrap;", "📂 点文件夹进入子目录；📄 点剧本文件即载入下方显示窗（仅列 .txt/.md）。"));
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    closeBtn.addEventListener("click", () => overlay.remove());
+    upBtn.addEventListener("click", () => { const p = cur.includes("/") ? cur.slice(0, cur.lastIndexOf("/")) : ""; load(p); });
+    latestBtn.addEventListener("click", () => {
+        onPick({ latest: true });
+        overlay.remove();
+    });
+
+    const mkRow = (icon, name, meta, onClick, color) => {
+        const row = el("div", "display:flex;align-items:center;gap:8px;padding:5px 7px;border-radius:4px;cursor:pointer;font-size:12px;color:" + (color || "#ddd") + ";");
+        row.addEventListener("mouseenter", () => { row.style.background = "#2a2a2a"; });
+        row.addEventListener("mouseleave", () => { row.style.background = ""; });
+        row.append(el("span", "flex:0 0 auto;", icon),
+                   el("span", "flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", name),
+                   el("span", "flex:0 0 auto;font-size:11px;color:#777;", meta || ""));
+        row.addEventListener("click", onClick);
+        return row;
+    };
+
+    const load = async (rel) => {
+        list.textContent = "加载中…";
+        let data = {};
+        try {
+            const r = await api.fetchApi(`/jzl/fs_list?path=${encodeURIComponent(rel || "")}`);
+            data = await r.json().catch(() => ({}));
+        } catch (e) { list.textContent = "❌ 加载失败：" + ((e && e.message) || e); return; }
+        if (!data || !data.ok) { list.textContent = "❌ " + ((data && data.error) || "无法读取目录"); return; }
+        cur = data.rel || "";
+        pathBox.textContent = "output/jzl/" + (cur ? cur + "/" : "");
+        upBtn.disabled = !cur;
+        upBtn.style.opacity = cur ? "1" : ".45";
+        list.innerHTML = "";
+        const dirs = (data.dirs || []).slice().sort((a, b) => (Number(b.mtime) || 0) - (Number(a.mtime) || 0));
+        const files = (data.files || [])
+            .filter((f) => SCRIPT_EXT.includes(String(f.ext || "").toLowerCase()))
+            .sort((a, b) => (Number(b.mtime) || 0) - (Number(a.mtime) || 0));   // 最新修改优先
+        if (!dirs.length && !files.length) {
+            list.append(el("div", "font-size:12px;color:#888;padding:8px;", "此目录下没有子文件夹或剧本文档（.txt/.md）"));
+        }
+        dirs.forEach((d) => list.append(mkRow("📂", d.name, fmtTime(d.mtime), () => load(d.rel), "#cfe3f7")));
+        files.forEach((f) => {
+            const isCur = String(f.rel) === String(currentRel || "");
+            list.append(mkRow("📄", f.name, (isCur ? "✅ 当前  " : "") + fmtTime(f.mtime),
+                              () => { onPick({ rel: f.rel, name: f.name }); overlay.remove(); },
+                              isCur ? "#9fd6a4" : "#ddd"));
+        });
+    };
+    load(cur);
+}
+
+function setupScriptViewerNode(self) {
+    // socketless story_name widget：隐藏 + 持久化「当前故事」
+    const _storyW = (self.widgets || []).find((x) => x.name === "story_name");
+    for (const w of self.widgets || []) {
+        if ((w && (w.name || "") === "story_name")) {
+            w.hidden = true;
+            if (!w.options) w.options = {};
+            w.options.hidden = true;
+            w.computeSize = () => [0, -4];
+        }
+    }
+    try { if (Array.isArray(self.widgets)) self.widgets = self.widgets.slice(); } catch (_) {}
+    try { self.graph?.trigger?.("node:slot-label:changed", { nodeId: self.id, slotType: 2 }); } catch (_) {}
+
+    // 剧本内容（默认 = 最后一次生成/增强；可用「选择剧本」覆盖为任意文件）
+    self.__scriptText = "";
+    self.__scriptSource = "";              // 已增强剧本 / 故事拆解 / 指定文件
+    self.__scriptPick = String(self.__scriptPick || "");   // 手动挑选的 rel 路径（相对 output/jzl），空=跟随最新
+    self.__scriptStory = String(_storyW ? String(readWidgetValue(_storyW) || "").trim() : "");
+    const _setStoryWidget = (sn) => {
+        if (_storyW && String(readWidgetValue(_storyW) || "").trim() !== sn) {
+            try { setWidgetValue(_storyW, sn); } catch (_) {}
+        }
+    };
+
+    const container = document.createElement("div");
+    container.style.cssText = "width:100%;height:100%;display:flex;flex-direction:column;gap:6px;padding:8px;box-sizing:border-box;overflow:hidden;";
+
+    // 顶行：故事下拉（自动识别=跟随导演台故事名）+ 刷新目录 + 复制剧本 + 编辑剧本 + 选择剧本
+    const ctrlRow = el("div", "display:flex;align-items:center;gap:6px;flex:0 0 auto;");
+    const storySel = document.createElement("select");
+    storySel.title = "故事文件夹：自动识别=跟随「导演台」的故事名称同名文件夹；或手动选择 output/jzl 下已有故事";
+    storySel.style.cssText = "flex:0 1 130px;min-width:0;background:#1d1d1d;color:#ddd;border:1px solid #444;border-radius:4px;padding:4px 3px;font-size:12px;";
+    storySel.addEventListener("mousedown", (e) => e.stopPropagation());
+    storySel.addEventListener("change", () => refresh());
+    const AUTO_VAL = "__auto__";
+    const refreshBtn = el("button", "flex:0 0 auto;height:26px;padding:0 8px;border-radius:5px;border:1px solid #5b9bd5;background:#2a4a6a;color:#cfe3f7;font-size:12px;cursor:pointer;", "🔄 刷新目录");
+    refreshBtn.title = "重新同步导演台的故事名并读取最新剧本（优先已增强，否则故事拆解；已手动选择剧本时重读该文件）";
+    refreshBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+    refreshBtn.addEventListener("click", () => { refresh().then(() => { try { notify("🔄 已同步（" + (self.__scriptSource || "剧本") + "）", "success"); } catch (_) {} }); });
+    const copyBtn = el("button", "flex:0 0 auto;height:26px;padding:0 8px;border-radius:5px;border:1px solid #5b9bd5;background:#3a3a3a;color:#eee;font-size:12px;cursor:pointer;", "📋 复制剧本");
+    copyBtn.title = "复制当前显示的剧本全文";
+    const viewBtn = el("button", "flex:0 0 auto;height:26px;padding:0 8px;border-radius:5px;border:1px solid #5b9bd5;background:#2a4a6a;color:#cfe3f7;font-size:12px;cursor:pointer;", "📖 编辑剧本");
+    viewBtn.title = "放大编辑当前剧本（可改后保存；已指定文件时同时写回磁盘）";
+    const pickBtn = el("button", "flex:0 0 auto;height:26px;padding:0 8px;border-radius:5px;border:1px solid #8a6d3b;background:#5a4a2a;color:#ffd98a;font-size:12px;cursor:pointer;", "📝 选择剧本");
+    pickBtn.title = "在 output/jzl/{故事名} 下挑选剧本文档（支持进入子文件夹；也可选「最新生成（优先增强）」）";
+    const storyName = el("span", "flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#9fd6a4;", "");
+    ctrlRow.append(storySel, storyName, refreshBtn, copyBtn, viewBtn, pickBtn);
+    container.appendChild(ctrlRow);
+
+    // 状态行：来源 + 字数
+    const stat = el("div", "font-size:11px;color:#888;flex:0 0 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-height:14px;", "");
+    container.appendChild(stat);
+    const updateStat = () => {
+        const t = self.__scriptText || "";
+        if (t.trim()) {
+            stat.textContent = `📝 ${self.__scriptSource || "剧本"}｜${t.length} 字${self.__scriptPick ? "（已指定文件）" : ""}`;
+            stat.style.color = "#9fd6a4";
+        } else {
+            stat.textContent = "尚未获取剧本：先跑一次导演台，或点「📝 选择剧本」手动挑选";
+            stat.style.color = "#888";
+        }
+    };
+    self.__scriptUpdateStat = updateStat;
+
+    // 显示窗：只读全文（等宽、可滚动、随节点拉大）
+    const scroll = el("div", "flex:1 1 auto;min-height:0;overflow:auto;border:1px solid #333;border-radius:6px;background:#141414;padding:8px;box-sizing:border-box;");
+    const pre = el("pre", "margin:0;white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.65;color:#ddd;font-family:Consolas,Menlo,monospace;");
+    scroll.appendChild(pre);
+    container.appendChild(scroll);
+    const renderText = () => {
+        const t = self.__scriptText || "";
+        pre.textContent = t.trim() ? t : "（暂无剧本内容）\n\n自动读取顺序：\n  output/jzl/{故事名}/第N次生成/已增强剧本/*.txt   ← 开启过增强时优先\n  output/jzl/{故事名}/第N次生成/故事拆解/*.txt     ← 未增强时\n也可点「📝 选择剧本」在子文件夹里挑选任意剧本文件。";
+    };
+
+    copyBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+    copyBtn.addEventListener("click", () => {
+        const t = self.__scriptText || "";
+        if (!t.trim()) { notify("目前没有剧本内容", "warning"); return; }
+        copyTextToClipboard(t, "剧本", "复制成功");
+    });
+    viewBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+    viewBtn.addEventListener("click", () => {
+        // ⭐ 打开前先把同图导演台的素材缓存同步过来 → 放大编辑器右侧「📁 资产显示窗」才有素材可点击插入 @引用
+        const got = syncViewerAssetsFromManager(self);
+        if (!got) notify("ℹ️ 图中未找到导演台素材：资产显示窗为空（先在同图放一个导演台并添加素材）", "warning");
+        openTextZoomEditor("📖 剧本（编辑）", () => self.__scriptText || "", async (text) => {
+            self.__scriptText = text || "";
+            renderText();
+            updateStat();
+            // 已指定具体文件 → 同步写回磁盘，避免「改了但没保存」
+            if (self.__scriptPick) {
+                try {
+                    const r = await api.fetchApi("/jzl/fs_write", {
+                        method: "POST", headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ path: self.__scriptPick, text: self.__scriptText }),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (d && d.ok) notify("✅ 剧本已保存到文件：" + self.__scriptPick, "success");
+                    else notify("⚠️ 已更新显示，但写回磁盘失败：" + ((d && d.error) || "未知错误"), "warning");
+                    return;
+                } catch (e) { notify("⚠️ 已更新显示，但写回磁盘失败：" + ((e && e.message) || e), "warning"); return; }
+            }
+            notify("✅ 剧本已更新（未指定文件，仅本次显示/复制用）", "success");
+        }, self);
+    });
+    pickBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+    pickBtn.addEventListener("click", () => {
+        const sn = String(self.__scriptStory || "").trim();
+        if (!sn) { notify("请先确定故事名（自动识别导演台，或从上方下拉选择）", "warning"); return; }
+        openScriptPicker(sn, self.__scriptPick, async (choice) => {
+            if (choice.latest) {
+                self.__scriptPick = "";
+                await refresh(true);
+                notify("✅ 已载入最新剧本（优先增强）", "success");
+                return;
+            }
+            self.__scriptPick = choice.rel || "";
+            try {
+                const r = await api.fetchApi(`/jzl/fs_read?path=${encodeURIComponent(self.__scriptPick)}`);
+                const d = await r.json().catch(() => ({}));
+                if (!(d && d.ok)) { notify("❌ 读取失败：" + ((d && d.error) || "未知错误"), "error"); return; }
+                self.__scriptText = d.text || "";
+                self.__scriptSource = "指定文件 " + (choice.name || self.__scriptPick);
+                renderText(); updateStat();
+                notify("✅ 已载入剧本：" + (choice.name || self.__scriptPick), "success");
+            } catch (e) { notify("❌ 读取失败：" + ((e && e.message) || e), "error"); }
+        });
+    });
+
+    // 自动识别：读同图「导演台」节点上的「故事名称」widget
+    const _findStoryName = () => {
+        try {
+            const g = self.graph || (window.app && window.app.graph);
+            if (!g || !g._nodes) return "";
+            for (const n of g._nodes) {
+                if (n && SCRIPT_VIEWER_MANAGER_TYPES.has(n.type)) {
+                    const w = (n.widgets || []).find((x) => x.name === "story_name");
+                    if (w) { const v = String(readWidgetValue(w) || "").trim(); if (v) return v; }
+                }
+            }
+        } catch (_) {}
+        return "";
+    };
+
+    // forceDefault=true → 忽略手动指定的文件，直接回到「最新生成（优先增强）」
+    const refresh = async (forceDefault) => {
+        syncViewerAssetsFromManager(self);   // 顺带同步导演台素材缓存（放大编辑器资产显示窗用）
+        const autoMode = String(storySel.value || "") === AUTO_VAL;
+        let sn = "";
+        if (autoMode) { sn = _findStoryName() || String(self.__scriptStory || "").trim(); }
+        else { sn = String(storySel.value || "").trim(); }
+        const storyChanged = sn && self.__scriptStory && sn !== self.__scriptStory;
+        if (sn) { self.__scriptStory = sn; _setStoryWidget(sn); }
+        if (forceDefault || storyChanged) self.__scriptPick = "";
+        storyName.textContent = sn ? `📺 ${sn}` : "";
+        storyName.style.color = sn ? "#9fd6a4" : "#666";
+        storyName.title = sn ? `已加载：output/jzl/${sn}/` : "自动识别：未找到导演台（图中无导演台或未填故事名称）";
+        if (!sn) { self.__scriptText = ""; self.__scriptSource = ""; renderText(); updateStat(); return; }
+        // 已手动指定文件 → 重读该文件（内容可能刚被编辑）；否则读「最新生成（优先增强）」
+        if (self.__scriptPick) {
+            try {
+                const r = await api.fetchApi(`/jzl/fs_read?path=${encodeURIComponent(self.__scriptPick)}`);
+                const d = await r.json().catch(() => ({}));
+                if (d && d.ok) {
+                    self.__scriptText = d.text || "";
+                    self.__scriptSource = "指定文件 " + self.__scriptPick.split("/").pop();
+                    renderText(); updateStat(); return;
+                }
+                self.__scriptPick = "";      // 文件已不存在 → 回退到最新
+            } catch (_) { self.__scriptPick = ""; }
+        }
+        try {
+            const r = await api.fetchApi(`/jzl/story_latest_script?story_name=${encodeURIComponent(sn)}`);
+            const d = await r.json().catch(() => ({}));
+            const sc = (d && d.ok && d.script) || "";
+            if (sc) {
+                self.__scriptText = sc;
+                self.__scriptSource = (d.source || "剧本") + (d.batch ? `（第${d.batch}次生成` + (d.file ? `｜${d.file}` : "") + "）" : "");
+            } else {
+                self.__scriptText = "";
+                self.__scriptSource = "";
+            }
+            renderText(); updateStat();
+        } catch (e) {
+            self.__scriptText = "";
+            self.__scriptSource = "";
+            pre.textContent = "❌ 加载失败：" + ((e && e.message) || e);
+            updateStat();
+        }
+    };
+
+    // addDOMWidget（填满节点、拉大自适应）
+    const widget = self.addDOMWidget?.("script_viewer_body", "JZL_SCRIPT_VIEWER", container, { serialize: false, hideOnZoom: false });
+    if (widget) {
+        try { delete widget.computeSize; } catch { widget.computeSize = undefined; }
+        widget.options = widget.options || {};
+        widget.options.serialize = false;
+        widget.options.getMinHeight = () => 220;
+        widget.options.getHeight = () => "100%";
+        widget.computeLayoutSize = () => ({ minHeight: 220, maxHeight: undefined, minWidth: 300 });
+        widget.options.onDraw = () => { try { syncW(); } catch (_) {} };
+        widget.options.afterResize = () => { try { syncW(); } catch (_) {} };
+    }
+    const syncW = () => {
+        try {
+            const fw = Number.isFinite(self.size?.[0]) ? self.size[0] : 0;
+            if (widget && fw && widget.width !== fw) widget.width = fw;
+        } catch (_) {}
+    };
+    syncW();
+    self._jzlScriptWidget = widget;
+    try { if (!Number.isFinite(self.size?.[1]) || self.size[1] < 300) self.setSize?.([420, 420]); } catch (_) {}
+
+    updateStat();
+    renderText();
+    // 故事下拉：首项「✨ 自动识别」（跟随导演台故事名）+ 手动选择（列出 output/jzl 下已有故事）
+    const autoStories = async () => {
+        try {
+            const r = await api.fetchApi("/jzl/generated_videos");
+            const d = await r.json().catch(() => ({}));
+            const list = (d && d.ok && d.stories) || [];
+            storySel.innerHTML = "";
+            const autoOpt = document.createElement("option");
+            autoOpt.value = AUTO_VAL;
+            autoOpt.textContent = "✨ 自动识别";
+            autoOpt.title = "跟随「导演台」的「故事名称」同名文件夹（改故事名后点刷新即同步）";
+            storySel.appendChild(autoOpt);
+            list.forEach((s) => { const o = document.createElement("option"); o.value = s.story; o.textContent = `📂 ${s.story}`; storySel.appendChild(o); });
+            const saved = String(_storyW ? String(readWidgetValue(_storyW) || "").trim() : "");
+            storySel.value = (saved && list.some((s) => s.story === saved)) ? saved : AUTO_VAL;
+            refresh();
+        } catch (_) {}
+    };
+    // 供「导演台执行完成」钩子调用：重新同步（跟随故事名 + 读最新剧本）
+    self.__scriptRefresh = () => { refresh().catch(() => {}); };
+    self.__scriptSetStory = (story) => {
+        const s = String(story || "").trim();
+        if (s) { self.__scriptStory = s; _setStoryWidget(s); storySel.value = AUTO_VAL; refresh(); }
         else autoStories();
     };
     autoStories();

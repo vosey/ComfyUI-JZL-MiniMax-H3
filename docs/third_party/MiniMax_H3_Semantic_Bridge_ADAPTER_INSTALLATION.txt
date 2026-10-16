@@ -1,0 +1,16 @@
+ADAPTER INSTALLATION
+====================
+
+Copy:
+
+MiniMaxH3_SemanticBridge_v1.safetensors
+
+to:
+
+ComfyUI/models/semantic_bridge/
+
+Final path:
+
+ComfyUI/models/semantic_bridge/MiniMaxH3_SemanticBridge_v1.safetensors
+
+Restart ComfyUI after copying the adapter.

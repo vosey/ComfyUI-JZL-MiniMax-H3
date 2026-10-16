@@ -53,11 +53,17 @@ class JZL_MiniMaxPromptEnhancer:
 
     @staticmethod
     def _split_blocks(text):
-        """分离统计表前缀与 [SHOT_START]...[SHOT_END] 块。"""
+        """分离统计表前缀与分段块；单段输出缺少外层标记时按 H3 块识别。"""
         text = text or ""
         blocks = re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', text, re.DOTALL)
-        prefix = re.split(r'\[SHOT_START\]', text, maxsplit=1)[0]
-        return prefix.rstrip(), [b.strip() for b in blocks]
+        if blocks:
+            prefix = re.split(r'\[SHOT_START\]', text, maxsplit=1)[0]
+            return prefix.rstrip(), [b.strip() for b in blocks]
+
+        single_start = text.find("===H3_PROMPT===")
+        if single_start >= 0:
+            return text[:single_start].rstrip(), [text[single_start:].strip()]
+        return text.strip(), []
 
     @staticmethod
     def _extract_field(h3_body, field_name):
@@ -168,8 +174,7 @@ class JZL_MiniMaxPromptEnhancer:
             return JZL_MiniMax_ScriptProcessor._call_api(api_config, system_prompt, user_msg)
         if not use_api and llama_model is not None:
             if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != llama_model:
-                print("[JZL-llama] 开始加载模型...")
-                LLAMA_CPP_STORAGE.load_model(llama_model)
+                LLAMA_CPP_STORAGE.load_model(llama_model, "增强提示词")
             try:
                 _params = parameters.copy() if parameters else {}
                 _params.pop("present_penalty", None)
@@ -297,7 +302,7 @@ class JZL_MiniMaxPromptEnhancer:
         if use_api is None:
             _llm_backend = str(bus.get("llm_backend") or "").lower()
             use_api = "api" in _llm_backend and bool(bus.get("api_config"))
-        print("[JZL-增强] 正在使用API模式增强提示词中..." if use_api else "[JZL-增强] 正在使用本地模式增强提示词中...")
+        print("[JZL-增强] 正在增强提示词中..." if not use_api else "[JZL-增强] 正在使用 API 增强提示词中...")
 
         prefix, blocks = self._split_blocks(script_text)
         if not blocks:

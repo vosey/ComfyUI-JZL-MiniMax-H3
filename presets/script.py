@@ -195,7 +195,7 @@ SCRIPT_SKELETON_V2 = '''# Role: 顶级短视频编剧 & MiniMax H3 分段提示�
    - **风格逐句渗透**：风格声明只用一句（句式「本段为 <媒介/渲染> 的 <风格> 风格」），且每个环境/特效/道具名词都带本风格定语；
    - **镜内分拍 + 句间因果**：一镜多拍已用空行分拍（每拍「触发→动作→结果」），每句新动作都由上一句因果引发；
    - **副运动 + 可见事实密度**：每次主体动作带至少 1 处附属物副运动（行囊/衣摆/发丝/道具/烟雾/尘土）；每个 [Shot N] 平均每秒 ≥ 2 个可拍到的事实；
-   - **首帧锚定句式**：有首帧锚点图时 subject_definitions 有 `<Picture N> is the first frame of [Shot 1], showing …` 行、[Shot 1] 起手句「本镜以 <Picture N> 作为第一帧开始」、summary 标签含 `keyframe completion`、retention 首帧图单独一行；
+   - **固定 ref2va（无首帧/尾帧锚定）**：subject_definitions 里参考图只写「普通参考」，严禁 `<Picture N> is the first frame of [Shot 1]` / `is the last frame of`；summary 严禁 `keyframe completion`；retention 严禁 `([Shot 1] first frame)`；
    - **声音两字段**：overall_soundscape 按事件时间顺序写（主导事件声→环境底噪，带「材质+动作+强度」）；non_diegetic_music 默认 N/A，指定音乐时写「体裁/速度 + 三件乐器（含演奏法）+ matching 画面事件」；
    - 第 2 段起 [Shot 1] 是承接上段末帧的延续画面（时长 = 段首衔接秒数）、其后才有本段新内容；无状态回退/重演上段已演事件。
 
@@ -267,8 +267,9 @@ def _extract_detail_length(preference_text):
 def _build_material_table(ref_image_intro, ref_video_intro, ref_audio_intro):
     """解析用户素材描述，生成「标签对照表」，供 LLM 严格按槽位名写 slots。
 
-    用户描述每行格式：「类型+字母 = 素材名（描述）」，如「角色A = 孙悟空（橙色武道服）」。
-    返回对照表文本；无素材时返回空串。
+    用户描述每行格式：「类型+字母 = 素材名（描述）」，如「角色A = 孙悟空（橙色武道服）」
+    「音色A = 小兔子音色」。音频子分类（角色音色/背景配乐/念白）各有独立前缀，
+    不在白名单里会被整行丢弃 → 对照表缺音频槽位 → LLM 只能把 AUDIO_INSTRUCTION 写空。
     """
     blocks = []
     for kind, intro in (("图片", ref_image_intro), ("视频", ref_video_intro), ("音频", ref_audio_intro)):
@@ -279,7 +280,7 @@ def _build_material_table(ref_image_intro, ref_video_intro, ref_audio_intro):
             line = line.strip()
             if not line:
                 continue
-            m = re.match(r'^(角色|场景|道具|视频|音频|分镜|音效|音乐|其他)\s*([A-Za-z])\s*[=＝:：]\s*(.+)', line)
+            m = re.match(r'^(角色|场景|道具|视频|音频|音色|配乐|念白|分镜|音效|音乐|其他)\s*([A-Za-z])\s*[=＝:：]\s*(.+)', line)
             if not m:
                 continue
             typ, slot, rest = m.group(1), m.group(2).upper(), m.group(3).strip()
@@ -295,9 +296,9 @@ def _build_material_table(ref_image_intro, ref_video_intro, ref_audio_intro):
             + "\n\n## 3.6 素材白名单（CRITICAL — 顶部字段与调度严禁引用对照表之外的素材）\n"
             "- 每段顶部元数据（**角色**/**场景**/**道具**/**视频**/**音频**/**音效**/**音乐**/**其他**）里列出的名称，必须全部来自上方对照表中的「素材名」或「类型:槽位名」（如 场景:场景B、角色:角色A），严禁自造或新增。\n"
             "- 剧情需要但对照表中没有的素材（如某道具/场景/角色），一律不得写入顶部字段或调度 slots：该字段写「无」，只允许在 detailed_description 剧情正文中作环境描写。\n"
-            "- 调度指令 slots 写「类型:槽位名」，如 场景:场景A、角色:角色A、道具:道具A、视频:视频A、音频:音频A，严禁写素材名（孙悟空）或自造槽位。\n"
+            "- 调度指令 slots 写「类型:槽位名」，如 场景:场景A、角色:角色A、道具:道具A、视频:视频A、音频:音色A（音频类类型前缀固定「音频」，槽位名按子分类可能是 音色A/配乐A/念白A/音频A），严禁写素材名（孙悟空）或自造槽位。\n"
             "- subject_definitions 写素材名（<Subject N> 是 <Picture N> 中的孙悟空），括号里的外貌描述原样复述。\n"
-            "- 音频槽位对应说话人音色：本段谁开口说话，AUDIO_INSTRUCTION.slots 就写对应角色的「音频:音频X」，无对话分段音频 slots 写空。")
+            "- 音频槽位对应说话人音色：本段谁开口说话，AUDIO_INSTRUCTION.slots 就写对应槽位（角色音色→「音频:音色X」、其它音频→「音频:配乐X/念白X/音频X」，一律照抄对照表里的槽位名），无对话分段音频 slots 写空。")
 
 def build_shot_prompt(
     user_story: str,

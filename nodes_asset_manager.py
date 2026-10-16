@@ -30,6 +30,7 @@ import comfy.model_management
 import comfy.sample
 import comfy.samplers
 import comfy.utils
+import comfy.audio
 import comfy.nested_tensor
 from PIL import Image, ImageOps
 from comfy_api.latest import io
@@ -95,35 +96,50 @@ ASPECT_RATIOS = {
 }
 
 
-# 每段视频时长选项（四个导演台节点共用：Pro / Max / Mini / 无限时长）
-# 固定 4~15 秒 + 常用区间；区间时由 LLM 按剧情弧线给每段实际秒数
+# 每段视频时长选项（导演台节点共用：Pro / Max / Mini / 无限时长 / 短剧导演台）
+# 固定 4~20 秒 + 常用区间；区间时由 LLM 按剧情弧线给每段实际秒数
+# ⚠️ 保留历史值「4~15秒」：老工作流存的就是这个字符串，从选项列表删掉会让它们加载失败
 SEGMENT_DURATION_CHOICES = (
     "固定4秒", "固定5秒", "固定6秒", "固定7秒", "固定8秒", "固定9秒", "固定10秒",
     "固定11秒", "固定12秒", "固定13秒", "固定14秒", "固定15秒",
-    "4~9秒", "7~12秒", "10~15秒", "4~15秒",
+    "固定16秒", "固定17秒", "固定18秒", "固定19秒", "固定20秒",
+    "4~9秒", "7~12秒", "10~15秒", "15~20秒", "4~15秒", "4~20秒",
 )
 SEGMENT_DURATION_DEFAULT = "固定5秒"
+SEGMENT_DURATION_MAX_SEC = 20   # 单段时长上限（秒）：选项已到「固定20秒 / 15~20秒 / 4~20秒」
 
-# 生成视频数量选项（四节点共用）：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数
+# 生成视频数量选项（Pro / Max / Mini / 无限时长 用下拉）：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数
+# 「短剧导演台」改为数值输入：0 = 剧情决定，1~60 = 固定段数
 VIDEO_COUNT_CHOICES = (
     "剧情决定",
     "生成1段", "生成2段", "生成3段", "生成4段", "生成6段", "生成9段",
     "生成12段", "生成16段", "生成20段", "生成26段", "生成32段", "生成40段",
-    "生成48段", "生成56段",
+    "生成48段", "生成56段", "生成60段",
 )
 VIDEO_COUNT_DEFAULT = "剧情决定"
 VIDEO_COUNT_FALLBACK = 6   # 「剧情决定」在拆解前的占位段数（拆解后按实际分段数覆盖）
-SEGMENT_COUNT_MAX = 56     # 段数上限（与选项一致）
+SEGMENT_COUNT_MAX = 60     # 段数上限（「短剧导演台」数值输入 1~60）
+
+# 采样分类（「🎭 采样解码设置 → 采样分类」）：常规采样（现有 K 采样器链路）/ SelfLift采样
+SAMPLE_MODE_NORMAL = "常规采样"
+SAMPLE_MODE_SELFLIFT = "SelfLift采样"
+SELFLIFT_STEPS_DEFAULT = 8   # SelfLift 独立步数默认值（与常规采样的 steps 互不干扰）
 
 
 def _parse_video_count(video_count):
-    """video_count 选项 → ('auto', None)【剧情决定】或 ('fixed', N)。兼容旧数字值。"""
+    """video_count → ('auto', None)【剧情决定】或 ('fixed', N)。
+
+    兼容三种写法：数值 0（短剧导演台的「剧情决定」）、字符串「剧情决定」、旧字符串「生成N段」。
+    """
     s = str(video_count if video_count is not None else VIDEO_COUNT_DEFAULT).strip()
     if (not s) or s == "剧情决定":
         return ("auto", None)
     m = re.search(r"\d+", s)
     if m:
-        return ("fixed", max(1, min(SEGMENT_COUNT_MAX, int(m.group(0)))))
+        n = int(m.group(0))
+        if n <= 0:
+            return ("auto", None)      # 0 = 剧情决定
+        return ("fixed", max(1, min(SEGMENT_COUNT_MAX, n)))
     return ("auto", None)
 
 
@@ -280,10 +296,15 @@ MANAGER_DEFAULTS = {
         },
     },
     "assets": {"images": [], "videos": [], "audios": []},
+    # 「生成设定 → 语义修正」：语义桥（内部调用内置副本 vendor_semantic_bridge）
+    "semantic_bridge": {
+        "enabled": False,
+        "adapter": "",
+        "alpha": 0.10,
+        "magnitude_match": "per_token",
+    },
     "enhance": {
-        "story_decompose": True,        # 固定开启（面板已移除该项；旧配置为 False 也按开启处理）
-        "vision_decompose": False,      # 开启拆解识图（参考素材同名图片交给 LLM）
-        "vision_expand": False,         # 开启扩写识图
+        "story_decompose": True,
         "enabled": False,
         "llm_backend": "在线API [api]",
         "force_offload": False,
@@ -314,9 +335,9 @@ MANAGER_DEFAULTS = {
         },
         "api": {
             "provider": "OpenAI 兼容 (OpenAI/DeepSeek/Qwen/GLM/Kimi/Ollama/vLLM/LM Studio)",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-flash",
             "api_key": "",
-            "base_url": "https://api.deepseek.com/v1",
+            "base_url": "https://api.deepseek.com",
             "temperature": 0.6,
             "max_tokens": 81920,
             "thinking": "disabled",
@@ -358,6 +379,20 @@ MANAGER_DEFAULTS = {
         "seed_mode": "randomize",
         "decode_video": "XB-BOX - VAE解码（原版优化）",
         "decode_cleanup": "卸载显存模型",
+        # 采样分类（常规采样 / SelfLift采样）；SelfLift 用内置副本 vendor_selflift
+        "sample_mode": SAMPLE_MODE_NORMAL,
+        "selflift": {
+            # SelfLift 有独立的步数（默认 8 = 低分辨率前缀 6 + 高分辨率收尾 2），与常规采样的 4 步互不干扰
+            "steps": 8,
+            "transition_step": 6,
+            "lowres_scale": 0.5,
+            "rho": 0.6,
+            "w_min": 0.5,
+            "w_max": 1.0,
+            "upscaler_model": "none",
+            "upscaler_unload": True,
+            "highres_tiling": False,
+        },
         "second": {
             "enabled": False,
             "upscaler_model": "minimax_h3_latent_upscaler_3d_fp32.pth",
@@ -369,6 +404,10 @@ MANAGER_DEFAULTS = {
             "denoise": 0.3,
             "sigmas_mode": "scheduler",
             "custom_sigmas": "0.8500, 0.6316, 0.3158, 0.0000",
+            # 二采空间分块（省显存）：关闭 / 自动（按显存预算选块数）/ 手动（指定块数）
+            "tiling": "关闭",
+            "tiling_tiles": 2,
+            "tiling_overlap": 128,
         },
     },
 }
@@ -393,12 +432,21 @@ def _manager_settings_file():
 
 
 def _merge_manager_settings(data):
-    """节点配置与默认值合并（补齐缺失块），并做旧配置兼容迁移。"""
-    merged = json.loads(json.dumps(MANAGER_DEFAULTS, ensure_ascii=False))
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if k in merged and isinstance(v, dict):
-                merged[k].update(v)
+    """节点配置与默认值合并（递归补齐缺失键），并做旧配置兼容迁移。
+
+    必须是**递归**补齐：只按顶层键 `update` 的话，用户旧配置里的 `sample_decode.selflift`
+    会整块覆盖默认值，导致后加的键（如 `selflift.steps`）永远缺失 → 面板显示 8 而后端只能回退。
+    """
+    def _fill(target, defaults):
+        for k, dv in defaults.items():
+            if k not in target or target[k] is None:
+                target[k] = json.loads(json.dumps(dv, ensure_ascii=False))
+            elif isinstance(dv, dict) and isinstance(target[k], dict):
+                _fill(target[k], dv)
+        return target
+
+    merged = _fill(json.loads(json.dumps(data, ensure_ascii=False)) if isinstance(data, dict) else {},
+                   MANAGER_DEFAULTS)
     # 旧配置兼容：enhance.llm.model 为空时，从旧 models.llm_* 字段补齐（①生成模型管理时代的结构）
     llm = merged.get("enhance", {}).get("llm") or {}
     if not (llm.get("model") or "").strip():
@@ -598,12 +646,13 @@ def _parse_four_in_one(content):
     return h3, scene, video, audio
 
 
-def _collect_slots(raw, kind, limit):
-    """按调度指令从全局资产池取 kind 类资产，返回 list[tensor]（≤limit）。
+def _collect_slots_ex(raw, kind, limit):
+    """按调度指令从全局资产池取 kind 类资产，返回 [(槽位名, 数据)]（≤limit）。
 
     与「场景/视频/音频调度」节点共用同一套规则（story_nodes 的 normalize_slots /
     _parse_slots / _get_from_pool / _match_name）：槽位名先经 JZL_SLOT_MAP 精确映射为
     资产名，再走共享池匹配（精确→模糊），保证管理器与真实调度节点行为一致。
+    保留槽位名是为了打印「真实调用信息」（槽位名=image N / Audio N）。
     """
     from .story_nodes import _parse_slots, _get_from_pool, normalize_slots
     try:
@@ -618,8 +667,64 @@ def _collect_slots(raw, kind, limit):
         asset_name = JZL_SLOT_MAP.get(name, name)
         data = _get_from_pool(asset_name, kind=kind)
         if data is not None:
-            out.append(data)
+            out.append((name, data))
+        else:
+            # LLM 引用了槽位但池里没有（素材未上传文件/文件缺失）→ 本段退化成无该参考。
+            # 不提示的话用户只会看到「参考 0 图」，无从判断原因。
+            _log_once(f"[JZL-素材] ⚠️ 参考槽位「{name}」未载入素材池（{asset_name}）"
+                      f"→ 该参考已忽略；请检查对应素材是否已上传文件")
     return out
+
+
+def _collect_slots(raw, kind, limit):
+    """同 _collect_slots_ex，只取数据（供不需要打印调用信息的调用点使用）。"""
+    return [d for _, d in _collect_slots_ex(raw, kind, limit)]
+
+
+def _collect_refs_with_names(scene, vid, aud, mention_names):
+    """按调度指令 + @引用收集参考素材，返回 (ref_images, ref_videos, ref_audios, names)。
+
+    names = {"image"/"video"/"audio": [槽位名…]}，与三个列表同序 —— 供编码阶段回填
+    「真实调用信息」。总数上限 12：超出时先丢视频、再丢图片，**音频最后才丢**
+    （音色/配乐/念白是用户明确引用的参考，不能被静默丢掉；9图+3音频=12 正常不会触发）。
+    """
+    img_pairs = _collect_slots_ex(scene, "image", 9)
+    vid_pairs = _collect_slots_ex(vid, "video", 3)
+    aud_pairs = _collect_slots_ex(aud, "audio", 3)
+    ref_images = [d for _, d in img_pairs]
+    ref_videos = [d for _, d in vid_pairs]
+    ref_audios = [d for _, d in aud_pairs]
+    names = {"image": [n for n, _ in img_pairs],
+             "video": [n for n, _ in vid_pairs],
+             "audio": [n for n, _ in aud_pairs]}
+    for mname in (mention_names or []):
+        kind, data = _get_asset_by_name(mname)
+        if data is None:
+            continue
+        if kind == "image" and len(ref_images) < 9:
+            ref_images.append(data)
+            names["image"].append(mname)
+        elif kind == "video" and len(ref_videos) < 3:
+            ref_videos.append(data)
+            names["video"].append(mname)
+        elif kind == "audio" and len(ref_audios) < 3:
+            ref_audios.append(data)
+            names["audio"].append(mname)
+    dropped = []
+    while len(ref_images) + len(ref_videos) + len(ref_audios) > 12:
+        if ref_videos:
+            ref_videos.pop()
+            dropped.append(names["video"].pop())
+        elif ref_images:
+            ref_images.pop()
+            dropped.append(names["image"].pop())
+        else:
+            ref_audios.pop()
+            dropped.append(names["audio"].pop())
+    if dropped:
+        _log_once(f"[JZL-素材] ⚠️ 参考总数超过 12 上限 → 已丢弃：{'、'.join(dropped)}"
+                  f"（丢弃优先级：视频 → 图片 → 音频）")
+    return ref_images, ref_videos, ref_audios, names
 
 
 def _match_asset(a, b):
@@ -670,26 +775,142 @@ def _get_asset_by_name(name):
 
 
 def _encode_ref_audio(audio_vae, audio):
-    """复刻官方 ref 音频编码：waveform → 归一化 latent。"""
+    """复刻官方 ref 音频编码：waveform → 归一化 latent。
+
+    重采样走 `comfy.audio.resample`（与官方节点一致）：语义同 torchaudio 的带限 sinc，
+    但不依赖 torchaudio —— 上游已把 torchaudio.functional.resample 换掉，本插件跟随。
+    """
     waveform = audio["waveform"]  # [B, C, L]
     sr = audio["sample_rate"]
     vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
     if sr != vae_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
+        try:
+            waveform = comfy.audio.resample(waveform, sr, vae_sr)
+        except AttributeError:                      # 老版 ComfyUI 没有 comfy.audio.resample
+            waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
     z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
     return z, z.shape[-1]
 
 
+def _vae_kind(vae):
+    """MiniMax H3 有两种 VAE：视觉(MiniMaxH3VideoVAE) / 音频(MiniMaxH3AudioVAE)。
+
+    返回 'video' / 'audio' / 'unknown'（按 first_stage_model 的类名与模块判定）。
+    """
+    try:
+        fsm = getattr(vae, "first_stage_model", None)
+        if fsm is None:
+            return "unknown"
+        mod = f"{type(fsm).__module__ or ''}".lower()
+        name = f"{type(fsm).__name__ or ''}".lower()
+        if "audio" in mod or "audio" in name:
+            return "audio"
+        if "minimax" in mod or "minimax" in name or name.endswith("vae"):
+            return "video"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _vae_type_name(vae):
+    try:
+        return type(getattr(vae, "first_stage_model", vae)).__name__
+    except Exception:
+        return "?"
+
+
+def _assert_vae_roles(vae, audio_vae):
+    """接线自检：视觉/音频 VAE 接错端口时给出可操作报错，而不是晦涩的 unpack 错误。
+
+    真实案例（N 卡用户现场日志确认）：把 checkpoint 加载器的「音频VAE」接到本节点「视觉VAE」口，
+    图像编码于是走到 comfy/ldm/minimax/audio_vae.py 的 encode()（它期望 [B,2,L] 波形张量），
+    抛 `too many values to unpack (expected 3)`，最终表现为「本段未落盘任何视频」。
+    """
+    if vae is not None and _vae_kind(vae) == "audio":
+        raise RuntimeError(
+            f"[接线错误] 「视觉VAE」口接的是**音频 VAE**（{_vae_type_name(vae)}）：\n"
+            f"  图像编码会走音频 VAE，它期望 [B,2,L] 波形张量，所以报 too many values to unpack (expected 3)。\n"
+            f"  修法：把 checkpoint 加载器的「视觉 / 视频 VAE」（MiniMaxH3VideoVAE）接到本节点「视觉VAE」口，\n"
+            f"        把「音频 VAE」（MiniMaxH3AudioVAE）接到「音频VAE」口 —— 两个口不能接反。\n"
+            f"  当前识别：视觉VAE口={_vae_type_name(vae)}，音频VAE口={_vae_type_name(audio_vae) if audio_vae is not None else '未接'}")
+    if audio_vae is not None and _vae_kind(audio_vae) == "video":
+        raise RuntimeError(
+            f"[接线错误] 「音频VAE」口接的是**视觉 VAE**（{_vae_type_name(audio_vae)}）：\n"
+            f"  音频编解码需要音频 VAE（MiniMaxH3AudioVAE）。\n"
+            f"  修法：把「音频 VAE」接到「音频VAE」口，「视觉 VAE」接到「视觉VAE」口 —— 两个口不能接反。\n"
+            f"  当前识别：视觉VAE口={_vae_type_name(vae) if vae is not None else '未接'}，音频VAE口={_vae_type_name(audio_vae)}")
+
+
+def _check_official_drift():
+    """一次性对拍：本包内置的官方 MiniMax H3 辅助函数 vs 用户机器上官方模块的输出。
+
+    本包（nodes.py）为兼容内置了一份官方 helpers。若用户的 ComfyUI 版本改动了这些函数
+    （返回元数 / 画布规则 / 帧数对齐变了），就会出现「只有别人的电脑报错、开发者本机永远复现不了」
+    的怪问题（典型症状就是 `too many values to unpack (expected N)`）。这里直接对拍并明确点名。
+    """
+    if getattr(_check_official_drift, "_done", False):
+        return
+    _check_official_drift._done = True
+    try:
+        from . import nodes as _ours
+        import comfy_extras.nodes_minimax_h3 as _off
+    except Exception:
+        return
+    diffs = []
+    try:
+        for _len in (5, 22, 39, 120, 192):
+            a, b = _ours.temporal_shape(_len), _off.temporal_shape(_len)
+            if tuple(a) != tuple(b):
+                diffs.append(f"temporal_shape({_len}): 本包={tuple(a)} 官方={tuple(b)}")
+    except Exception as e:
+        diffs.append(f"temporal_shape 对拍异常：{type(e).__name__}: {e}")
+    try:
+        for _wh in ((832, 480), (480, 832), (1280, 720)):
+            a, b = _ours.adapt_canvas(*_wh), _off.adapt_canvas(*_wh)
+            if tuple(a) != tuple(b):
+                diffs.append(f"adapt_canvas{_wh}: 本包={tuple(a)} 官方={tuple(b)}")
+    except Exception as e:
+        diffs.append(f"adapt_canvas 对拍异常：{type(e).__name__}: {e}")
+    if diffs:
+        print("[JZL-管理器] ⚠️ 官方 MiniMax H3 代码与「本包内置版本」不一致（ComfyUI 版本漂移）：")
+        for d in diffs[:6]:
+            print(f"[JZL-管理器]    - {d}")
+        print("[JZL-管理器]    这很可能就是「只有别人的电脑报错」的原因，请把这几行连同完整日志回传。")
+
+
 def _encode_ref_to_video(clip, vae, audio_vae, prompt, width, height, length,
                          ref_images=None, ref_videos=None, ref_video_audios=None,
-                         ref_audios=None, ref_image_size="match", ref_scale=1.0):
-    """复刻官方 MiniMaxH3ReferenceToVideo 编码（va2va / ref2va）。"""
+                         ref_audios=None, ref_image_size="match", ref_scale=1.0,
+                         slot_names=None, probe=None):
+    """复刻官方 MiniMaxH3ReferenceToVideo 编码（va2va / ref2va）。
+
+    slot_names/probe：可选，用于回填「真实调用信息」——probe 会被写入
+    {"images": [(槽位名, 0基图序号)], "videos": [(槽位名, <Video N> 的 N)], "audios": [(槽位名, <Audio N> 的 N)]}，
+    记录的是**实际进入编码的项**（被跳过的项不会出现），供调用方打印真实调用结果。
+    """
+    _check_official_drift()
+    _assert_vae_roles(vae, audio_vae)
     latent, frame_count = _empty_av_latent(width, height, length)
+
+    names = slot_names or {}
+    _in_names = list(names.get("image") or [])
+    _vd_names = list(names.get("video") or [])
+    _au_names = list(names.get("audio") or [])
+    if probe is not None:
+        probe.setdefault("images", [])
+        probe.setdefault("videos", [])
+        probe.setdefault("audios", [])
+
+    def _nm(lst, pos):
+        return lst[pos] if 0 <= pos < len(lst) else f"#{pos}"
 
     ref_items = []   # tokenizer 呈现顺序
     ref_blocks = []  # DiT payload 顺序
+    # <Audio N> 编号必须与 tokenizer 的 counters["audio"] 完全一致：视频自带音轨也占一个编号，
+    # 且排在独立音频之前（否则「有视频音轨」分段里独立音频的 N 会偏小，日志与提示词对不上）。
+    _audio_n = 0
 
-    for img in (ref_images or []):
+    for pos, img in enumerate(ref_images or []):
         if img is None:
             continue
         h, w = img.shape[1], img.shape[2]
@@ -703,12 +924,16 @@ def _encode_ref_to_video(clip, vae, audio_vae, prompt, width, height, length,
         z = vae.encode(resized)
         ref_items.append({"type": "image", "data": resized})
         ref_blocks.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "latent": z})
+        if probe is not None:
+            probe["images"].append((_nm(_in_names, pos), len(probe["images"])))
 
-    ref_video_audios = ref_video_audios or []
-    for idx, video_frames in enumerate(ref_videos or []):
+    # 视频未被引用时，视频音轨端口必须彻底关闭：否则音频会被当成「视频音轨」送进音轨通道，
+    # 结果既丢了独立音频参考（ref_audios），又让音轨与并不存在的视频配对。
+    ref_video_audios = (ref_video_audios or []) if (ref_videos and len(ref_videos) > 0) else []
+    for pos, video_frames in enumerate(ref_videos or []):
         if video_frames is None:
             continue
-        soundtrack = ref_video_audios[idx] if idx < len(ref_video_audios) else None
+        soundtrack = ref_video_audios[pos] if pos < len(ref_video_audios) else None
         vh, vw = video_frames.shape[1], video_frames.shape[2]
         cw, ch = adapt_canvas(vw, vh)
         if vw * vh < cw * ch:
@@ -728,6 +953,7 @@ def _encode_ref_to_video(clip, vae, audio_vae, prompt, width, height, length,
         if soundtrack is not None:
             audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
             ref_items.append({"type": "audio"})
+            _audio_n += 1          # 音轨占用一个 <Audio N> 编号
         sample_idx = list(range(0, frames.shape[0], 12))  # FPS//2 = 12 (2fps)
         qwen_frames = frames[sample_idx]
         ref_items.append({"type": "video", "data": qwen_frames,
@@ -735,19 +961,134 @@ def _encode_ref_to_video(clip, vae, audio_vae, prompt, width, height, length,
         ref_blocks.append({"kind": "video_audio" if ref_audio_t else "video",
                            "latent_t": z.shape[2], "latent_h": ch // 16, "latent_w": cw // 16,
                            "ref_audio_t": ref_audio_t, "latent": z, "audio_latent": audio_latent})
+        if probe is not None:
+            probe["videos"].append((_nm(_vd_names, pos), len(probe["videos"]) + 1))
 
-    for audio in (ref_audios or []):
+    for pos, audio in enumerate(ref_audios or []):
         if audio is None:
             continue
         audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, audio)
         ref_items.append({"type": "audio"})
         ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent})
+        _audio_n += 1
+        if probe is not None:
+            probe["audios"].append((_nm(_au_names, pos), _audio_n, _audio_src_desc(audio, ref_audio_t)))
 
     tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
     cond = clip.encode_from_tokens_scheduled(tokens)
     if ref_blocks:
         cond = node_helpers.conditioning_set_values(cond, {"minimax_refs": ref_blocks})
     return cond, latent
+
+
+def _audio_src_desc(audio, ref_audio_t):
+    """音频来源描述：源时长 → 编码出的 latent token 数（证明「确实用了这个文件」）。"""
+    try:
+        sr = int(audio.get("sample_rate") or 0)
+        wf = audio.get("waveform")
+        n = int(wf.shape[-1]) if wf is not None else 0
+        if sr > 0 and n > 0:
+            return f"源 {n / float(sr):.2f}s → {int(ref_audio_t)} token"
+    except Exception:
+        pass
+    return f"{int(ref_audio_t or 0)} token"
+
+
+def _fmt_call_info(probe):
+    """把编码阶段回填的**真实**调用记录格式化为一行：槽位名=image N / Video N / Audio N。
+
+    image N 是 0 基图序号（对应提示词里 <Picture N+1>）；Video/Audio N 即提示词里的
+    <Video N>/<Audio N> 编号。记录来自实际进入编码的项，被跳过/未载入的参考不会出现。
+    """
+    if not probe:
+        return ""
+    parts = []
+
+    def _emit(items, kind):
+        for it in (items or []):
+            it = tuple(it)
+            nm, ix = it[0], it[1]
+            extra = it[2] if len(it) > 2 else None
+            parts.append(f"{nm}={kind} {ix}" + (f"（{extra}）" if extra else ""))
+
+    _emit(probe.get("images"), "image")
+    _emit(probe.get("videos"), "Video")
+    _emit(probe.get("audios"), "Audio")
+    return " 丨 ".join(parts)
+
+
+def _encode_refs(tag, seg_label, clip, vae, audio_vae, prompt, width, height, length,
+                 ref_images, ref_videos, ref_audios, ref_names, ref_scale=1.0, model=None):
+    """ref2va 编码统一入口：编码后打印**真实**调用信息（槽位名=image N / Video N / Audio N）。
+
+    生成路径固定 ref2va（多参考）——不存在 fl2va 首尾帧路径。视频未被引用时，
+    视频与视频音轨端口由 _encode_ref_to_video 强制关闭，音频只会走独立音频端口。
+    """
+    probe = {}
+    cond, latent = _encode_ref_to_video(
+        clip, vae, audio_vae, prompt, width, height, length,
+        ref_images=ref_images, ref_videos=ref_videos,
+        ref_video_audios=[],       # 管理器不产出「视频音轨」；无视频时编码函数会硬关该端口
+        ref_audios=ref_audios,     # 音频素材（角色音色/配乐/念白）都是独立参考音频
+        ref_scale=ref_scale, slot_names=ref_names, probe=probe)
+    info = _fmt_call_info(probe)
+    print(f"[JZL-{tag}] {seg_label}调用信息：{info if info else '（纯文本，无参考素材）'}")
+    if model is not None:
+        _warn_audio_ref_variant(model, bool(ref_audios), tag)
+    return cond, latent
+
+
+def _model_ckpt_name(model):
+    """反查当前加载的 checkpoint 文件名（用于判断 t2va / fl2va / ref2va 变体）。
+
+    ComfyUI 的 load_torch_file 会给每个权重的 storage 打上来源路径
+    （comfy.storage.annotate_state_dict → untyped_storage()._comfy_source_path），
+    这里顺着权重读回来；读不到就返回 None（此时不做变体断言，只给通用提示）。
+    """
+    try:
+        real = getattr(model, "model", model)
+        for i, p in enumerate(real.parameters()):
+            if i > 800:
+                break
+            st = getattr(p, "untyped_storage", None)
+            if st is None:
+                continue
+            path = getattr(st(), "_comfy_source_path", None)
+            if path:
+                return os.path.basename(str(path))
+    except Exception:
+        pass
+    return None
+
+
+def _warn_audio_ref_variant(model, has_audio_refs, tag):
+    """音色参考只有 ref2va 一条通路，这里把「模型变体不匹配」这个静默失败点说出来。
+
+    H3 的 t2va / fl2va / ref2va 是**同一套架构的三个任务变体**（ComfyUI 源码
+    comfy/ldm/minimax/model.py 顶部注明：t2va/fl2va = [text | cond rows | audio | video]，
+    ref2va = [text | reference blocks | audio | video]）。参考**图片**能通过 tokenizer 的
+    视觉嵌入进入文本流，所以在任何变体上都"看起来生效"；而参考**音频**在 tokenizer 里
+    只有一个 `<Audio N>: ` 文本标签、没有任何嵌入，完全依赖 ref2va 的 reference blocks
+    → 加载 fl2va/t2va 变体时音色必然完全无效（且不报错）。故此处点名提示。
+    """
+    if not has_audio_refs:
+        return
+    name = _model_ckpt_name(model) or ""
+    low = name.lower()
+    if low and "ref2va" not in low and ("fl2va" in low or "t2va" in low):
+        try:
+            alts = [n for n in folder_paths.get_filename_list("diffusion_models")
+                    if "ref2va" in n.lower()]
+        except Exception:
+            alts = []
+        hint = ("；磁盘上可用的 ref2va 模型：" + "、".join(alts[:4])) if alts else ""
+        _log_once(f"[JZL-{tag}] ⚠️ 当前加载的模型是「{name}」（fl2va/t2va 变体）→ **不支持参考素材**。"
+                  f"参考音频只有 ref2va 的 reference blocks 一条通路，所以音色会完全无效"
+                  f"（参考图片还能走视觉嵌入，所以看起来正常）。请改用 ref2va 变体模型{hint}")
+    else:
+        _log_once(f"[JZL-{tag}] ℹ️ 音色参考只通过 ref2va 的 reference blocks 生效"
+                  f"（<Audio N> 在文本里只是个标签、没有嵌入）。若音色未生效，"
+                  f"请确认当前加载的是 ref2va 变体模型——fl2va/t2va 会静默忽略参考音频")
 
 
 def _sample_av(model, positive, latent, sample_decode, seed):
@@ -795,6 +1136,219 @@ def _sample_av_custom_sigmas(model, positive, latent, sigmas_text, sampler_name,
 
 
 _JZL_UP_MODEL_INFO = {}
+# 每段都会重算/重复触发的日志 → 同一句只打印一次
+_JZL_LOG_ONCE_SEEN = set()
+
+
+class _JzlQuietSelfLift(logging.Filter):
+    """精简内置 SelfLift 副本的 INFO 日志：只去掉逐行刷屏，保留采样进度与耗时。
+
+    上游一次运行会打十几行 INFO。这里仅屏蔽「每步一行 / 起止重复行 / 毫秒级子项」，
+    保留 `[SelfLift plan]`、`[SelfLift upscaler]`、各阶段 `*_total` 与 `paired_lifts` ——
+    仍能看出本次跑到哪一步、慢在哪个阶段。需要完整日志时设环境变量 SELFLIFT_VERBOSE=1。
+    """
+
+    _MUTE = (
+        "] low_resolution step ",            # 低分辨率每步一行（tqdm 进度条已给出进度）
+        "] high_resolution step ",           # 高分辨率每步一行
+        "] low_resolution start",            # 与 low_resolution total 重复
+        "] high_resolution start",           # 与 high_resolution total 重复
+        "] transition start",                # 与 transition total 重复
+        "] transition prepare_endpoint:",    # 毫秒级子项（已含在 transition total）
+        "] transition correction_and_debug:",
+        "] transition renoise:",
+    )
+
+    def filter(self, record):
+        if record.levelno >= logging.WARNING:
+            return True
+        if os.environ.get("SELFLIFT_VERBOSE", "0") == "1":
+            return True
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if not msg.startswith("[SelfLift "):
+            return True
+        return not any(s in msg for s in self._MUTE)
+
+
+_JZL_FILTER_INSTANCE = _JzlQuietSelfLift()
+_JZL_FILTERED_HANDLERS = set()
+
+
+def _install_log_filters():
+    """把 SelfLift 静音过滤器挂到 root logger 及其 handlers（幂等；每次调用都补挂新出现的 handler）。"""
+    try:
+        root = logging.getLogger()
+        if _JZL_FILTER_INSTANCE not in root.filters:
+            root.addFilter(_JZL_FILTER_INSTANCE)
+        for h in list(root.handlers):
+            if id(h) not in _JZL_FILTERED_HANDLERS:
+                h.addFilter(_JZL_FILTER_INSTANCE)
+                _JZL_FILTERED_HANDLERS.add(id(h))
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SelfLift 采样（内置副本 vendor_selflift，不依赖用户另装 comfyui-SelfLift）
+# ═══════════════════════════════════════════════════════════════
+
+def _sample_av_selflift(model, positive, latent, sample_decode, seed, vae, tag="管理器"):
+    """SelfLift 渐进分辨率采样：低分辨率跑 transition_step 步 → 提升到全分辨率 → 收尾。
+
+    与「SelfLift Progressive Sampler (MiniMax H3)」节点同一份实现（内置副本 vendor_selflift）：
+      · sampler 必须是标准 Euler（SelfLift 复用过渡步的预测，NFE 数不变）
+      · sigmas 由「调度器 + 采样步数」生成（等同 BasicScheduler）
+      · latent_image = 目标分辨率的 H3 AV latent（定义尺寸与时长）
+      · vae = H3 视频 VAE（过渡处像素锚点用；rho=0 时跳过 VAE 往返）
+    """
+    _install_log_filters()   # 屏蔽上游每个阶段/每步的 INFO 刷屏（要完整日志设 SELFLIFT_VERBOSE=1）
+    try:
+        from .vendor_selflift.nodes import SelfLiftH3Sampler
+    except Exception as _e:
+        raise RuntimeError(
+            f"SelfLift 采样不可用：内置副本 vendor_selflift 加载失败（{type(_e).__name__}: {_e}）"
+        ) from _e
+
+    sl = dict((sample_decode or {}).get("selflift") or {})
+    # SelfLift 步数是独立配置（默认 8），与常规采样的 steps 互不干扰
+    steps = int(sl.get("steps") or SELFLIFT_STEPS_DEFAULT)
+    scheduler = (sample_decode or {}).get("scheduler", "simple") or "simple"
+    cfg = float((sample_decode or {}).get("cfg", 1.0) or 1.0)
+    denoise = float((sample_decode or {}).get("denoise", 1.0) or 1.0)
+
+    if steps < 2:
+        raise RuntimeError("SelfLift 采样至少需要 2 步（低分辨率前缀 + 高分辨率收尾）")
+
+    # transition_step 合法区间：[1, 步数-1]（末步必须是高分辨率收尾）
+    ts_raw = int(sl.get("transition_step", 6) or 6)
+    ts = max(1, min(ts_raw, steps - 1))
+    if ts != ts_raw:
+        _log_once(f"[JZL-{tag}] ⚠️ SelfLift 过渡步数 {ts_raw} 超出「采样步数 {steps}」允许范围（1~{steps - 1}）→ 已钳制为 {ts}")
+    if denoise != 1.0:
+        _log_once(f"[JZL-{tag}] ⚠️ SelfLift 采样忽略「降噪系数 {denoise}」（调度由 采样步数+调度器 决定）")
+
+    latent_image = dict(latent or {})
+    sigmas = comfy.samplers.calculate_sigmas(
+        model.get_model_object("model_sampling"), scheduler, steps)
+    sampler = comfy.samplers.sampler_object("euler")   # SelfLift 只接受标准 Euler
+
+    up_raw = str(sl.get("upscaler_model") or "none").strip()
+    if up_raw and up_raw.lower() != "none":
+        # 二级子目录嗅探：用户/旧配置可能只存了文件名或旧路径 → 统一解析成磁盘上真实存在的相对路径
+        _resolved = _resolve_upscaler_entry(up_raw)
+        if _resolved is None:
+            _avail = [e for e in _selflift_upscaler_options() if e != "none"]
+            if _avail:
+                up = _avail[0]
+                _log_once(f"[JZL-{tag}] ⚠️ SelfLift 放大模型「{up_raw}」在磁盘上找不到 → 已自动改用：{up}")
+            else:
+                up = "none"
+                _log_once(f"[JZL-{tag}] ⚠️ SelfLift 放大模型「{up_raw}」找不到，且 models/latent_upscale_models 下没有 H3 放大模型"
+                          f"（含二级子目录）→ 改用 none（nearest 直接提升）")
+        else:
+            _ok, _p, _sz, _why, _fmt = _upscaler_file_check(_resolved)
+            if not _ok:
+                raise RuntimeError(
+                    f"SelfLift 放大模型不可用：{_resolved}\n  路径：{_p or '（解析失败）'}\n"
+                    f"  大小：{_sz} 字节（{_sz / 1048576:.2f} MB）\n  原因：{_why}\n"
+                    f"  可用选项：{_selflift_upscaler_options()}")
+            up = _resolved
+            _JZL_UP_MODEL_INFO.clear()
+            _JZL_UP_MODEL_INFO.update({"name": up, "path": _p, "size": _sz, "bad": False, "why": ""})
+    else:
+        up = "none"
+    rho = float(sl.get("rho", 0.6))
+    # 修正强度上下限：默认值对齐上游 SelfLift 节点（w_min=0.5 / w_max=1.0）
+    w_min, w_max = float(sl.get("w_min", 0.5)), float(sl.get("w_max", 1.0))
+    if rho <= 0.0 and up == "none":
+        raise RuntimeError(
+            "SelfLift 采样参数无效：rho=0 且 放大模型=none 会同时关闭「SelfLift 修正」与「外部 latent 提升」，"
+            "请把 rho 调到 >0（推荐 0.6）或选择一个外部 H3 放大模型")
+    _routes = ("外部 latent 提升" if up != "none" else "nearest 直接提升") + \
+              (" + 像素锚点修正" if (rho > 0.0 and w_max > 0.0) else "")
+    # 「二次采样」在 SelfLift 下无意义（SelfLift 自身即渐进分辨率采样）→ 并进本行说明，不再另占一行
+    _skip2 = "（已跳过二次采样）" if (sample_decode or {}).get("second", {}).get("enabled") else ""
+    print(f"[JZL-{tag}] SelfLift 采样：步数 {steps}（低分辨率 {ts} 步 + 高分辨率 {steps - ts} 步）｜"
+          f"低分辨率缩放 {sl.get('lowres_scale', 0.5)}｜rho {rho}｜权重 {w_min}/{w_max}｜"
+          f"放大模型 {up}｜路径 {_routes}{_skip2}")
+
+    out = SelfLiftH3Sampler().sample(
+        model=model, positive=positive, negative=[], vae=vae, latent_image=latent_image,
+        sampler=sampler, sigmas=sigmas, seed=int(seed), cfg=cfg,
+        transition_step=ts,
+        lowres_scale=float(sl.get("lowres_scale", 0.5)),
+        rho=rho, w_min=w_min, w_max=w_max,
+        upscaler_model=up,
+        highres_tiling=bool(sl.get("highres_tiling", False)),
+        upscaler_unload=bool(sl.get("upscaler_unload", True)),
+    )[0]
+    # SelfLift 节点声明 RETURN_TYPES=("LATENT",)，其 progressive_sample 返回的是
+    # LATENT dict（{"samples": NestedTensor}）；本插件内部统一用 NestedTensor（与 _sample_av 一致），
+    # 否则下游 _decode_av 会把 dict 当张量传给 vae.decode → AttributeError: 'dict' object has no attribute 'shape'
+    if isinstance(out, dict):
+        out = out.get("samples", out)
+    return out
+
+
+def _selflift_mode(sample_decode):
+    """「采样分类」是否为 SelfLift采样。"""
+    return str((sample_decode or {}).get("sample_mode") or SAMPLE_MODE_NORMAL) == SAMPLE_MODE_SELFLIFT
+
+
+def _sample_first_pass(model, positive, latent, sample_decode, seed, vae, tag="管理器"):
+    """一采入口：按「采样分类」分派 常规采样 / SelfLift采样。"""
+    if str((sample_decode or {}).get("sample_mode") or SAMPLE_MODE_NORMAL) == SAMPLE_MODE_SELFLIFT:
+        return _sample_av_selflift(model, positive, latent, sample_decode, seed, vae, tag=tag)
+    return _sample_av(model, positive, latent, sample_decode, seed)
+
+
+def _semantic_bridge_on(manager):
+    """「生成设定 → 语义修正」是否开启（语义桥）。"""
+    return bool(((manager or {}).get("semantic_bridge") or {}).get("enabled"))
+
+
+def _apply_semantic_bridge(positive, manager, tag="管理器"):
+    """语义修正（语义桥）：用内置副本 vendor_semantic_bridge 修正 H3 文本条件 [B,T,5120]。
+
+    与「MiniMax H3 Image to Video + Semantic Bridge」节点同一份实现：
+    hybrid = h + alpha * (student(rms_norm(h)) - h)，按 per_token / global 做幅度匹配。
+    适配器放在 ComfyUI/models/semantic_bridge/（推荐 MiniMaxH3_SemanticBridge_v1.safetensors，alpha=0.10）。
+    """
+    cfg = (manager or {}).get("semantic_bridge") or {}
+    if not cfg.get("enabled"):
+        return positive
+    try:
+        from .vendor_semantic_bridge.nodes import _apply_distilled_bridge, _list_safetensors
+    except Exception as _e:
+        raise RuntimeError(
+            f"语义修正不可用：内置副本 vendor_semantic_bridge 加载失败（{type(_e).__name__}: {_e}）"
+        ) from _e
+
+    adapter = str(cfg.get("adapter") or "").strip()
+    if not adapter:
+        _avail = [a for a in _list_safetensors() if not a.startswith("NO_DISTILLED_ADAPTER_FOUND")]
+        adapter = _avail[0] if _avail else ""
+    if not adapter:
+        raise RuntimeError(
+            "语义修正已开启，但未找到适配器。请把 MiniMaxH3_SemanticBridge_v1.safetensors 放入 "
+            "ComfyUI/models/semantic_bridge/ 后重启，或在「运行参数设置 → 语义修正」里指定适配器文件名")
+    alpha = float(cfg.get("alpha", 0.10))
+    mm = str(cfg.get("magnitude_match") or "per_token")
+    # 内置副本首次加载适配器时会 print("[MiniMax H3 Semantic Bridge] Loaded adapter: …")，
+    # 与下面本插件的日志重复 → 首次调用时把它的 stdout 吃掉（只影响这一次加载，不碰 vendor 源码）
+    if not getattr(_apply_semantic_bridge, "_logged", False):
+        import contextlib as _ctx
+        import io as _io
+        with _ctx.redirect_stdout(_io.StringIO()):
+            out = _apply_distilled_bridge(positive, adapter, alpha, mm)
+        _apply_semantic_bridge._logged = True
+        print(f"[JZL-{tag}] 语义修正（语义桥）：适配器 {adapter}｜alpha {alpha}｜幅度匹配 {mm}")
+    else:
+        out = _apply_distilled_bridge(positive, adapter, alpha, mm)
+    return out
 
 
 def _detect_weight_format(p):
@@ -817,6 +1371,92 @@ def _detect_weight_format(p):
     return ""
 
 
+def _list_upscaler_entries():
+    """latent_upscale_models 下全部权重（**含二级/更深子目录**），返回相对路径列表。
+
+    主路径走 folder_paths.get_filename_list（ComfyUI 自身就是递归的）；万一该版本不递归，
+    这里再按 os.walk 兜底扫盘一次——保证「模型放在 MiniMax-H3\\ 这类二级文件夹里」也能被看到。
+    """
+    _KEY = "latent_upscale_models"
+    _EXT = (".pth", ".safetensors")
+    out = []
+    try:
+        out = [n for n in folder_paths.get_filename_list(_KEY)
+               if os.path.splitext(n)[1].lower() in _EXT]
+    except Exception:
+        out = []
+    if not out:
+        try:
+            bases = folder_paths.get_folder_paths(_KEY)
+        except Exception:
+            bases = [os.path.join(folder_paths.models_dir, _KEY)]
+        seen = set()
+        for _b in bases:
+            for _root, _dirs, _files in os.walk(_b):
+                for _f in _files:
+                    if os.path.splitext(_f)[1].lower() in _EXT:
+                        _rel = os.path.relpath(os.path.join(_root, _f), _b)
+                        if _rel not in seen:
+                            seen.add(_rel)
+                            out.append(_rel)
+        out = sorted(out)
+    return out
+
+
+def _semantic_bridge_adapters():
+    """语义桥可用适配器（models/semantic_bridge/ 下的 .safetensors，含二级子目录）。
+
+    沿用内置副本 vendor_semantic_bridge 的列表口径（与上游节点下拉完全一致），
+    并过滤掉它用于占位的 NO_DISTILLED_ADAPTER_FOUND。
+    """
+    try:
+        from .vendor_semantic_bridge.nodes import _list_safetensors
+        items = list(_list_safetensors())
+    except Exception:
+        items = []
+    return [n for n in items if not str(n).startswith("NO_DISTILLED_ADAPTER_FOUND")]
+
+
+def _resolve_upscaler_entry(name):
+    """把放大模型名解析成「相对路径」——支持只填文件名（自动在子目录里嗅探）。
+
+    依次尝试：① 完整相对路径（含子目录，正/反斜杠都认）→ ② basename 嗅探（同名多个时优先 h3）
+    → ③ basename 部分匹配。返回 None 表示磁盘上确实没有。
+    """
+    name = str(name or "").strip()
+    if not name:
+        return None
+    norm = name.replace("/", os.sep).replace("\\\\", os.sep)
+    entries = _list_upscaler_entries()
+    # ① 完整相对路径
+    for e in entries:
+        if e.replace("/", os.sep) == norm:
+            return e
+    # ② 只给了文件名 → 在子目录里按 basename 嗅探
+    base = os.path.basename(norm).lower()
+    hits = [e for e in entries if os.path.basename(e).lower() == base]
+    if hits:
+        h3 = [e for e in hits if "h3" in e.lower()]
+        return (h3 or hits)[0]
+    # ③ 去掉扩展名后的部分匹配（容忍用户漏写 / 写错扩展名的情况留给后续校验报错）
+    stem = os.path.splitext(base)[0]
+    if stem:
+        part = [e for e in entries if stem in os.path.basename(e).lower()]
+        if part:
+            h3 = [e for e in part if "h3" in e.lower()]
+            return (h3 or part)[0]
+    return None
+
+
+def _selflift_upscaler_options():
+    """SelfLift「放大模型」下拉选项：["none"] + 磁盘上可用的 **H3** 放大模型（含二级子目录）。
+
+    与上游 SelfLift 节点 _upscaler_input() 同一口径：只列名字含 h3 的，避免把 Ltx 等
+    其它架构的放大模型混进来（选中后会在内部报架构不符）。
+    """
+    return ["none"] + [e for e in _list_upscaler_entries() if "h3" in os.path.basename(e).lower()]
+
+
 def _upscaler_file_check(name):
     """校验 latent 放大模型文件能否被官方加载器读取：返回 (ok, abspath, size, reason, fmt)。
 
@@ -827,18 +1467,22 @@ def _upscaler_file_check(name):
     典型坏文件：Git LFS 指针（几十~几百字节）、下载中断的 .pth（zip 结构不完整）
     → torch.load 会报 `PytorchStreamReader failed reading zip archive: failed finding central directory`。
     """
+    # 只填了文件名时先在二级子目录里嗅探出相对路径（否则 get_full_path 会解析不到）
+    _resolved = _resolve_upscaler_entry(name)
+    if _resolved:
+        name = _resolved
     try:
         p = folder_paths.get_full_path("latent_upscale_models", name)
     except Exception:
         p = None
     if not p or not os.path.isfile(p):
-        return (False, str(p or ""), 0, "文件不存在")
+        return (False, str(p or ""), 0, "文件不存在", "")
     try:
         size = os.path.getsize(p)
     except Exception:
         size = 0
     if size < 1024 * 1024:
-        return (False, p, size, f"文件过小（{size} 字节，疑似下载未完成 / Git LFS 指针文件）")
+        return (False, p, size, f"文件过小（{size} 字节，疑似下载未完成 / Git LFS 指针文件）", "")
     low = p.lower()
     _fmt = _detect_weight_format(p)
     _want = "safetensors" if low.endswith(".safetensors") else "zip"
@@ -854,6 +1498,48 @@ def _upscaler_file_check(name):
     return (False, p, size,
             f"内容是 PyTorch zip（.pth）格式，但扩展名是 {_ext}——官方加载器会用 safetensors 读它；"
             f"把它改名为 .pth 即可直接使用", _fmt)
+
+
+def _log_once(msg):
+    """同一条日志只打印一次（二采放大模型解析、解码前清理等每段都会重复触发）。"""
+    if msg in _JZL_LOG_ONCE_SEEN:
+        return
+    _JZL_LOG_ONCE_SEEN.add(msg)
+    print(msg)
+
+
+def _report_save_failure(tag, out_root, out_dir, saved, errors, ctx_lines=()):
+    """落盘 0 个视频时的自检：打印「第一原因 + 报告路径」，并写完整环境报告供用户回传。
+
+    用户报「本段未落盘任何视频」时，控制台这两行 + output/jzl/_诊断/ 下的报告，
+    就能直接看出是「没接 model/CLIP/VAE」还是「没装 ffmpeg / 目录不可写 / 磁盘满」。
+    """
+    first = ""
+    for e in (errors or []):
+        s = str(e).strip()
+        if s:
+            first = s.splitlines()[0][:200]
+            break
+    ctx = [f"节点={tag}", f"落盘目录={out_dir}", f"成功落盘视频数={len(saved)}",
+           f"ffmpeg={_resolve_ffmpeg() or '❌ 未找到'}（{_ffmpeg_reason()}）",
+           f"回退编码器={_pyav_reason()}"]
+    ctx += [str(x) for x in (ctx_lines or [])]
+    if errors:
+        ctx.append(f"本次错误（{len(errors)} 条）：")
+        ctx += [f"  - {str(e)[:400]}" for e in errors[:12]]
+    if _JZL_SEG_TRACEBACKS:
+        ctx.append("分段失败调用栈（最外层失败点在每段最后一行）：")
+        ctx += list(_JZL_SEG_TRACEBACKS)
+        _JZL_SEG_TRACEBACKS.clear()
+    try:
+        from .jzl_env_check import build_report
+        _text, fp = build_report(ctx, out_dir=out_root)
+    except Exception as e:
+        fp = f"（自检报告生成失败：{type(e).__name__}: {e}）"
+    if first:
+        print(f"[JZL-{tag}] ❗落盘失败原因：{first}")
+    print(f"[JZL-{tag}] ❗环境自检报告（请把该文件发回，或运行 jzl_diagnose.py）：{fp}")
+    return fp
 
 
 def _resolve_upscaler_model(precision="fp32", explicit_model=""):
@@ -889,9 +1575,9 @@ def _resolve_upscaler_model(precision="fp32", explicit_model=""):
     if exp and "minimax_h3_latent_upscaler_3d" not in exp:
         _ok, _p, _sz, _why, _fmt = _upscaler_file_check(exp)
         if _ok:
-            print(f"[JZL-管理器] 二采放大模型（自定义）：{exp}（{_p}，{_sz / 1048576:.1f} MB）")
+            _log_once(f"[JZL-管理器] 二采放大模型：{exp}（自定义，{_sz / 1048576:.1f} MB）")
         else:
-            print(f"[JZL-管理器] ⚠️ 二采放大模型（自定义）{exp} 校验未通过：{_why} → {_p}")
+            _log_once(f"[JZL-管理器] ⚠️ 二采放大模型（自定义）{exp} 校验未通过：{_why}")
         _JZL_UP_MODEL_INFO.clear()
         _JZL_UP_MODEL_INFO.update({"name": exp, "path": _p, "size": _sz, "bad": not _ok, "why": _why})
         return exp
@@ -909,91 +1595,177 @@ def _resolve_upscaler_model(precision="fp32", explicit_model=""):
     for c in cands:
         _ok, _p, _sz, _why, _fmt = _upscaler_file_check(c)
         if _ok:
-            print(f"[JZL-管理器] 二采放大模型：{c}（{_p}，{_sz / 1048576:.1f} MB）")
+            _log_once(f"[JZL-管理器] 二采放大模型：{c}（{_sz / 1048576:.1f} MB）")
             if exp and c != exp:
-                print(f"[JZL-管理器] 指定的放大模型 {exp} 不可用，已自动改用：{c}")
+                _log_once(f"[JZL-管理器] 指定的放大模型 {exp} 不可用，已自动改用：{c}")
             elif (not exp) and (_key not in os.path.basename(c)):
-                print(f"[JZL-管理器] 未找到 minimax_h3_latent_upscaler_3d_{prec} 权重，自动改用磁盘现有模型：{c}（精度参数 {prec} 仍生效）")
+                _log_once(f"[JZL-管理器] 未找到 minimax_h3_latent_upscaler_3d_{prec} 权重，自动改用磁盘现有模型：{c}")
             _JZL_UP_MODEL_INFO.clear()
             _JZL_UP_MODEL_INFO.update({"name": c, "path": _p, "size": _sz, "bad": False, "why": ""})
             return c
         if _fmt:
             _fmt_mismatch.append((c, _p, _sz, _why))
         _bad.append((c, _p, _sz, _why))
-        print(f"[JZL-管理器] 跳过不可用的放大模型候选：{c} → {_p or '路径解析失败'}"
-              f"（{_sz} 字节）: {_why}")
+        _log_once(f"[JZL-管理器] 跳过不可用的放大模型候选：{c} → {_p or '路径解析失败'}"
+                f"（{_sz} 字节）: {_why}")
 
     if _fmt_mismatch:
         _c, _p2, _sz2, _why2 = _fmt_mismatch[0]
-        print(f"[JZL-管理器] ⚠️ 放大权重扩展名与内容不符：{_c} → {_p2}（{_sz2} 字节）")
-        print(f"[JZL-管理器]    {_why2}")
+        _log_once(f"[JZL-管理器] ⚠️ 放大权重扩展名与内容不符：{_c} → {_p2}（{_sz2} 字节）")
+        _log_once(f"[JZL-管理器]    {_why2}")
         _JZL_UP_MODEL_INFO.clear()
         _JZL_UP_MODEL_INFO.update({"name": _c, "path": _p2, "size": _sz2, "bad": True, "why": _why2})
         return _c
 
     if _bad:
-        print(f"[JZL-管理器] ⚠️ 放大模型候选全部不可用（共 {len(_bad)} 个）：")
+        _log_once(f"[JZL-管理器] ⚠️ 放大模型候选全部不可用（共 {len(_bad)} 个）：")
         for c, p, sz, why in _bad[:6]:
-            print(f"[JZL-管理器]    - {c} → {p or '路径解析失败'}（{sz} 字节）: {why}")
-        print("[JZL-管理器]    请重新下载权重放入 ComfyUI/models/latent_upscale_models/"
-              "（官方三套精度：fp32.pth / fp16.safetensors / bf16.safetensors）")
+            _log_once(f"[JZL-管理器]    - {c} → {p or '路径解析失败'}（{sz} 字节）: {why}")
+        _log_once("[JZL-管理器]    请重新下载权重放入 ComfyUI/models/latent_upscale_models/"
+                "（官方三套精度：fp32.pth / fp16.safetensors / bf16.safetensors）")
         _JZL_UP_MODEL_INFO.clear()
         _JZL_UP_MODEL_INFO.update({"name": _bad[0][0], "path": _bad[0][1], "size": _bad[0][2],
                                    "bad": True, "why": _bad[0][3]})
         return _bad[0][0]
 
     _ext = ".pth" if prec == "fp32" else ".safetensors"
-    print(f"[JZL-管理器] 警告: latent_upscale_models 目录没有 minimax_h3_latent_upscaler_3d 模型, 请先下载 {prec} 精度权重放入 ComfyUI/models/latent_upscale_models/")
+    _log_once(f"[JZL-管理器] 警告: latent_upscale_models 目录没有 minimax_h3_latent_upscaler_3d 模型, "
+            f"请先下载 {prec} 精度权重放入 ComfyUI/models/latent_upscale_models/")
     return f"minimax_h3_latent_upscaler_3d_{prec}{_ext}"
 
 
 def _import_upscaler_3d():
-    """动态导入 MinimaxH3LatentUpscaler3D（兼容不同安装目录名）。
+    """获取 MinimaxH3LatentUpscaler3D 类（二采 latent 放大用）。
 
-    云机与本地 custom node 目录名可能不一致（例如带连字符的目录无法用 import 语句导入），
-    依次尝试：标准模块名 → 常见变体 → 扫描 custom_nodes 目录按文件路径加载。
+    查找顺序（越靠前越确定）：
+      ① 本插件**内置副本**（`jzl_h3_latent_upscaler_3d.py`）——用户无需另装该节点包，
+         行为不受用户环境影响，也彻底避免「多份同名副本」问题；
+      ② ComfyUI 全局注册表（用户自装的该节点，若已成功加载）——兜底，尊重用户装的那份；
+      ③ 扫 custom_nodes 下**所有**同名副本逐个尝试（包路径 / 裸模块名 / 按文件加载）。
+         旧版找到第一个就 break：一旦那份额外副本无法独立加载（例如内部用相对导入，
+         只有作为自己插件包的一员才成立），就会跳过后面能用的副本、误报「没安装」；
+      ④ 全部失败时，把「每份副本为何失败」汇总进报错，避免误导排查方向。
+
+    内置副本仅用于内部调用，**不导出**它的 NODE_CLASS_MAPPINGS（不会与用户自装的同名节点重复注册）。
+    来源与协议见 THIRD_PARTY_NOTICES.md（MIT, Copyright (c) 2026 LBH-123-AI）。
     """
     import importlib.util
     import sys as _sys
-    # 1) 常见模块名
-    for _modname in (
-        "Comfyui_Minimax_h3_latent_Upscaler.nodes.minimax_h3_latent_upscaler_3d",
-        "ComfyUI_Minimax_h3_latent_Upscaler.nodes.minimax_h3_latent_upscaler_3d",
-    ):
-        try:
-            _m = importlib.import_module(_modname)
-            if hasattr(_m, "MinimaxH3LatentUpscaler3D"):
-                return getattr(_m, "MinimaxH3LatentUpscaler3D")
-        except Exception:
-            pass
-    # 2) 扫描 custom_nodes 目录，找到 minimax_h3_latent_upscaler_3d.py 按文件加载
+
+    # 1) 内置副本（首选）
     try:
-        _base = os.path.abspath(getattr(folder_paths, "base_path", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        from .jzl_h3_latent_upscaler_3d import MinimaxH3LatentUpscaler3D as _VENDORED
+        return _VENDORED
+    except Exception as _ev:
+        _vendor_err = f"{type(_ev).__name__}: {_ev}"
+        try:
+            _vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jzl_h3_latent_upscaler_3d.py")
+            _vspec = importlib.util.spec_from_file_location("_jzl_vendored_up3d", _vf)
+            _vmod = importlib.util.module_from_spec(_vspec)
+            _vspec.loader.exec_module(_vmod)
+            return _vmod.MinimaxH3LatentUpscaler3D
+        except Exception as _ev2:
+            _vendor_err += f"；按文件加载 → {type(_ev2).__name__}: {_ev2}"
+
+    # 2) ComfyUI 全局注册表（用户自装的那份）
+    try:
+        from nodes import NODE_CLASS_MAPPINGS as _GLOBAL_MAP
+        _cls = _GLOBAL_MAP.get("MinimaxH3LatentUpscaler3D")
+        if _cls is not None:
+            return _cls
+    except Exception as _e:
+        _global_err = f"{type(_e).__name__}: {_e}"
+    else:
+        _global_err = "未注册（该插件可能加载失败）"
+
+    # 3) 收集 custom_nodes 下所有同名副本
+    _cands = []
+    _cn = ""
+    try:
+        _base = os.path.abspath(getattr(
+            folder_paths, "base_path", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
         _cn = os.path.join(_base, "custom_nodes")
-        _found = None
         if os.path.isdir(_cn):
             for _root, _dirs, _files in os.walk(_cn):
                 if "minimax_h3_latent_upscaler_3d.py" in _files:
-                    _found = os.path.join(_root, "minimax_h3_latent_upscaler_3d.py")
-                    break
-        if _found:
-            _pdir = os.path.dirname(_found)
-            if _pdir not in _sys.path:
+                    _cands.append(os.path.join(_root, "minimax_h3_latent_upscaler_3d.py"))
+    except Exception:
+        _cands, _cn = [], ""
+
+    _fails = []
+    for _f in _cands:
+        _why = []
+        _mod = None
+
+        # 3a) 包路径导入（把 custom_nodes 当包根；连字符目录名会被跳过）
+        _parts = os.path.relpath(_f, _cn).replace(os.sep, "/").split("/")
+        _parts[-1] = _parts[-1][:-3] if _parts[-1].endswith(".py") else _parts[-1]
+        if all(_p.isidentifier() for _p in _parts):
+            _ins = _cn not in _sys.path
+            if _ins:
+                _sys.path.insert(0, _cn)
+            try:
+                _mod = importlib.import_module(".".join(_parts))
+            except Exception as _e:
+                _why.append(f"包路径 {'.'.join(_parts)} → {type(_e).__name__}: {_e}")
+            finally:
+                if _ins:
+                    try:
+                        _sys.path.remove(_cn)
+                    except ValueError:
+                        pass
+        else:
+            _why.append(f"目录名不可作包名（{_parts[0]}），跳过包路径导入")
+
+        # 3b) 裸模块名 / 按文件加载（不复用别的副本已缓存的同名模块）
+        if _mod is None or not hasattr(_mod, "MinimaxH3LatentUpscaler3D"):
+            _cached = _sys.modules.get("minimax_h3_latent_upscaler_3d")
+            if _cached is not None and os.path.abspath(getattr(_cached, "__file__", "") or "") != os.path.abspath(_f):
+                _sys.modules.pop("minimax_h3_latent_upscaler_3d", None)
+            _pdir = os.path.dirname(_f)
+            _ins = _pdir not in _sys.path
+            if _ins:
                 _sys.path.insert(0, _pdir)
             try:
                 _mod = importlib.import_module("minimax_h3_latent_upscaler_3d")
-            except Exception:
-                _spec = importlib.util.spec_from_file_location("_jzl_upscaler_3d", _found)
-                _mod = importlib.util.module_from_spec(_spec)
-                _spec.loader.exec_module(_mod)
-            if hasattr(_mod, "MinimaxH3LatentUpscaler3D"):
-                return getattr(_mod, "MinimaxH3LatentUpscaler3D")
-    except Exception:
-        pass
-    raise RuntimeError("缺少「Minimax H3 Latent Upscaler (3D)」自定义节点（Comfyui_Minimax_h3_latent_Upscaler），请先在 custom_nodes 安装")
+            except Exception as _e:
+                _why.append(f"裸模块名 → {type(_e).__name__}: {_e}")
+                try:
+                    _spec = importlib.util.spec_from_file_location("_jzl_upscaler_3d", _f)
+                    _m2 = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_m2)
+                    _mod = _m2
+                except Exception as _e2:
+                    _why.append(f"按文件加载 → {type(_e2).__name__}: {_e2}")
+                    _mod = None
+            finally:
+                if _ins:
+                    try:
+                        _sys.path.remove(_pdir)
+                    except ValueError:
+                        pass
+
+        if _mod is not None and hasattr(_mod, "MinimaxH3LatentUpscaler3D"):
+            return getattr(_mod, "MinimaxH3LatentUpscaler3D")
+        _fails.append((_f, "；".join(_why) or "模块内没有 MinimaxH3LatentUpscaler3D 类"))
+
+    # 4) 全部失败：给出可诊断的报错（不再让用户猜「到底装没装」）
+    _msg = ("缺少「Minimax H3 Latent Upscaler (3D)」自定义节点"
+            "（Comfyui_Minimax_h3_latent_Upscaler），请先在 custom_nodes 安装")
+    _msg += f"\n  [JZL诊断] 插件内置副本：{_vendor_err}"
+    _msg += f"\n  [JZL诊断] 全局注册表：{_global_err}"
+    if _fails:
+        _msg += f"\n  [JZL诊断] 磁盘上找到 {len(_fails)} 份同名副本，但都无法加载："
+        for _p, _r in _fails[:5]:
+            _msg += f"\n    - {_p}\n        {_r}"
+        _msg += ("\n    说明节点其实已安装，只是这份副本无法被独立加载（常见于多装了一份第三方副本）。"
+                 "建议删除多余的同名副本、只保留官方 Comfyui_Minimax_h3_latent_Upscaler 后重启 ComfyUI。")
+    elif not _cands:
+        _msg += "\n  [JZL诊断] custom_nodes 下没有找到 minimax_h3_latent_upscaler_3d.py。"
+    raise RuntimeError(_msg)
 
 
-def _run_second_sampling(model, positive, samples, sample_decode, second, upscale_scale, seed):
+def _run_second_sampling(model, positive, samples, sample_decode, second, upscale_scale, seed, tag="管理器"):
     """复刻 1180 二采链路：一采 latent → LTXV分离音视频 → 视频latent放大(MinimaxH3LatentUpscaler3D)
     → LTXVConcatAVLatent 合并 → 按二采参数再次采样。
 
@@ -1058,7 +1830,7 @@ def _run_second_sampling(model, positive, samples, sample_decode, second, upscal
     # 2.5) ♾️ 无限时长衔接：二采画布被放大，而 positive 里的 keyframe 引导 latent 取自「一采画布」
     #      → PackedLayout 按二采画布算 cond 行数、引导 latent 按自己 h/w 排行 → 行数不匹配必崩。
     #      此处把引导 latent 对齐到二采画布（尺寸一致时是空操作，纯 ref2va 无 keyframe 时也是空操作）。
-    positive = _seam_fit_guides_to_canvas(positive, up_latent)
+    positive = _seam_fit_guides_to_canvas(positive, up_latent, tag=tag)
 
     # 3) 合并音视频潜空间
     merged = LTXVConcatAVLatent.execute(up_latent, audio_latent).args[0]
@@ -1066,9 +1838,10 @@ def _run_second_sampling(model, positive, samples, sample_decode, second, upscal
     # 4) 二次采样：与一采共用 positive（ref2va 参考不受输出分辨率绑定；种子与一采共享，cfg 沿用一采）
     #    Sigmas 模式：scheduler=调度器+步数+降噪；custom=直接用自定义 sigmas 序列（对齐 1190 ManualSigmas→sample_custom）
     cfg = float(sample_decode.get("cfg", 1.0) or 1.0)
+    _model2 = _maybe_wrap_tiling(model, second, up_latent, audio_latent, tag=tag)
     if (second.get("sigmas_mode") or "scheduler") == "custom":
         return _sample_av_custom_sigmas(
-            model, positive, merged,
+            _model2, positive, merged,
             second.get("custom_sigmas") or "0.8500, 0.6316, 0.3158, 0.0000",
             second.get("sampler") or "euler", seed, cfg)
     second_sd = dict(sample_decode or {})
@@ -1076,7 +1849,35 @@ def _run_second_sampling(model, positive, samples, sample_decode, second, upscal
     second_sd["scheduler"] = second.get("scheduler") or "simple"
     second_sd["steps"] = int(second.get("steps", 3) or 3)
     second_sd["denoise"] = float(second.get("denoise", 0.3) or 0.3)
-    return _sample_av(model, positive, merged, second_sd, seed)
+    return _sample_av(_model2, positive, merged, second_sd, seed)
+
+
+def _maybe_wrap_tiling(model, second, up_latent, audio_latent, tag="管理器"):
+    """二采空间分块：按配置给 model 包一层「前向内切块 + 升余弦融合」（省显存）。
+
+    只在二采生效（一采保持整画布）；放大环节不变 —— 分块解决的是「放大后画布太大采不动」。
+    返回可能被包装过的 model；任何异常都退回原 model（宁可慢也不要跑不起来）。
+    """
+    mode = str((second or {}).get("tiling") or "关闭")
+    if mode == "关闭":
+        return model
+    try:
+        from . import jzl_tiling as _tiling
+    except Exception as e:
+        print(f"[JZL-{tag}] ⚠️ 空间分块模块加载失败，本次按整画布二采：{type(e).__name__}: {e}")
+        return model
+    try:
+        v = up_latent["samples"] if isinstance(up_latent, dict) else up_latent
+        a = audio_latent["samples"] if isinstance(audio_latent, dict) else audio_latent
+        if v is None or a is None:
+            return model
+        overlap_px = int((second or {}).get("tiling_overlap", 128) or 0)
+        tiles = int((second or {}).get("tiling_tiles", 2) or 2) if mode == "手动" else 0
+        return _tiling.wrap_model(model, (tuple(int(x) for x in v.shape), tuple(int(x) for x in a.shape)),
+                                  tiles=tiles, overlap_px=overlap_px, tag=tag)
+    except Exception as e:
+        print(f"[JZL-{tag}] ⚠️ 空间分块初始化失败，本次按整画布二采：{type(e).__name__}: {e}")
+        return model
 
 
 def _clean_cache():
@@ -1098,8 +1899,11 @@ def _clean_cache():
         print(f"[JZL-管理器] 显存清理失败：{e}")
 
 
-def _cleanup_vram(level="卸载显存模型"):
-    """全量显存清理（复刻 XB-BOX VAE解码 的 L2：卸载显存模型），生成结束后统一调用。"""
+def _cleanup_vram(level="卸载显存模型", tag="管理器", label="显存清理完成（卸载显存模型）"):
+    """全量显存清理（对齐 XB-BOX「VAE解码（原版优化）」的 L2：unload_all_models 把模型退回内存）。
+
+    label：日志文案——解码前用「解码前卸载显存模型…」，生成结束用默认文案。
+    """
     if level != "卸载显存模型":
         return
     try:
@@ -1111,8 +1915,9 @@ def _cleanup_vram(level="卸载显存模型"):
             torch.cuda.empty_cache()
         import gc
         gc.collect()
+        print(f"[JZL-{tag}] {label}")
     except Exception as e:
-        print(f"[JZL-管理器] 显存清理失败：{e}")
+        print(f"[JZL-{tag}] 显存清理失败：{e}")
 
 
 def _gpu_diag_hint():
@@ -1143,6 +1948,46 @@ def _attention_diag_hint(err_text=""):
             "    ① 工作流里若用了「Model Attention Backend」节点，把 backend 选为 \"pytorch attention\"（推荐）；\n"
             "    ② 启动 ComfyUI 时加参数 --use-pytorch-cross-attention；\n"
             "    ③ 卸载 xformers（pip uninstall xformers）。")
+
+
+def _oom_diag_hint(err_text="", sample_decode=None, width=0, height=0, length=0):
+    """显存不足（OOM）时的专项提示；不命中返回空串。
+
+    关键事实（本插件的日志实测）：一次前向的 MLP 激活 ≈ token 数 × ffn_hidden(14336) × 4B。
+    H3 高分辨率阶段的 token 数 ≈ (帧数/17)*... 见 _packed_token_estimate：
+    1664×928 × 294 帧 → 视频 131196 行 + 参考/衔接 ≈ 1.5 万行 → 单个激活缓冲就 8 GiB。
+    所以「采样步数」几乎不影响占用，**画布面积 × 时长** 才是决定项；SelfLift 的
+    「高分辨率分块」正是按空间切块来压低这个 token 数。
+    """
+    t = str(err_text or "")
+    if ("out of memory" not in t.lower()) and ("OutOfMemoryError" not in t) and ("would exceed allowed memory" not in t):
+        return ""
+    tips = [f"\n  [JZL提示] 显存不足（OOM）：本次画布约 {int(width)}x{int(height)}、{int(length)} 帧"
+            f"，参考/衔接条件 token 会额外叠加。"]
+    items = []
+    if sample_decode and _selflift_mode(sample_decode):
+        sl = (sample_decode or {}).get("selflift") or {}
+        if not sl.get("highres_tiling", False):
+            items.append("【最有效】勾选「🎭 采样解码设置 → SelfLift 采样 → 高分辨率分块」："
+                         "它把高分辨率阶段按空间切块，token 数与单块面积成正比，能直接把峰值降下来"
+                         "（日志会打印 `[SelfLift tiling plan] tiles=N`）。")
+        else:
+            items.append("「高分辨率分块」已开启 → 可把「采样步数」里的**低分辨率步数**调小"
+                         "（低分辨率阶段同样占显存），或再降画布/时长。")
+        items.append(f"降低「每段视频时长」或「百万像素」：占用 ≈ 画布面积 × 时长，"
+                     f"当前 {int(length)} 帧偏长（124 帧只有它的 42%）。")
+        if sl.get("transition_step"):
+            items.append("段间衔接的引导 keyframe 也会占用条件 token → 把「无限时长衔接 → 窗口」"
+                         "调小（如 22 → 5）可省一部分。")
+    else:
+        items.append("降低「每段视频时长」或「百万像素」（占用 ≈ 画布面积 × 时长）。")
+        items.append("若开了二次采样，勾选「二次采样 → 空间分块 = 自动」，让二采按块采样。")
+    items.append("加环境变量 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 可显著减少碎片导致的 OOM"
+                 "（你的日志里出现过「已分配 6.25 GiB 但仅剩 0.43 GiB 空闲」，是典型碎片特征）。")
+    _marks = "①②③④⑤⑥⑦⑧⑨"
+    for k, it in enumerate(items):
+        tips.append(f"\n    {_marks[k] if k < len(_marks) else str(k + 1)} {it}")
+    return "".join(tips)
 
 
 def _ensure_safe_attention(model=None, tag="管理器"):
@@ -1197,10 +2042,14 @@ def _ensure_safe_attention(model=None, tag="管理器"):
 
 
 _JZL_SEG_ERR_SEEN = {}
+_JZL_SEG_TRACEBACKS = []   # 本次运行的分段失败调用栈（写入自检报告，便于远程定位具体失败行）
 
+def _log_seg_error(tag, idx, err, tb=None):
+    """分段失败日志：同一原因只详列一次（避免多段重复刷屏）；首次附带调用栈。
 
-def _log_seg_error(tag, idx, err):
-    """分段失败日志：同一原因只详列一次（避免多段重复刷屏）。"""
+    ⚠️ 必须带调用栈：像 `too many values to unpack (expected 3)` 这种错误，
+    只有 traceback 才能指出是哪一行（本包 / ComfyUI / 第三方节点）——否则只能靠猜。
+    """
     try:
         key = f"{tag}|{str(err)[:180]}"
         prev = _JZL_SEG_ERR_SEEN.get(key)
@@ -1209,19 +2058,39 @@ def _log_seg_error(tag, idx, err):
         else:
             _JZL_SEG_ERR_SEEN[key] = idx
             print(f"[JZL-{tag}] 第{idx}段生成失败：{err}")
+            if tb:
+                print(f"[JZL-{tag}] 第{idx}段调用栈（最外层失败点在最后一行，请把这几行一起发回）：")
+                for _ln in str(tb).rstrip().splitlines()[-14:]:
+                    print(f"[JZL-{tag}]   {_ln}")
     except Exception:
         print(f"[JZL-{tag}] 第{idx}段生成失败：{err}")
 
 
-def _decode_av(vae, audio_vae, samples, sample_decode=None):
+def _seg_fail_context(idx, tb):
+    """记录分段失败的完整调用栈（自检报告用；每次运行最多留 6 条）。"""
+    try:
+        txt = f"── 第{idx}段 ──\n{str(tb).rstrip()}"
+        if len(_JZL_SEG_TRACEBACKS) < 6:
+            _JZL_SEG_TRACEBACKS.append(txt)
+        return txt
+    except Exception:
+        return ""
+
+
+def _decode_av(vae, audio_vae, samples, sample_decode=None, tag="管理器"):
     """NestedTensor latent → (IMAGE [T,H,W,C], AUDIO dict|None)。
 
-    解码前做轻量缓存清理（不卸载模型，避免分段间重载导致日志刷屏/变慢）；
-    「卸载显存模型」的全量卸载在生成结束后统一执行。日志风格对齐 XB-BOX VAE解码。
+    「解码前清理=卸载显存模型」时完全对齐 XB-BOX「VAE解码（原版优化）」：解码前先
+    unload_all_models 把采样模型退回内存（制造显存真空区），再解码，显存峰值最低；
+    代价是下一段采样需要把模型搬回显存（分段越多越慢，日志会显示重载）。
+    未开启时不做卸载（分段间另有 _clean_cache 轻量清理）。
     """
     if (sample_decode or {}).get("decode_cleanup") == "卸载显存模型":
-        print("[JZL-管理器] 🧹 解码前清理（卸载显存模型）...")
-        _clean_cache()
+        _cleanup_vram("卸载显存模型", tag=tag,
+                      label="解码前卸载显存模型")
+    _assert_vae_roles(vae, audio_vae)
+    if isinstance(samples, dict):        # 兼容 LATENT dict（SelfLift 等节点返回的就是这种）
+        samples = samples.get("samples", samples)
     if getattr(samples, "is_nested", False):
         tensors = samples.tensors
         video_z = tensors[0]
@@ -1236,9 +2105,12 @@ def _decode_av(vae, audio_vae, samples, sample_decode=None):
 
     audio = None
     if audio_z is not None:
-        waveform = audio_vae.first_stage_model.decode(audio_z)  # [B, 2, L]
-        audio = {"waveform": waveform, "sample_rate": getattr(audio_vae, "audio_sample_rate", 32000)}
-    print("[JZL-管理器] ✅ 解码完成（XB-BOX - VAE解码（原版优化））")
+        if audio_vae is None:
+            # 采样结果含音频潜空间但没接「音频VAE」→ 只解码视频，别在这里崩掉整段
+            _log_once(f"[JZL-{tag}] ⚠️ 本段含音频潜空间但未连接「音频VAE」→ 只解码视频（该段无声）")
+        else:
+            waveform = audio_vae.first_stage_model.decode(audio_z)  # [B, 2, L]
+            audio = {"waveform": waveform, "sample_rate": getattr(audio_vae, "audio_sample_rate", 32000)}
     return image, audio
 
 
@@ -1621,7 +2493,7 @@ def _seam_trim_audio_frames(audio, drop_frames, keep_frames, fps=VIDEO_FPS):
     return audio
 
 
-def _seam_trim_decoded(image, audio, plan, fps=VIDEO_FPS, settle_frames=0, trim_audio=True):
+def _seam_trim_decoded(image, audio, plan, fps=VIDEO_FPS, settle_frames=0, trim_audio=True, tag="无限时长"):
     """【默认路径】像素/波形域裁切：latent 完全不裁，解码后再丢掉段首 window 帧 + 过渡帧。
 
     为什么必须像素域裁（官方源码事实）：MiniMax H3 视频 VAE 解码按时序分块——tokens_chunk_size=5，
@@ -1648,13 +2520,13 @@ def _seam_trim_decoded(image, audio, plan, fps=VIDEO_FPS, settle_frames=0, trim_
     if image is not None:
         frames = int(image.shape[0])
         if drop >= frames:  # 段长装不下丢弃量：钳制为「至少保留 1 帧」，避免落盘 0 帧空视频
-            print(f"[JZL-无限时长] ⚠️ 衔接丢弃量 {drop} 帧 ≥ 本段解码帧数 {frames}：钳制为丢 {max(0, frames - 1)} 帧"
+            print(f"[JZL-{tag}] ⚠️ 衔接丢弃量 {drop} 帧 ≥ 本段解码帧数 {frames}：钳制为丢 {max(0, frames - 1)} 帧"
                   f"（请调小「衔接窗口 / 过渡丢弃帧数」）")
             drop = max(0, frames - 1)
         if drop > 0:
             image = image[drop:]
     if not trim_audio:
-        print(f"[JZL-无限时长] ⚠️ 「音频同步裁剪」已关闭：画面丢 {drop} 帧而音频不裁 → 音画错位 "
+        print(f"[JZL-{tag}] ⚠️ 「音频同步裁剪」已关闭：画面丢 {drop} 帧而音频不裁 → 音画错位 "
               f"{drop / fps:.3f}s（仅作对比实验，正式生成请保持开启）")
         return image, audio
     keep = int(image.shape[0]) if image is not None else 0
@@ -1685,7 +2557,7 @@ def _seam_video_tensor(obj):
     return obj
 
 
-def _seam_fit_guides_to_canvas(positive, target_video):
+def _seam_fit_guides_to_canvas(positive, target_video, tag="无限时长"):
     """把 positive 里 keyframe 引导 latent 的空间尺寸对齐到「本次采样目标画布」。
 
     为什么必须做（官方源码事实）：PackedLayout 组装序列时，keyframe 的视频 cond 行**按目标画布**
@@ -1724,23 +2596,166 @@ def _seam_fit_guides_to_canvas(positive, target_video):
             nk["latent"] = zf
             out_kfs.append(nk)
             changed = True
-            print(f"[JZL-无限时长] 引导 latent 画布对齐：{int(z.shape[-2])}x{int(z.shape[-1])} → {th}x{tw}"
+            print(f"[JZL-{tag}] 引导 latent 画布对齐：{int(z.shape[-2])}x{int(z.shape[-1])} → {th}x{tw}"
                   f"（{int(z.shape[2])} token，时间轴不变）")
         if not changed:
             return positive
         return node_helpers.conditioning_set_values(positive, {"minimax_keyframes": out_kfs})
     except Exception as e:
-        print(f"[JZL-无限时长] ⚠️ 引导 latent 画布对齐失败（按原样继续）：{e}")
+        print(f"[JZL-{tag}] ⚠️ 引导 latent 画布对齐失败（按原样继续）：{e}")
         return positive
 
 
-def _ffmpeg_bin():
-    """返回可用的 ffmpeg 可执行文件路径（优先 imageio_ffmpeg 自带的，回退 PATH 中的 ffmpeg）。"""
+_FFMPEG_CACHE = {"probed": False, "path": None, "reason": ""}
+
+
+def _find_ffmpeg_executable():
+    """ffmpeg 可执行文件候选：imageio-ffmpeg 自带 → PATH → 常见安装目录。返回 (路径|None, 说明)。"""
+    tried = []
     try:
         import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        if p and os.path.isfile(p):
+            return p, f"imageio-ffmpeg 自带（{p}）"
+        tried.append(f"imageio-ffmpeg 返回的路径不存在（{p}）")
+    except Exception as e:
+        tried.append(f"未安装 imageio-ffmpeg（{type(e).__name__}）")
+
+    p = shutil.which("ffmpeg")
+    if p:
+        return p, f"PATH 中的 ffmpeg（{p}）"
+    tried.append("PATH 中没有 ffmpeg")
+
+    for c in (r"C:\ffmpeg\bin\ffmpeg.exe", r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+              r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+              os.path.expanduser(r"~\scoop\apps\ffmpeg\current\bin\ffmpeg.exe"),
+              "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"):
+        if os.path.isfile(c):
+            return c, f"常见安装目录（{c}）"
+    tried.append("常见安装目录也没有 ffmpeg.exe")
+    return None, "；".join(tried)
+
+
+def _resolve_ffmpeg():
+    """解析可用的 ffmpeg 可执行文件（进程内缓存一次）。
+
+    ⚠️ 用户机常见故障：ComfyUI 官方依赖只装 PyAV(av)、不装 imageio-ffmpeg，
+    而 ffmpeg 又不在 PATH → 旧代码回退成字符串 "ffmpeg" 交给子进程，直接
+    「[WinError 2] 系统找不到指定的文件」，逐段落盘全失败（表现为「本段未落盘任何视频」）。
+    因此这里找不到就明确返回 None，由调用方改用 PyAV 落盘。
+    """
+    if _FFMPEG_CACHE["probed"]:
+        return _FFMPEG_CACHE["path"]
+    _FFMPEG_CACHE["probed"] = True
+    path, reason = _find_ffmpeg_executable()
+    _FFMPEG_CACHE["path"] = path
+    _FFMPEG_CACHE["reason"] = reason
+    return path
+
+
+def _ffmpeg_reason():
+    """ffmpeg 解析结论（诊断/报错文案用）。"""
+    _resolve_ffmpeg()
+    return _FFMPEG_CACHE["reason"]
+
+
+def _ffmpeg_short_desc():
+    """落盘编码器的简短来源描述（运行横幅用，一行说清用的是什么）。"""
+    _resolve_ffmpeg()
+    if _FFMPEG_CACHE["path"]:
+        r = _FFMPEG_CACHE["reason"] or ""
+        if r.startswith("imageio-ffmpeg"):
+            src = "imageio-ffmpeg 自带"
+        elif r.startswith("PATH"):
+            src = "系统 PATH"
+        else:
+            src = "常见安装目录"
+        return f"ffmpeg（{src}）"
+    av = _pyav_module()
+    if av is not None:
+        return f"PyAV {getattr(av, '__version__', '?')}（未找到 ffmpeg 可执行文件，已回退）"
+    return "无（ffmpeg 与 PyAV 都不可用）"
+
+
+def _is_ffmpeg_missing_error(msg):
+    """判断异常文本是否为「ffmpeg 可执行文件不存在」（Windows 中文报错也要认）。"""
+    s = (msg or "").lower()
+    return any(k in s for k in (
+        "winerror 2", "winerror 3", "系统找不到指定", "系统找不到文件",
+        "no such file", "not found", "errno 2", "cannot find",
+        "不是内部或外部命令", "is not recognized",
+    ))
+
+
+def _pyav_module():
+    try:
+        import av
+        return av
     except Exception:
-        return "ffmpeg"
+        return None
+
+
+def _pyav_reason():
+    """PyAV 可用性说明（诊断/报错文案用）。"""
+    av = _pyav_module()
+    if av is None:
+        return "PyAV(av) 未安装"
+    return f"PyAV(av) {getattr(av, '__version__', '?')} 可用"
+
+
+def _save_segment_mp4_pyav(img, wf_fit, wf_sr, path, fps=VIDEO_FPS, keep_wav=None):
+    """PyAV(av) 落盘回退：ffmpeg 可执行文件缺失/不可用时用官方依赖 av 直接编码 mp4（H.264+AAC）。
+
+    img: uint8 numpy [T,H,W,3]；wf_fit: 已对齐画面的 float tensor [C,L] 或 None。
+    ComfyUI 官方 requirements 必装 av，且自带 libx264/aac，因此这是「没装 ffmpeg」用户的可靠兜底。
+    """
+    av = _pyav_module()
+    if av is None:
+        raise RuntimeError(
+            "落盘失败：既没有 ffmpeg 可执行文件，PyAV(av) 也不可用。"
+            "请在本环境执行 pip install imageio-ffmpeg（或安装 ffmpeg 并加入 PATH）")
+    import numpy as np
+
+    T, H, W = int(img.shape[0]), int(img.shape[1]), int(img.shape[2])
+    fps = int(fps or VIDEO_FPS)
+    if wf_fit is not None and keep_wav:
+        try:
+            _write_wav(wf_fit, wf_sr, keep_wav)
+        except Exception as e:
+            print(f"[JZL-管理器] ⚠️ 无损 WAV 写盘失败（不影响 mp4 落盘）：{e}")
+    try:
+        with av.open(path, mode="w", format="mp4") as container:
+            vstream = container.add_stream("libx264", rate=fps)
+            vstream.width, vstream.height = W, H
+            vstream.pix_fmt = "yuv420p"
+            vstream.options = {"crf": "18", "preset": "medium"}
+            astream = container.add_stream("aac", rate=int(wf_sr)) if wf_fit is not None else None
+
+            for i in range(T):
+                frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(img[i]), format="rgb24")
+                frame.pts = i
+                for packet in vstream.encode(frame):
+                    container.mux(packet)
+            for packet in vstream.encode(None):
+                container.mux(packet)
+
+            if astream is not None:
+                arr = wf_fit.detach().cpu().float().numpy()
+                if arr.ndim == 3:      # [B, C, L] → [C, L]（PyAV 音频帧只接受 2 维）
+                    arr = arr[0]
+                if arr.ndim == 1:      # [L] → [1, L]
+                    arr = arr[None, :]
+                layout = "stereo" if int(arr.shape[0]) >= 2 else "mono"
+                aframe = av.AudioFrame.from_ndarray(np.ascontiguousarray(arr), format="fltp", layout=layout)
+                aframe.sample_rate = int(wf_sr)
+                aframe.pts = 0
+                for packet in astream.encode(aframe):
+                    container.mux(packet)
+                for packet in astream.encode(None):
+                    container.mux(packet)
+    except Exception as e:
+        raise RuntimeError(f"PyAV 落盘失败（{_pyav_reason()}）：{type(e).__name__}: {e}")
+    return path
 
 
 def _write_wav(waveform, sample_rate, path):
@@ -1840,9 +2855,6 @@ def _save_segment_mp4(image, audio, out_dir, index, story_name="story", counter=
     - keep_wav：把本段音频的无损 WAV 写到该路径并**不删除**（供拼接时“音频统一编码一次”，
       避免每段独立 AAC 编码 + -c copy 拼接带来的段边界 encoder delay/priming 误差）。
     """
-    if not getattr(_save_segment_mp4, "_jzl_ver_printed", False):
-        _save_segment_mp4._jzl_ver_printed = True
-        print(f"[JZL-管理器] 落盘模块加载路径：{os.path.abspath(__file__)}")
     if image is None:
         raise ValueError("图像为空，无法落盘")
     img = image.detach().cpu().float().clamp(0.0, 1.0).mul(255.0).to(torch.uint8).numpy()
@@ -1852,7 +2864,7 @@ def _save_segment_mp4(image, audio, out_dir, index, story_name="story", counter=
     os.makedirs(out_dir, exist_ok=True)
     _seg = f"{int(batch)}次生成分段" if batch else "分段"
     path = os.path.join(out_dir, f"{story_name}_{_seg}{int(index)}_{int(counter):05d}.mp4")
-    ff = _ffmpeg_bin()
+    ff = _resolve_ffmpeg()
 
     # ★ 音频强制对齐画面帧数（容器时长 = max(视频,音频)：音频偏长 → 段尾画面被冻结，拼接后表现为“结尾卡顿”）
     wf_fit, wf_sr = None, 32000
@@ -1865,6 +2877,11 @@ def _save_segment_mp4(image, audio, out_dir, index, story_name="story", counter=
                 print(f"[JZL-管理器] 分段 {int(index)}：音频比画面{'长' if _adj > 0 else '短'} "
                       f"{abs(_adj):.3f}s → 已按 {int(T)} 帧（{int(T) / float(fps or VIDEO_FPS):.3f}s）对齐"
                       f"（否则容器被音频拉长 → 段尾画面冻结，拼接后每段结尾“卡一下”）")
+
+    # 没有 ffmpeg 可执行文件 → 直接用 PyAV（ComfyUI 官方依赖 av）落盘，不依赖外部 ffmpeg
+    if ff is None:
+        _log_once(f"[JZL-管理器] 未找到 ffmpeg 可执行文件（{_ffmpeg_reason()}）→ 自动改用 {_pyav_reason()} 落盘")
+        return _save_segment_mp4_pyav(img, wf_fit, wf_sr, path, fps, keep_wav=keep_wav)
 
     # 临时 rawvideo 文件（视频帧整体写入，避免 stdin 管道竞态）
     raw_path = os.path.join(out_dir, f"._jzl_raw_{int(index)}_{os.getpid()}.raw")
@@ -1913,10 +2930,13 @@ def _save_segment_mp4(image, audio, out_dir, index, story_name="story", counter=
                 try:
                     return _run("mpeg4", ["-q:v", "5"])
                 except Exception as e2:
-                    raise RuntimeError(f"ffmpeg 落盘失败（libx264 与 mpeg4 均不可用）：{msg} | {e2}")
-            # 其他错误（如 ffmpeg 未安装）直接抛出并附诊断
-            if "No such file" in msg or "not found" in msg.lower() or "Errno 2" in msg:
-                raise RuntimeError(f"未找到 ffmpeg 可执行文件：{ff}（请安装 ffmpeg 或 pip install imageio-ffmpeg）")
+                    print(f"[JZL-管理器] ⚠️ ffmpeg 两种编码器都失败，改用 {_pyav_reason()} 落盘：{e2}")
+                    return _save_segment_mp4_pyav(img, wf_fit, wf_sr, path, fps, keep_wav=keep_wav)
+            # ffmpeg 可执行文件不存在（Windows 中文报错是「系统找不到指定的文件」/WinError 2）
+            if _is_ffmpeg_missing_error(msg):
+                print(f"[JZL-管理器] ⚠️ ffmpeg 不可用（{msg.splitlines()[0][:140] if msg else '未知原因'}）"
+                      f"，改用 {_pyav_reason()} 落盘")
+                return _save_segment_mp4_pyav(img, wf_fit, wf_sr, path, fps, keep_wav=keep_wav)
             raise
     finally:
         try:
@@ -1962,7 +2982,11 @@ def _merge_mp4_concat(paths, out_path, audio_wavs=None):
     """
     if not paths:
         raise ValueError("没有可合并的分段文件")
-    ff = _ffmpeg_bin()
+    ff = _resolve_ffmpeg()
+    if ff is None:
+        raise RuntimeError(
+            f"未找到 ffmpeg 可执行文件，无法合并分段（{_ffmpeg_reason()}）。"
+            f"各分段视频已保留、可直接使用；要启用自动合并请在本环境执行 pip install imageio-ffmpeg")
     out_path = os.path.abspath(out_path)
     out_dir = os.path.dirname(out_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -2056,7 +3080,7 @@ def _seg_len_for(raw, duration):
     无该元数据（直通/纯文本单段）回退统一 duration。区间化后各段时长各异，靠它逐段生效。"""
     m = re.search(r"\*\*(?:时长|Duration)\*\*\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)", raw or "")
     sec = float(m.group(1)) if m else float(duration or 8)
-    sec = max(4.0, min(15.0, sec))
+    sec = max(4.0, min(SEGMENT_DURATION_MAX_SEC, sec))
     return _resolve_length(sec)
 
 
@@ -2077,7 +3101,7 @@ def _parse_duration_spec(duration):
             _x = float(_t); lo = _x; hi = _x
         except Exception:
             lo = 8.0; hi = 8.0
-    lo = max(4.0, min(15.0, lo)); hi = max(lo, min(15.0, hi))
+    lo = max(4.0, min(SEGMENT_DURATION_MAX_SEC, lo)); hi = max(lo, min(SEGMENT_DURATION_MAX_SEC, hi))
     if lo > hi:
         lo, hi = hi, lo
     if lo == hi:
@@ -2106,10 +3130,19 @@ def _resolve_seed(seed_mode, base_seed, index):
 
 _IMAGE_SLOT_TYPES = ("角色", "场景", "道具", "分镜", "其他")
 
+# 音频子分类 → 槽位名前缀（各自独立编号空间）。
+# 三个子分类必须用不同前缀，否则会撞出多个「音频A」，LLM 调度素材时无法区分。
+_AUDIO_SLOT_PREFIX = {
+    "角色音色": "音色",
+    "背景配乐": "配乐",
+    "念白": "念白",
+}
+
 # ref_intro 输出排序：类型顺序（角色→场景→道具→分镜→其他；视频/音频）→ 字母顺序
 _SLOT_TYPE_ORDER = {
     "角色": 0, "场景": 1, "道具": 2, "分镜": 3, "其他": 4,
-    "视频": 0, "音频": 0,
+    "视频": 0,
+    "音色": 0, "配乐": 1, "念白": 2, "音频": 3,
 }
 
 
@@ -2117,6 +3150,7 @@ def _asset_type_for_slot(kind, typ):
     """资产类型 → 调度槽位类型（build_shot_prompt 对照表识别的类型）。
 
     「自定义」→「其他」：官方 material_table/slot_map 只识别 角色/场景/道具/分镜/视频/音频/音效/音乐/其他。
+    音频子分类各自带独立前缀（音色/配乐/念白），其余音频统一走「音频」。
     """
     if kind == "image":
         if typ == "自定义":
@@ -2125,8 +3159,39 @@ def _asset_type_for_slot(kind, typ):
     if kind == "video":
         return "视频"
     if kind == "audio":
-        return "音频"
+        return _AUDIO_SLOT_PREFIX.get(typ, "音频")
     return None
+
+
+def _audio_voice_label(item):
+    """「角色音色」条目的展示名：指定了角色 →「{角色名}音色」，否则回退条目名。
+
+    角色改名由前端联动（下拉选项来自图片里的角色列表），这里只做展示与资产池命名。
+    """
+    ch = (item.get("character") or "").strip()
+    if ch:
+        return f"{ch}音色"
+    return (item.get("name") or "").strip()
+
+
+def _asset_display_name(kind, item):
+    """条目在「素材描述 / 资产池」里使用的名称。
+
+    「音频 → 角色音色」没有独立名称字段（名称由所绑定的角色决定）→ 用 {角色名}音色；
+    其余类型一律用用户填写的名称。**资产池 key 与槽位描述必须共用本函数，否则槽位映射取不到数据。**
+    """
+    typ = (item.get("type") or "").strip()
+    if kind == "audio" and typ == "角色音色":
+        return _audio_voice_label(item)
+    return (item.get("name") or "").strip()
+
+
+def _asset_name(kind, index, item, name_override=None):
+    """生成资产名：图片1 角色 孙悟空 / 视频1 主体 跳舞的美女 / 音频1 角色音色 孙悟空音色。"""
+    prefix = {"image": "图片", "video": "视频", "audio": "音频"}.get(kind, "资产")
+    typ = (item.get("type") or "").strip()
+    name = _asset_display_name(kind, item) if name_override is None else (name_override or "").strip()
+    return " ".join(x for x in (f"{prefix}{index + 1}", typ, name) if x)
 
 
 def _build_asset_intro(assets_cfg):
@@ -2145,7 +3210,7 @@ def _build_asset_intro(assets_cfg):
             if not item.get("enabled", True):
                 continue
             typ = (item.get("type") or "").strip()
-            name = (item.get("name") or "").strip()
+            name = _asset_display_name(kind, item)   # 「角色音色」的名称来自绑定角色
             if not name:
                 continue
             slot_type = _asset_type_for_slot(kind, typ)
@@ -2161,14 +3226,14 @@ def _build_asset_intro(assets_cfg):
                 letter = chr(ord(letter) + 1)
                 slot = f"{slot_type}{letter}"
             counters[slot_type] = counters.get(slot_type, 0) + 1
-            asset_name = _asset_name(kind, i, item)
-            slot_to_asset[slot] = asset_name
+            slot_to_asset[slot] = _asset_name(kind, i, item)
             desc = (item.get("description") or "").strip()
             # 槽位格式（官方解析）：角色A = 名称（描述）
             text = f"{slot} = {name}"
             if desc:
                 text += f"（{desc}）"
             entries[kind].append((_SLOT_TYPE_ORDER.get(slot_type, 9), letter, text))
+
     out = {}
     for kind in ("image", "video", "audio"):
         entries[kind].sort(key=lambda e: (e[0], e[1]))
@@ -2367,7 +3432,7 @@ def _prune_fantasy_assets(script_text, slot_to_asset):
             items = [x.strip() for x in re.split(r'[,，、/;；]', m.group(2)) if x.strip()]
             kept = [x for x in items if _keep(x)]
             return f"**{key}**: " + (_sep.join(kept) if kept else _empty)
-        return re.sub(r'^\*\*((?:角色|场景|道具|视频|音频|音效|音乐|其他|Characters|Scene|Props|Video|Audio|Sound|Music|Other))\*\*\s*[:：]\s*(.+)$',
+        return re.sub(r'^\*\*((?:角色|场景|道具|视频|音频|音色|配乐|念白|音效|音乐|其他|Characters|Scene|Props|Video|Audio|Voice|Music|Sound|Other))\*\*\s*[:：]\s*(.+)$',
                       _repl, block, flags=re.M)
 
     def _fix_slots(raw):
@@ -2423,6 +3488,26 @@ def _detect_enables(story, assets_cfg):
     return enable_scene, enable_props, enable_video, enable_audio
 
 
+def _seg_label(auto_count, count):
+    """日志用分段数标签：「剧情决定」或「N段」。"""
+    return "剧情决定" if auto_count else f"{count}段"
+
+
+def _llm_backend_label(enhance):
+    """日志用后端标签：API / 本地。"""
+    return "API" if "api" in str((enhance or {}).get("llm_backend", "")) else "本地"
+
+
+def _run_banner(tag, run_mode, seg_label, story_style, story_name, enhance, extra=""):
+    """四个导演台共用的运行横幅：只打关键参数（运行模式 / 分段 / 风格 / 故事 / 后端 / 增强）。"""
+    print(f"[JZL-{tag}] 运行模式={run_mode} | 分段={seg_label} | 风格「{story_style or '热血战斗'}」 | "
+          f"故事「{story_name or ''}」 | 后端={_llm_backend_label(enhance)} | "
+          f"增强={'开' if (enhance or {}).get('enabled', False) else '关'}{extra}")
+    # 会生成视频的模式下顺带报一次落盘编码器（固定位置，避免首次落盘时才突然冒出来）
+    if "仅提示词" not in str(run_mode):
+        print(f"[JZL-{tag}] 落盘编码器：{_ffmpeg_short_desc()}")
+
+
 def _build_preference(enhance):
     """偏好设置（镜头语言）+ 自定义提示词 → preference 字符串。"""
     pref_cfg = enhance.get("preference") or {}
@@ -2438,19 +3523,14 @@ def _build_preference(enhance):
             pref_cfg.get("creative_req", "无特别要求"),
             pref_cfg.get("detail_length", "标准 (350-500字)"),
             pref_cfg.get("custom", ""),
+            视角机位=pref_cfg.get("angle_view", "根据剧情"),
         )[0])
     except Exception as _e:
-        print(f"[JZL-偏好] build 异常：{_e}")
+        print(f"[JZL-偏好] 构建偏好失败：{_e}")
     custom = (enhance.get("custom_prompt") or "").strip()
     if custom:
         parts.append(custom)
-    _joined = "\n".join(parts)
-    # 诊断：打印实际注入拆解/增强的偏好文本（确认面板值是否传到后端；可随时删除）
-    _raw = {k: pref_cfg.get(k) for k in ("shot_size", "camera_move", "cut_rhythm", "transition",
-                                          "music_style", "creative_req", "detail_length", "custom")}
-    print(f"[JZL-偏好] 面板原始值={_raw}")
-    print(f"[JZL-偏好] 注入文本(前240字)={_joined[:240]!r} | 总长={len(_joined)}")
-    return _joined
+    return "\n".join(parts)
 
 
 def _llm_local_config(enhance):
@@ -2485,38 +3565,28 @@ def _llm_local_config(enhance):
     return custom_config, parameters
 
 
-def _llm_chat(enhance, system_prompt, user_msg, seed, images=None):
-    """按 enhance 配置调用 LLM（本地/API），返回生成文本。
-
-    images: [(类型, 素材名, data_uri)] —— 非空时走多模态识图；本地未配置视觉模块会自动跳过图片。
-    """
+def _llm_chat(enhance, system_prompt, user_msg, seed):
+    """按 enhance 配置调用 LLM（本地/API），返回生成文本。"""
     from .llama_backend import LLAMA_CPP_STORAGE
     from .nodes_llama import JZL_MiniMax_ScriptProcessor
-    from . import vision_utils as _vu
-
-    _imgs = list(images or [])
-    if _imgs and not _vu.vision_local_ready(enhance.get("llm_backend"), enhance.get("llm") or {}):
-        _imgs = []
-    _user_content = _vu.vision_user_content(user_msg, _imgs) if _imgs else user_msg
 
     if "api" in str(enhance.get("llm_backend", "")):
         api_cfg = enhance.get("api") or {}
         return JZL_MiniMax_ScriptProcessor._call_api(
-            json.dumps(api_cfg, ensure_ascii=False), system_prompt, _user_content)
+            json.dumps(api_cfg, ensure_ascii=False), system_prompt, user_msg)
 
     custom_config, parameters = _llm_local_config(enhance)
     if not custom_config["model"]:
         return "[错误] 未选择本地 LLM 模型（请在「文本增强设置」里配置）"
     if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != custom_config:
-        print("[JZL-llama] 开始加载模型...")
-        LLAMA_CPP_STORAGE.load_model(custom_config)
+        LLAMA_CPP_STORAGE.load_model(custom_config, "故事扩写")
     try:
         _params = parameters.copy()
         _params.pop("present_penalty", None)
         _params.pop("state_uid", None)
         output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
             messages=[{"role": "system", "content": system_prompt},
-                      {"role": "user", "content": _user_content}],
+                      {"role": "user", "content": user_msg}],
             seed=seed, **_params)
         return output["choices"][0]["message"]["content"]
     except Exception as e:
@@ -2561,11 +3631,17 @@ def _persist_seed_control(manager, enhance, seed_control, current_seed, used_see
 
 
 def _build_seed_ui(manager, enhance, seed_control, current_seed, used_seed):
-    """构造 control_after_generate 的 ui 回传（前端据此更新本节点 manager_settings 里的 seed）。"""
+    """构造 control_after_generate 的 ui 回传（前端据此更新本节点 manager_settings 里的 seed）。
+
+    注意：ui 的每个值都必须用 list 包一层——ComfyUI execution.get_output_from_returns 会对每个
+    value 再展开一次（`ui = {k: [y for x in uis for y in x[k]] ...}`）：传裸 dict 会被迭代成
+    key 列表（["seed", "seed_control"]），传裸 str 会被拆成单字符，前端永远收到错数据。
+    同理 manager_error 也必须写成 ["..."]，否则错误提示只显示第一个字。
+    """
     ret = _persist_seed_control(manager, enhance, seed_control, current_seed, used_seed)
     if ret is None:
         return None
-    return {"seed_update": {"seed": ret, "seed_control": seed_control}}
+    return {"seed_update": [{"seed": str(int(ret)), "seed_control": seed_control}]}
 
 
 def _enhance_bus(enhance):
@@ -2608,16 +3684,8 @@ def _run_story_expander(story, manager, story_style, story_name, prompt_lang, se
     system_prompt = build_expand_prompt(lang, style_text, expand_words,
                                         expand_source=expand_source, material_intro=material_intro)
 
-    # 扩写识图：命中「参考素材管理」里与故事同名的 角色/场景/道具 图片 → 一并交给 LLM（无命中自动跳过）
-    _vimgs = []
-    if enhance.get("vision_expand"):
-        from . import vision_utils as _vu
-        _vimgs = _vu.collect_vision_images(manager.get("assets") or {}, story)
-        if _vimgs:
-            system_prompt = system_prompt + _vu.vision_note(_vimgs)
-
     # 与拆解/增强共享 seed/生成后控制；强制卸载统一由外部 _llm_finish 处理
-    output = _llm_chat(enhance, system_prompt, (story or "").strip(), seed, images=_vimgs)
+    output = _llm_chat(enhance, system_prompt, (story or "").strip(), seed)
     if output.startswith(("[错误]", "[API 错误]", "[API 配置错误]", "[LLM 错误]")):
         return (story or "").strip(), output
     expanded = output.strip()
@@ -2675,13 +3743,6 @@ def _run_script_processor(story, manager, video_count, story_style, story_name, 
     enhance_enabled = bool(enhance.get("enabled", False))
     script_force_offload = bool(enhance.get("force_offload", False)) and not enhance_enabled
 
-    print(f"[JZL-剧本] 直接调用 JZL_MiniMax_ScriptProcessor | 模式={mode} | 分段={'剧情决定' if _vc_auto else str(count) + '段'} | "
-          f"风格「{story_style}」 | 故事「{story_name or ''}」 | 后端={'API' if is_api else '本地'} | 增强={'开' if enhance_enabled else '关'}")
-    # 拆解识图：命中「参考素材管理」里与故事同名的 角色/场景/道具 图片 → 一并交给 LLM（无命中自动跳过）
-    _vimgs = []
-    if enhance.get("vision_decompose"):
-        from . import vision_utils as _vu
-        _vimgs = _vu.collect_vision_images(manager.get("assets") or {}, story)
     script_output, _bus = JZL_MiniMax_ScriptProcessor().execute(
         mode=mode,
         story_name=(story_name or "").strip(),
@@ -2707,7 +3768,8 @@ def _run_script_processor(story, manager, video_count, story_style, story_name, 
         custom_rule_path=custom_rule_text or None,
         gen_dir=gen_dir,
         seam_runway=seam_runway,
-        vision_images=_vimgs or None,
+        # 增强开启时这次加载会一直服务到增强结束 → 日志按「增强提示词」命名（与增强共用同一个本地模型）
+        llm_purpose=("增强提示词" if enhance_enabled else "拆解剧本"),
     )
     if script_output.startswith(("[错误]", "[API 错误]", "[API 配置错误]", "[LLM 错误]")):
         return story, script_output
@@ -2747,7 +3809,6 @@ def _run_prompt_enhancer(segmented_text, manager, duration, story_style, prompt_
         "preference": _build_preference(enhance),
         "custom_rules": (enhance.get("system_prompt") or "").strip(),
     })
-    print(f"[JZL-增强] 开启提示词增强 | 语言={lang} | 风格「{style_name}」 | 种子={seed}（与拆解共享）")
     try:
         result = JZL_MiniMaxPromptEnhancer().enhance(segmented_text, bus, False, seed)[0]
     except Exception as e:
@@ -2842,15 +3903,44 @@ def _load_assets_into_pool(assets):
         except Exception as e:
             errors.append(f"音频{i + 1}加载失败：{e}")
 
+    _report_asset_pool(manifest, errors, assets)
     return manifest, errors
 
 
-def _asset_name(kind, index, item):
-    """生成资产名：图片1 角色 孙悟空 / 视频1 主体 跳舞的美女 / 音频1 音色 孙悟空参考音色。"""
-    prefix = {"image": "图片", "video": "视频", "audio": "音频"}.get(kind, "资产")
-    typ = (item.get("type") or "").strip()
-    name = (item.get("name") or "").strip()
-    return " ".join(x for x in (f"{prefix}{index + 1}", typ, name) if x)
+def _report_asset_pool(manifest, errors, assets_cfg):
+    """打印素材池装载摘要。
+
+    只在「有素材没进池」时输出（正常运行不刷屏）。**未上传文件/文件丢失的素材会被静默跳过**，
+    但给 LLM 的素材描述仍会列出该槽位 → LLM 引用后取不到 → 本段退化成纯文本生成，
+    而用户从日志上完全看不出来。这里把原因显式打出来。
+    """
+    try:
+        total = sum(len(assets_cfg.get(k) or []) for k in ("images", "videos", "audios"))
+        if not errors and len(manifest) >= total:
+            return
+        kinds = {}
+        for m in manifest:
+            kinds[m.get("kind")] = kinds.get(m.get("kind"), 0) + 1
+        parts = [f"{lbl}{kinds.get(k, 0)}个" for k, lbl in (("image", "图片"), ("video", "视频"), ("audio", "音频"))]
+        print(f"[JZL-素材] 载入：{'/'.join(parts)}（配置共 {total} 个）")
+        missing = []
+        for _kind, _key, _lbl in (("image", "images", "图片"), ("video", "videos", "视频"), ("audio", "audios", "音频")):
+            for _it in (assets_cfg.get(_key) or []):
+                if not _it.get("enabled", True):
+                    continue
+                _nm = _asset_display_name(_kind, _it)
+                if not _nm:
+                    continue
+                if _it.get("path") and _resolve_asset_path(_it.get("path")):
+                    continue
+                missing.append(f"{_lbl}{(_it.get('type') or '').strip()}{_nm}")
+        if missing:
+            print(f"[JZL-素材] ⚠️ 未上传文件/文件缺失（不会作为参考，但仍写进了给 LLM 的素材描述）："
+                  f"{'、'.join(missing[:8])}" + ("…" if len(missing) > 8 else ""))
+        for _e in errors[:6]:
+            print(f"[JZL-素材] ⚠️ {_e}")
+    except Exception:
+        pass
 
 
 def _find_ffmpeg():
@@ -3043,7 +4133,7 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
             # 输出用 [None] 占位（非空列表）：即使旧版 ComfyUI 不识别 block_execution，
             # 也不会让下游 slice_dict 对空列表 v[-1] 崩溃
             return io.NodeOutput([None], [None], "", block_execution="必须填写「故事名称」后才能生成",
-                                  ui={"manager_error": "必须填写「故事名称」后才能生成"})
+                                  ui={"manager_error": ["必须填写「故事名称」后才能生成"]})
 
         # 节点独立配置：工作流内保存的 manager_settings 优先；空则回退全局（旧工作流兼容）
         manager = _parse_node_manager_settings(manager_settings)
@@ -3075,13 +4165,9 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
             llm_seed = int(torch.randint(0, 0x7fffffffffffffff, (1,)).item())
         else:
             llm_seed = current_seed
-        _mode_hint = "（故事扩写模式：只扩写故事正文→已处理剧本输出）" if expand_mode else (
-            "（仅提示词输出：拆解+增强→已处理剧本输出，不生成视频）" if pure_prompt else (
-            "（穿透生成模式：跳过LLM拆解/增强，直接用提示词生成）" if passthrough else (
-            "（故事拆解模式→生成）" if run_mode == "故事拆解模式" else "（故事扩写模式→生成）")))
-        print(f"[JZL-管理器] 运行模式={run_mode} | LLM种子={llm_seed}({seed_control}) | "
-              f"采样种子模式={sample_decode.get('seed_mode', 'randomize')} | 共"
-              f"{'剧情决定' if manager.get('_jzl_auto_count') else str(_vc_count(video_count)) + ' 段'}{_mode_hint}")
+        _run_banner("管理器", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
+                    story_style, story_name, enhance,
+                    f" | 扩写≈{int(enhance.get('expand_words') or 500)}字" if expand_mode else "")
 
         # 故事扩写模式：只按「故事风格 + 扩写字数」把故事扩写为丰满正文，不拆解；
         # 纯文本经「已处理剧本」端口输出 + 落盘；无需 model/clip/vae/audio_vae。
@@ -3091,7 +4177,6 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 return io.NodeOutput([None], [None], "")
             _ew = int(enhance.get("expand_words") or 500)
             _esrc = str(enhance.get("expand_source") or "素材")
-            print(f"[JZL-管理器] 故事扩写模式：扩写到约 {_ew} 字正文 | 范围={'按素材' if _esrc != '自由' else '自由发挥'}（纯文本，不拆解）")
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             _xri, _xrv, _xra, _ = _build_asset_intro(assets_cfg)
@@ -3119,8 +4204,6 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
             _pcount = _vc_count(video_count)
             ri, rv, ra, _ = _build_asset_intro(assets_cfg)
             _pe, _pp, _pv, _pa = _detect_enables(prompt_input, assets_cfg)
-            print(f"[JZL-管理器] 仅提示词输出：按「拆解模式(Decompose)」拆解为 "
-                  f"{'剧情决定' if manager.get('_jzl_auto_count') else str(_pcount) + ' 段'} + 增强（纯文本，不生成视频）")
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             processed, p_err = _run_script_processor(
@@ -3170,11 +4253,11 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 print(f"[JZL-管理器] ❌ {_nl_err}（已终止）")
                 return io.NodeOutput([None], [None], prompt_input or "",
                                      block_execution=f"❌ {_nl_err}",
-                                     ui={"manager_error": _nl_err})
+                                     ui={"manager_error": [_nl_err]})
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         # 每次运行归入一个新批次：output/jzl/{故事名}/第NNNNN次生成/（拆解+增强共用同一批次）
         gen_dir = None
-        if not passthrough and not has_shots and prompt_input:
+        if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             prompt_input, err = _run_script_processor(
@@ -3206,7 +4289,7 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 print(f"[JZL-管理器] ❌ {_pt_err}（已终止）")
                 return io.NodeOutput([None], [None], prompt_input or "",
                                      block_execution=f"❌ {_pt_err}",
-                                     ui={"manager_error": _pt_err})
+                                     ui={"manager_error": [_pt_err]})
             count = _pt_n          # 以剧本实际分段数为准（避免多生成空占位段）
 
         # 调度指令规范化：LLM 可能把 slots 写成素材名（角色:兔子），用槽位映射反查纠正为槽位名（角色:角色A），
@@ -3238,6 +4321,8 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
 
         bus_items = []
         saved_segments = []
+        _JZL_SEG_TRACEBACKS.clear()   # 本次运行的分段失败调用栈（诊断报告用）
+        _JZL_SEG_ERR_SEEN.clear()     # 每轮重置去重表：否则本轮第 1 段失败会被上一轮抑制掉调用栈
         # 自动合并时同时收集各段无損 WAV → 合并时「音频统一编码一次」（消除段边界 AAC encoder delay 误差）
         _merge_wavs = [] if (auto_merge and auto_merge_path) else None
         # 保存/合并路径固定为运行中 ComfyUI 的 output/jzl（运行时可推导，不写死盘符，不可修改）
@@ -3268,38 +4353,12 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
             mention_names, h3 = _extract_mentions(h3)
 
             # 参考提取（融合场景/视频/音频调度2：从资产池按名匹配）
-            ref_images = _collect_slots(scene, "image", 9)
-            ref_videos = _collect_slots(vid, "video", 3)
-            ref_audios = _collect_slots(aud, "audio", 3)
-
-            # @ 引用补充参考
-            for mname in mention_names:
-                kind, data = _get_asset_by_name(mname)
-                if data is None:
-                    continue
-                if kind == "image" and len(ref_images) < 9:
-                    ref_images.append(data)
-                elif kind == "video" and len(ref_videos) < 3:
-                    ref_videos.append(data)
-                elif kind == "audio" and len(ref_audios) < 3:
-                    ref_audios.append(data)
-
-            # 12 参考总上限（官方文档）：图片 + 视频 + 音频（视频音轨随视频计）≤ 12
-            # 兜底截断优先级（用户选择：图 > 音频 > 视频）——仅纯文本提示词（无前端 @去重限制）可能超限
-            while len(ref_images) + len(ref_videos) + len(ref_audios) > 12:
-                if ref_videos:
-                    ref_videos.pop()
-                elif ref_audios:
-                    ref_audios.pop()
-                elif ref_images:
-                    ref_images.pop()
+            ref_images, ref_videos, ref_audios, ref_names = _collect_refs_with_names(scene, vid, aud, mention_names)
 
             # 生成模式：始终 ref2va（对齐 1146 分镜组：图片全部作 <Picture> 身份参考，不用首尾帧）
             mode = "纯文本生成音视频-T2VA"
             if ref_videos or ref_images or ref_audios:
                 mode = "多参考生成音视频-REF2VA"
-            print(f"[JZL-管理器] 第 {i + 1} 段生成模式 = {mode}"
-                  f"（本段参考：图 {len(ref_images)} / 视频 {len(ref_videos)} / 音频 {len(ref_audios)}）")
 
             can_generate = clip is not None and vae is not None and model is not None
             if (ref_videos or ref_audios) and audio_vae is None:
@@ -3319,29 +4378,29 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 })
                 continue
 
-            print(f"[JZL-管理器] ── 分段 {i + 1}/{count} 生成开始（{mode}，种子 {seed}）──")
+            print(f"[JZL-管理器] 分段 {i + 1}/{count} 生成中（{mode}，种子 {seed}，"
+                  f"参考 {len(ref_images)}图/{len(ref_videos)}视频/{len(ref_audios)}音频）")
             try:
-                # 始终 ref2va 编码（对齐 1146）；前 N 个音频与视频配对为音轨，其余为独立音频（不重复编码）
-                positive, latent = _encode_ref_to_video(
+                # 始终 ref2va 编码（对齐 1146）；音频素材全部作为独立参考音频（官方 ref_audio_N 顺序 = 说话顺序）
+                positive, latent = _encode_refs(
+                    "管理器", f"分段 {i + 1}/{count} ",
                     clip, vae, audio_vae, h3, width, height, _seg_len_for(raw, duration_lo),
-                    ref_images=ref_images, ref_videos=ref_videos,
-                    ref_video_audios=ref_audios[:len(ref_videos)],
-                    ref_audios=ref_audios[len(ref_videos):],
-                    ref_scale=scale_factor)
+                    ref_images, ref_videos, ref_audios, ref_names, ref_scale=scale_factor, model=model)
+                positive = _apply_semantic_bridge(positive, manager, tag="管理器")
 
-                samples = _sample_av(model, positive, latent, sample_decode, seed)
+                samples = _sample_first_pass(model, positive, latent, sample_decode, seed, vae, tag="管理器")
                 _second = (sample_decode or {}).get("second") or {}
-                if _second.get("enabled"):
+                if _second.get("enabled") and not _selflift_mode(sample_decode):
                     if (_second.get("sigmas_mode") or "scheduler") == "custom":
-                        print(f"[JZL-管理器] 分段 {i + 1}/{count} 二次采样：视频latent放大 {upscale_scale}x（自定义 Sigmas：{_second.get('custom_sigmas') or ''}，{_second.get('sampler', 'euler')}）…")
+                        print(f"[JZL-管理器] 分段 {i + 1}/{count} 二次采样：latent 放大 {upscale_scale}x（自定义 Sigmas，{_second.get('sampler', 'euler')}）…")
                     else:
-                        print(f"[JZL-管理器] 分段 {i + 1}/{count} 二次采样：视频latent放大 {upscale_scale}x（{_second.get('sampler', 'euler')}/{_second.get('scheduler', 'simple')}，{_second.get('steps', 3)}步，denoise {_second.get('denoise', 0.3)}）…")
-                    samples = _run_second_sampling(model, positive, samples, sample_decode, _second, upscale_scale, seed)
-                print(f"[JZL-管理器] 分段 {i + 1}/{count} 采样完成（{sample_decode.get('steps', 4)} 步 / {sample_decode.get('sampler', 'res_multistep')}）{'（含二次采样）' if _second.get('enabled') else ''}，开始解码…")
-                image, audio = _decode_av(vae, audio_vae, samples, sample_decode)
+                        print(f"[JZL-管理器] 分段 {i + 1}/{count} 二次采样：latent 放大 {upscale_scale}x（{_second.get('sampler', 'euler')}/{_second.get('scheduler', 'simple')}，{_second.get('steps', 3)}步，denoise {_second.get('denoise', 0.3)}）…")
+                    samples = _run_second_sampling(model, positive, samples, sample_decode, _second, upscale_scale, seed, tag="管理器")
+                image, audio = _decode_av(vae, audio_vae, samples, sample_decode, tag="管理器")
 
                 JZL_BUS_POOL[i] = {"image": image, "audio": audio}
                 # 分段视频自动保存：每段解码完立即用 ffmpeg 落盘 mp4（不依赖下游 VHS）
+                _saved_msg = ""
                 if auto_save and auto_save_path:
                     try:
                         _wav_keep = None
@@ -3353,11 +4412,12 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                                                 story_name=_safe_story, counter=_seg_start + i, batch=_batch,
                                                 keep_wav=_wav_keep)
                         saved_segments.append(_sp)
-                        print(f"[JZL-管理器] 分段 {i + 1}/{count} 已自动保存：{_sp}")
+                        _saved_msg = f" | 已保存 {_sp}"
                     except Exception as _se:
                         errors.append(f"第{i + 1}段自动保存失败：{_se}")
                 _frames = int(image.shape[0]) if image is not None else 0
-                print(f"[JZL-管理器] 分段 {i + 1}/{count} 生成完成：图像 {_frames} 帧 + 音频{'✓' if audio is not None else '✗'}，已写入总线")
+                print(f"[JZL-管理器] 分段 {i + 1}/{count} 完成：{_frames} 帧 + "
+                      f"音频{'✓' if audio is not None else '✗'}{_saved_msg}")
                 bus_items.append({
                     "index": i, "mode": mode, "prompt": h3,
                     "has_image": True, "has_audio": audio is not None,
@@ -3365,22 +4425,31 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 })
             except Exception as e:
                 err = str(e)
+                _tb_txt = ""
+                try:
+                    import traceback as _tb
+                    _tb_txt = _tb.format_exc()
+                except Exception:
+                    pass
+                _seg_fail_context(i + 1, _tb_txt)
                 if "no kernel image" in err:
                     err += (f"\n  [JZL提示] CUDA/ROCm 内核与显卡架构不匹配（no kernel image）：当前 torch 没有该 GPU 的编译内核。"
                             f"诊断：{_gpu_diag_hint()}\n"
                             f"  请确认云机显卡型号与 torch/CUDA 版本匹配（本地 Z 盘 torch 是 ROCm 版 2.9.1+rocm7.13 + AMD 核显，"
                             f"无法用于其他架构显卡生成）。")
-                elif "CUDA error" in err or "cudaError" in err or "RuntimeError" in err:
-                    import traceback as _tb
-                    _tb.print_exc()
-                    err += (f"\n  [JZL提示] CUDA 运行时错误（非内核不匹配），诊断：{_gpu_diag_hint()}\n"
-                            f"  可能原因：驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、或某算子非法参数（如 attention 后端/参考张量）。"
-                            f"完整堆栈已打印到上方日志，请按其定位。")
+                elif "CUDA error" in err or "cudaError" in err or "out of memory" in err:
+                    err += (f"\n  [JZL提示] CUDA 运行时错误，诊断：{_gpu_diag_hint()}\n"
+                            f"  可能原因：显存不足、驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、"
+                            f"或某算子非法参数（如 attention 后端/参考张量）。")
+                _oom_hint = _oom_diag_hint(err, sample_decode, width, height,
+                                       _seg_len_for(raw, duration_lo))
+                if _oom_hint:
+                    err += _oom_hint
                 _attn_hint = _attention_diag_hint(err)
                 if _attn_hint:
                     err += _attn_hint
                 errors.append(f"第{i + 1}段生成失败：{err}")
-                _log_seg_error("管理器", i + 1, err)
+                _log_seg_error("管理器", i + 1, err, _tb_txt)
                 bus_items.append({
                     "index": i, "mode": mode, "prompt": h3,
                     "has_image": False, "has_audio": False,
@@ -3389,17 +4458,17 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
 
         # 采样种子回写：randomize 时把实际使用的种子（第 1 段）回传前端 → 刷新后显示真实种子
         if seed_mode == "randomize" and first_seed is not None:
-            _samp_ui = {"seed_update_sample": {"seed": int(first_seed), "seed_control": seed_mode}}
+            _samp_ui = {"seed_update_sample": [{"seed": str(int(first_seed)), "seed_control": seed_mode}]}
+            print(f"[JZL-管理器] 采样种子（本轮第 1 段）={int(first_seed)} → 已回传前端显示")
             if _seed_ui:
                 _seed_ui = dict(_seed_ui)
                 _seed_ui.update(_samp_ui)
             else:
                 _seed_ui = _samp_ui
 
-        # 生成结束：按「解码前清理」配置执行最终显存清理（卸载显存模型时释放，见日志确认）
+        # 生成结束：按「解码前清理」配置执行最终显存清理（卸载显存模型时释放）
         if (sample_decode or {}).get("decode_cleanup") == "卸载显存模型":
-            _cleanup_vram("卸载显存模型")
-            print("[JZL-管理器] 显存清理完成（卸载显存模型）")
+            _cleanup_vram("卸载显存模型", tag="管理器")
 
         # 分段视频自动合并：把 ffmpeg 落盘的各段 mp4 按顺序拼接为完整一个视频（无论保存模式）。
         # 未开「自动保存」时内部临时落盘再合并，合并后清理临时分段文件。
@@ -3427,7 +4496,7 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                         auto_merge_path,
                         f"{_safe_story}_{_batch}次生成分段合并_{_next_counter(auto_merge_path, f'{_safe_story}_{_batch}次生成分段合并'):05d}.mp4")
                     _merged = _merge_mp4_concat(_segs, _merge_out, audio_wavs=_merge_wavs)
-                    print(f"[JZL-管理器] 分段视频已按顺序合并（音频统一编码一次）：{_merged}")
+                    print(f"[JZL-管理器] 分段已合并：{_merged}")
                     if auto_merge_delete:
                         _del_n = 0
                         for _p in saved_segments:
@@ -3436,21 +4505,18 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                                 _del_n += 1
                             except Exception:
                                 pass
-                        print(f"[JZL-管理器] 已删除 {_del_n} 个分段视频（合并后清理）")
+                        print(f"[JZL-管理器] 已删除 {_del_n} 个分段视频（仅保留合并结果）")
                 except Exception as _me2:
                     errors.append(f"合并失败：{_me2}")
             else:
                 errors.append("合并失败：没有可合并的分段文件")
             if _merge_wavs:   # 先清临时无损 WAV（_merge_dir 内的随 rmtree 一起清）
-                _wrm = 0
                 for _w in _merge_wavs:
                     try:
                         if os.path.exists(_w):
-                            os.remove(_w); _wrm += 1
+                            os.remove(_w)
                     except Exception:
                         pass
-                if _wrm:
-                    print(f"[JZL-管理器] 已清理 {_wrm} 个分段临时音频（无损 WAV）")
             if _merge_dir:
                 shutil.rmtree(_merge_dir, ignore_errors=True)
 
@@ -3478,6 +4544,13 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
         # 分段保存：按顺序输出每段（失败的段跳过，错误见日志）
         if not images:
             # 无任何有效生成（未接模型/CLIP/VAE 或全部分段失败）→ 阻止下游，避免空列表让下游 slice_dict 崩溃
+            print("[JZL-管理器] ⚠️ 本段未落盘任何视频（未连接模型/CLIP/VAE 或全部分段失败）")
+            _report_save_failure(
+                "管理器", _out_root, auto_save_path, saved_segments, errors,
+                [f"已连接：model={model is not None} CLIP={clip is not None} VAE={vae is not None} "
+                 f"audio_vae={audio_vae is not None}",
+                 f"计划段数={count} 实际分段块={len(shots)} 运行模式={run_mode}",
+                 f"保存模式={save_mode} 自动保存={auto_save}"])
             return io.NodeOutput([None], [None], prompt_input,
                                  block_execution="无有效生成结果（未连接模型/CLIP/VAE，或所有分段生成失败），已阻止下游执行",
                                  ui=_seed_ui)
@@ -3588,7 +4661,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
         if not story_name:
             print("[JZL-Max] ⚠️ 必须填写「故事名称」才能生成（已终止）")
             return io.NodeOutput("", block_execution="必须填写「故事名称」后才能生成",
-                                  ui={"manager_error": "必须填写「故事名称」后才能生成"})
+                                  ui={"manager_error": ["必须填写「故事名称」后才能生成"]})
 
         manager = _parse_node_manager_settings(manager_settings)
         manager["_jzl_auto_count"] = _vc_auto          # 「剧情决定」标记（供 _run_script_processor/日志用）
@@ -3614,9 +4687,9 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
             llm_seed = int(torch.randint(0, 0x7fffffffffffffff, (1,)).item())
         else:
             llm_seed = current_seed
-        print(f"[JZL-Max] 运行模式={run_mode} | LLM种子={llm_seed}({seed_control}) | "
-              f"采样种子模式={sample_decode.get('seed_mode', 'randomize')} | 共"
-              f"{'剧情决定' if manager.get('_jzl_auto_count') else str(_vc_count(video_count)) + ' 段'}（逐段即时落盘）")
+        _run_banner("Max", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
+                    story_style, story_name, enhance,
+                    f" | 扩写≈{int(enhance.get('expand_words') or 500)}字" if expand_mode else "")
 
         # 故事扩写模式：只按「故事风格 + 扩写字数」扩写正文，不拆解；纯文本输出，不生成视频
         if expand_mode:
@@ -3625,7 +4698,6 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                 return io.NodeOutput("")
             _ew = int(enhance.get("expand_words") or 500)
             _esrc = str(enhance.get("expand_source") or "素材")
-            print(f"[JZL-Max] 故事扩写模式：扩写到约 {_ew} 字正文 | 范围={'按素材' if _esrc != '自由' else '自由发挥'}（纯文本，不生成视频）")
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             _xri, _xrv, _xra, _ = _build_asset_intro(assets_cfg)
@@ -3651,7 +4723,6 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
             _pcount = _vc_count(video_count)
             ri, rv, ra, _ = _build_asset_intro(assets_cfg)
             _pe, _pp, _pv, _pa = _detect_enables(prompt_input, assets_cfg)
-            print("[JZL-Max] 仅提示词输出：按「拆解模式(Decompose)」拆解 + 增强（纯文本，不生成视频）")
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             processed, p_err = _run_script_processor(
@@ -3693,10 +4764,10 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
             if _nl_err:
                 print(f"[JZL-Max] ❌ {_nl_err}（已终止）")
                 return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_nl_err}",
-                                     ui={"manager_error": _nl_err})
+                                     ui={"manager_error": [_nl_err]})
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         gen_dir = None
-        if not passthrough and not has_shots and prompt_input:
+        if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             prompt_input, err = _run_script_processor(
@@ -3726,7 +4797,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
             if _pt_err:
                 print(f"[JZL-Max] ❌ {_pt_err}（已终止）")
                 return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_pt_err}",
-                                     ui={"manager_error": _pt_err})
+                                     ui={"manager_error": [_pt_err]})
             count = _pt_n
 
         prompt_input = _normalize_dispatch_slots(prompt_input, slot_to_asset)
@@ -3747,6 +4818,8 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
         seed_mode = sample_decode.get("seed_mode", "randomize") or "randomize"
 
         saved_files = []          # 本次运行逐段落盘成功的 mp4 绝对路径（只存路径字符串，不存 tensor）
+        _JZL_SEG_TRACEBACKS.clear()   # 本次运行的分段失败调用栈（诊断报告用）
+        _JZL_SEG_ERR_SEEN.clear()     # 每轮重置去重表：否则本轮第 1 段失败会被上一轮抑制掉调用栈
         _out_root = os.path.abspath(folder_paths.get_output_directory())
         _jzl_dir = os.path.join(_out_root, "jzl")
         _safe_story = _safe_story_name(story_name)
@@ -3775,27 +4848,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
 
             # @ 引用 + 参考提取（复刻 8888：按每段调度指令从资产池按名取参考元素）
             mention_names, h3 = _extract_mentions(h3)
-            ref_images = _collect_slots(scene, "image", 9)
-            ref_videos = _collect_slots(vid, "video", 3)
-            ref_audios = _collect_slots(aud, "audio", 3)
-            for mname in mention_names:
-                kind, data = _get_asset_by_name(mname)
-                if data is None:
-                    continue
-                if kind == "image" and len(ref_images) < 9:
-                    ref_images.append(data)
-                elif kind == "video" and len(ref_videos) < 3:
-                    ref_videos.append(data)
-                elif kind == "audio" and len(ref_audios) < 3:
-                    ref_audios.append(data)
-            # 12 参考总上限（官方文档）：图 + 视频 + 音频（视频音轨随视频计）≤ 12，兜底截断 图>音频>视频
-            while len(ref_images) + len(ref_videos) + len(ref_audios) > 12:
-                if ref_videos:
-                    ref_videos.pop()
-                elif ref_audios:
-                    ref_audios.pop()
-                elif ref_images:
-                    ref_images.pop()
+            ref_images, ref_videos, ref_audios, ref_names = _collect_refs_with_names(scene, vid, aud, mention_names)
 
             mode = "纯文本生成音视频-T2VA"
             if ref_videos or ref_images or ref_audios:
@@ -3813,26 +4866,23 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                 errors.append(f"第{i + 1}段跳过：未连接 {_need}，仅完成剧本分段（未生成视频）")
                 continue
 
-            print(f"[JZL-Max] 第 {i + 1} 段生成模式 = {mode}"
-                  f"（本段参考：图 {len(ref_images)} / 视频 {len(ref_videos)} / 音频 {len(ref_audios)}）")
-            print(f"[JZL-Max] ── 分段 {i + 1}/{count} 生成开始（{mode}，种子 {seed}）──")
+            print(f"[JZL-Max] 分段 {i + 1}/{count} 生成中（{mode}，种子 {seed}，"
+                  f"参考 {len(ref_images)}图/{len(ref_videos)}视频/{len(ref_audios)}音频）")
             try:
                 # 编码（ref2va，复刻 8888 ReferenceToVideo2）
-                positive, latent = _encode_ref_to_video(
+                positive, latent = _encode_refs(
+                    "Max", f"分段 {i + 1}/{count} ",
                     clip, vae, audio_vae, h3, width, height, _seg_len_for(raw, duration_lo),
-                    ref_images=ref_images, ref_videos=ref_videos,
-                    ref_video_audios=ref_audios[:len(ref_videos)],
-                    ref_audios=ref_audios[len(ref_videos):],
-                    ref_scale=scale_factor)
-                # 第一次采样
-                samples = _sample_av(model, positive, latent, sample_decode, seed)
+                    ref_images, ref_videos, ref_audios, ref_names, ref_scale=scale_factor, model=model)
+                positive = _apply_semantic_bridge(positive, manager, tag="Max")
+                # 第一次采样（按「采样分类」分派：常规采样 / SelfLift采样）
+                samples = _sample_first_pass(model, positive, latent, sample_decode, seed, vae, tag="Max")
                 # latent 放大 + 第二次采样（可选，复刻 8888 一采→LTXV分离→Upscaler3D→合并→二采）
                 _second = (sample_decode or {}).get("second") or {}
-                if _second.get("enabled"):
-                    print(f"[JZL-Max] 分段 {i + 1}/{count} 二次采样：视频latent放大 {upscale_scale}x（{_second.get('sampler', 'euler')}/{_second.get('scheduler', 'simple')}，{_second.get('steps', 3)}步，denoise {_second.get('denoise', 0.3)}）…")
-                    samples = _run_second_sampling(model, positive, samples, sample_decode, _second, upscale_scale, seed)
-                print(f"[JZL-Max] 分段 {i + 1}/{count} 采样完成，开始解码…")
-                image, audio = _decode_av(vae, audio_vae, samples, sample_decode)
+                if _second.get("enabled") and not _selflift_mode(sample_decode):
+                    print(f"[JZL-Max] 分段 {i + 1}/{count} 二次采样：latent 放大 {upscale_scale}x（{_second.get('sampler', 'euler')}/{_second.get('scheduler', 'simple')}，{_second.get('steps', 3)}步，denoise {_second.get('denoise', 0.3)}）…")
+                    samples = _run_second_sampling(model, positive, samples, sample_decode, _second, upscale_scale, seed, tag="Max")
+                image, audio = _decode_av(vae, audio_vae, samples, sample_decode, tag="Max")
 
                 # ★ Max 恒定：每段解码完立即 ffmpeg 落盘（复刻 8888 里 VHS 每分镜独立落盘）
                 #   拼接保存时额外保留一份无損 WAV，供最后音频统一编码一次
@@ -3846,7 +4896,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                                         keep_wav=_wav_keep)
                 saved_files.append(_sp)
                 _frames = int(image.shape[0]) if image is not None else 0
-                print(f"[JZL-Max] 分段 {i + 1}/{count} 已即时落盘：{_sp}（{_frames} 帧）")
+                print(f"[JZL-Max] 分段 {i + 1}/{count} 已落盘：{_sp}（{_frames} 帧）")
 
                 # ★ Max 恒定：释放该段全部显存/内存（解码帧/音频/latent/条件全部丢弃）→ 跑下段占用不叠加
                 try:
@@ -3854,28 +4904,37 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                 except Exception:
                     pass
                 _clean_cache()
-                print(f"[JZL-Max] 分段 {i + 1}/{count} 完成，已释放该段显存/内存（跑{count}段与跑1段占用不叠加）")
             except Exception as e:
                 err = str(e)
+                _tb_txt = ""
+                try:
+                    import traceback as _tb
+                    _tb_txt = _tb.format_exc()
+                except Exception:
+                    pass
+                _seg_fail_context(i + 1, _tb_txt)
                 if "no kernel image" in err:
                     err += (f"\n  [JZL提示] CUDA/ROCm 内核与显卡架构不匹配（no kernel image）：当前 torch 没有该 GPU 的编译内核。"
                             f"诊断：{_gpu_diag_hint()}\n"
                             f"  请确认云机显卡型号与 torch/CUDA 版本匹配。")
-                elif "CUDA error" in err or "cudaError" in err or "RuntimeError" in err:
-                    import traceback as _tb
-                    _tb.print_exc()
-                    err += (f"\n  [JZL提示] CUDA 运行时错误（非内核不匹配），诊断：{_gpu_diag_hint()}\n"
-                            f"  可能原因：驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、或某算子非法参数（如 attention 后端/参考张量）。"
-                            f"完整堆栈已打印到上方日志，请按其定位。")
+                elif "CUDA error" in err or "cudaError" in err or "out of memory" in err:
+                    err += (f"\n  [JZL提示] CUDA 运行时错误，诊断：{_gpu_diag_hint()}\n"
+                            f"  可能原因：显存不足、驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、"
+                            f"或某算子非法参数（如 attention 后端/参考张量）。")
+                _oom_hint = _oom_diag_hint(err, sample_decode, width, height,
+                                       _seg_len_for(raw, duration_lo))
+                if _oom_hint:
+                    err += _oom_hint
                 _attn_hint = _attention_diag_hint(err)
                 if _attn_hint:
                     err += _attn_hint
                 errors.append(f"第{i + 1}段生成失败：{err}")
-                _log_seg_error("Max", i + 1, err)
+                _log_seg_error("Max", i + 1, err, _tb_txt)
 
         # 采样种子回写：randomize 时把第 1 段实际种子回传前端
         if seed_mode == "randomize" and first_seed is not None:
-            _samp_ui = {"seed_update_sample": {"seed": int(first_seed), "seed_control": seed_mode}}
+            _samp_ui = {"seed_update_sample": [{"seed": str(int(first_seed)), "seed_control": seed_mode}]}
+            print(f"[JZL-Max] 采样种子（本轮第 1 段）={int(first_seed)} → 已回传前端显示")
             if _seed_ui:
                 _seed_ui = dict(_seed_ui)
                 _seed_ui.update(_samp_ui)
@@ -3884,8 +4943,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
 
         # 生成结束：按「解码前清理」配置执行最终显存清理
         if (sample_decode or {}).get("decode_cleanup") == "卸载显存模型":
-            _cleanup_vram("卸载显存模型")
-            print("[JZL-Max] 显存清理完成（卸载显存模型）")
+            _cleanup_vram("卸载显存模型", tag="Max")
 
         # ── 保存模式：
         #  分段保存：每段已即时落盘 → video_paths = saved_files（生成视频管理可逐个查看）
@@ -3897,7 +4955,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                     out_video_dir,
                     f"{_safe_story}_{_batch}次生成分段合并_{_next_counter(out_video_dir, f'{_safe_story}_{_batch}次生成分段合并'):05d}.mp4")
                 _merged = _merge_mp4_concat(saved_files, _merge_out, audio_wavs=_merge_wavs)
-                print(f"[JZL-Max] 拼接保存完成（读盘 {len(saved_files)} 段 concat 合并，音频统一编码）：{_merged}")
+                print(f"[JZL-Max] 拼接保存完成（{len(saved_files)} 段按顺序合并）：{_merged}")
                 if auto_merge_delete:
                     _del_cnt = 0
                     for _sp in saved_files:
@@ -3906,22 +4964,19 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                                 os.remove(_sp); _del_cnt += 1
                         except Exception:
                             pass
-                    print(f"[JZL-Max] 已按「拼接保存后删除分段视频」删除 {_del_cnt} 个分段，仅保留合并结果：{_merged}")
+                    print(f"[JZL-Max] 已按配置删除 {_del_cnt} 个分段视频（仅保留合并结果）")
                 out_files = [_merged]
             except Exception as _me:
                 errors.append(f"拼接保存失败：{_me}（已保留各分段视频）")
 
         # 清理临时无損 WAV（已合入成片或不再需要）
         if _merge_wavs:
-            _wrm = 0
             for _w in _merge_wavs:
                 try:
                     if os.path.exists(_w):
-                        os.remove(_w); _wrm += 1
+                        os.remove(_w)
                 except Exception:
                     pass
-            if _wrm:
-                print(f"[JZL-Max] 已清理 {_wrm} 个分段临时音频（无损 WAV）")
 
         if errors:
             for e in errors:
@@ -3929,9 +4984,16 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
 
         # Max 0 输出：视频已即时落盘到 output/jzl/{故事名}/；剧本已写「最近提示词.json」+ 第N次生成/故事拆解/
         # （「生成视频查看器」改直接读盘获取故事名/剧本/视频，不再经端口传递）
-        print(f"[JZL-Max] 本次落盘目录：{out_video_dir}（视频 {len(saved_files)} 个，剧本 {len(prompt_input)} 字）")
+        print(f"[JZL-Max] 本次落盘：{out_video_dir}（视频 {len(saved_files)} 个）")
         if not saved_files:
             print("[JZL-Max] ⚠️ 本段未落盘任何视频（未连接模型/CLIP/VAE 或全部分段失败）")
+            _report_save_failure(
+                "Max", _out_root, out_video_dir, saved_files, errors,
+                [f"已连接：model={model is not None} CLIP={clip is not None} VAE={vae is not None} "
+                 f"audio_vae={audio_vae is not None}",
+                 f"计划段数={count} 实际分段块={len(shots)} 运行模式={run_mode}",
+                 f"保存模式={save_mode}"])
+
         return io.NodeOutput(prompt_input, ui=_seed_ui)
 
 
@@ -3972,7 +5034,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                 io.Float.Input("megapixels", display_name="百万像素（MP）", default=0.4, min=0.1, max=16.0, step=0.1,
                     tooltip="总像素数（MP），画幅×MP 决定分辨率"),
                 io.Combo.Input("duration", options=list(SEGMENT_DURATION_CHOICES), default=SEGMENT_DURATION_DEFAULT,
-                    display_name="每段视频时长", tooltip="每段视频时长（秒）：固定 4~15 秒 或 区间。等同「剧本与镜头处理器」的每段视频时长。无限时长下每段会往后损失「衔接窗口」帧长（默认 22 帧≈0.92 秒，被下一段复用），总时长 = Σ段长 − 窗口×(段数−1)"),
+                    display_name="每段视频时长", tooltip="每段视频时长（秒）：固定 4~20 秒 或 区间。等同「剧本与镜头处理器」的每段视频时长。无限时长下每段会往后损失「衔接窗口」帧长（默认 22 帧≈0.92 秒，被下一段复用），总时长 = Σ段长 − 窗口×(段数−1)"),
                 io.Float.Input("scale_factor", display_name="参考数值放大", default=1.0, min=1.0, max=5.0, step=0.1,
                     tooltip="参考图放大系数"),
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.05,
@@ -4042,7 +5104,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         if not story_name:
             print("[JZL-无限时长] ⚠️ 必须填写「故事名称」才能生成（已终止）")
             return io.NodeOutput("", block_execution="必须填写「故事名称」后才能生成",
-                                  ui={"manager_error": "必须填写「故事名称」后才能生成"})
+                                  ui={"manager_error": ["必须填写「故事名称」后才能生成"]})
 
         manager = _parse_node_manager_settings(manager_settings)
         manager["_jzl_auto_count"] = _vc_auto          # 「剧情决定」标记（供 _run_script_processor/日志用）
@@ -4052,6 +5114,8 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         sample_decode = manager.get("sample_decode") or {}
         # ♾️ 衔接设置（面板「🎭 采样解码设置 → 无限时长衔接」；缺省即官方 Motion Context 基线）
         _inf = sample_decode.get("infinite") or {}
+        # 「无限时长衔接」总开关：关闭后每段独立生成（等价 Max 语义）
+        _seam_on = _inf.get("enabled", True) is not False
         seam_window_cfg = _seam_resolve_window(_inf.get("window", SEAM_DEFAULT_WINDOW))
         seam_audio_link = _seam_flag(_inf.get("audio_link"), True)
         # 「音频同步裁剪」：默认**开启**（画面丢了衔接帧，音频必须同量裁掉，否则音画错位）。
@@ -4083,16 +5147,13 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         #    单段（count=1）或诊断档「不裁切」时跑道 = 0（没有衔接就没有额外生成内容）。
         _seg_count_probe = _vc_count(video_count)
         seam_runway_sec = _seam_runway_seconds(seam_window_cfg, seam_settle,
-                                               enabled=(_seg_count_probe > 1 and seam_trim_mode != "none"))
+                                               enabled=(_seam_on and _seg_count_probe > 1 and seam_trim_mode != "none"))
         if seam_runway_sec > 0:
-            print(f"[JZL-无限时长] 段首衔接跑道 = {seam_runway_sec:.3f} 秒"
-                  f"（窗口 {seam_window_cfg} + 过渡 {seam_settle} = {seam_window_cfg + seam_settle} 帧 / 24fps）"
-                  f"→ 第 2 段起生成时长 = 设定时长 + 跑道，成片裁掉跑道 ⇒ **落盘时长 = 设定时长**")
+            print(f"[JZL-无限时长] 段首衔接跑道 {seam_runway_sec:.3f} 秒（窗口 {seam_window_cfg} + 过渡 {seam_settle} "
+                  f"= {seam_window_cfg + seam_settle} 帧/24fps）→ 第 2 段起生成时长 = 设定时长 + 跑道，成片裁掉 ⇒ 落盘 = 设定时长")
         # ♾️ 接缝亮度匹配（只做亮度）：把每段开头若干帧的亮度朝上段末帧平滑过渡（加性、限幅）
         # 缺省 = 开（与官方 Director 一致：该做法是他们试错后**保留**的那一种，只动亮度不动 RGB）
         seam_luma_on = _seam_flag(_inf.get("luma_match"), True)
-        if seam_runway_sec > 0 and not seam_luma_on:
-            print("[JZL-无限时长] 接缝亮度匹配：已关闭（配置 luma_match=false）")
         _save_cfg = manager.get("save") or {}
         save_mode = (_save_cfg.get("mode") or "分段保存").strip() or "分段保存"
         auto_merge_delete = bool(_save_cfg.get("auto_merge_delete"))
@@ -4112,15 +5173,24 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
             llm_seed = current_seed
         _trim_label = {"pixel": "像素域裁切（保解码相位）", "latent": "latent域裁切（旧·诊断）",
                        "none": "不裁切（诊断）"}.get(seam_trim_mode, seam_trim_mode)
-        print(f"[JZL-无限时长] 运行模式={run_mode} | LLM种子={llm_seed}({seed_control}) | "
-              f"采样种子模式={sample_decode.get('seed_mode', 'randomize')} | "
-              f"共{'剧情决定' if manager.get('_jzl_auto_count') else str(_vc_count(video_count)) + ' 段'} | 衔接窗口={seam_window_cfg}帧 | "
-              f"引导来源={'上段尾帧→VAE重编码' if seam_guide_source == 'pixel' else '一采latent尾部'} | "
-              f"裁切方式={_trim_label} | 过渡丢弃={seam_settle}帧 | "
-              f"接缝亮度匹配={'开' if (seam_luma_on and seam_runway_sec > 0) else '关'} | "
-              f"音频衔接={'开' if seam_audio_link else '关'} | 音频同步裁剪={'开' if seam_trim_audio else '关'} | "
-              f"二采引导={'上段二采latent尾部' if seam_second_guide == 'second' else '上段一采latent（插值到二采画布）'}"
-              f"（逐段即时落盘）")
+        # 只在「非默认配置」时追加提示，默认档（像素域裁切 / 亮度匹配开 / 一采 latent 引导）不再逐项刷屏
+        _banner_extra = ""
+        if seam_trim_mode != "pixel":
+            _banner_extra += f" | 裁切={_trim_label}"
+        if seam_runway_sec > 0 and not seam_luma_on:
+            _banner_extra += " | 亮度匹配=关"
+        if not seam_audio_link:
+            _banner_extra += " | 音频衔接=关"
+        if not seam_trim_audio:
+            _banner_extra += " | 音频同步裁剪=关"
+        if seam_guide_source == "pixel":
+            _banner_extra += " | 引导=上段尾帧→VAE重编码"
+        if seam_second_guide == "second":
+            _banner_extra += " | 二采引导=上段二采latent尾部"
+        if expand_mode:
+            _banner_extra += f" | 扩写≈{int(enhance.get('expand_words') or 500)}字"
+        _run_banner("无限时长", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
+                    story_style, story_name, enhance, _banner_extra)
 
         # ── 故事扩写模式：只按「故事风格 + 扩写字数」扩写正文，不拆解；纯文本输出，不生成视频 ──
         if expand_mode:
@@ -4129,7 +5199,6 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                 return io.NodeOutput("")
             _ew = int(enhance.get("expand_words") or 500)
             _esrc = str(enhance.get("expand_source") or "素材")
-            print(f"[JZL-无限时长] 故事扩写模式：扩写到约 {_ew} 字正文 | 范围={'按素材' if _esrc != '自由' else '自由发挥'}（纯文本，不生成视频）")
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             _xri, _xrv, _xra, _ = _build_asset_intro(assets_cfg)
@@ -4155,7 +5224,6 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
             _pcount = _vc_count(video_count)
             ri, rv, ra, _ = _build_asset_intro(assets_cfg)
             _pe, _pp, _pv, _pa = _detect_enables(prompt_input, assets_cfg)
-            print("[JZL-无限时长] 仅提示词输出：按「拆解模式(Decompose)」拆解 + 增强（纯文本，不生成视频）")
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             processed, p_err = _run_script_processor(
@@ -4196,17 +5264,17 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
             if _nl_err:
                 print(f"[JZL-无限时长] ❌ {_nl_err}（已终止）")
                 return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_nl_err}",
-                                     ui={"manager_error": _nl_err})
+                                     ui={"manager_error": [_nl_err]})
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         # ⭐ 衔接跑道：段 2+ 的「生成时长 = 设定时长 + 跑道」（段首跑道会被裁掉 ⇒ 落盘时长 = 设定时长）。
         #    `gen_duration_lo` = 生成时长下限（块内缺 **时长** 字段时的兜底，也按生成时长算）。
         gen_duration_lo = duration_lo + seam_runway_sec
         if seam_runway_sec > 0 and has_shots:
-            print(f"[JZL-无限时长] ⚠️ 你自带了 [SHOT_START] 剧本块：各段 **时长** 按「生成时长」解释，"
-                  f"本节点会再裁掉段首 {seam_window_cfg + seam_settle} 帧跑道 → 落盘 = 生成 − 跑道。"
+            print(f"[JZL-无限时长] ⚠️ 你自带了 [SHOT_START] 剧本块：本节点会再裁掉段首 "
+                  f"{seam_window_cfg + seam_settle} 帧跑道 → 落盘 = 生成 − 跑道；"
                   f"若要落盘 = 设定时长，请把每段 **时长** 写成「设定时长 + {seam_runway_sec:.2f} 秒」")
         gen_dir = None
-        if not passthrough and not has_shots and prompt_input:
+        if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             prompt_input, err = _run_script_processor(
@@ -4236,7 +5304,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
             if _pt_err:
                 print(f"[JZL-无限时长] ❌ {_pt_err}（已终止）")
                 return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_pt_err}",
-                                     ui={"manager_error": _pt_err})
+                                     ui={"manager_error": [_pt_err]})
             count = _pt_n
 
         prompt_input = _normalize_dispatch_slots(prompt_input, slot_to_asset)
@@ -4257,6 +5325,8 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         seed_mode = sample_decode.get("seed_mode", "randomize") or "randomize"
 
         saved_files = []
+        _JZL_SEG_TRACEBACKS.clear()   # 本次运行的分段失败调用栈（诊断报告用）
+        _JZL_SEG_ERR_SEEN.clear()     # 每轮重置去重表：否则本轮第 1 段失败会被上一轮抑制掉调用栈
         _out_root = os.path.abspath(folder_paths.get_output_directory())
         _jzl_dir = os.path.join(_out_root, "jzl")
         _safe_story = _safe_story_name(story_name)
@@ -4276,7 +5346,6 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         prev_latent2 = None
         # ♾️ 接缝亮度匹配参考：上一段**落盘后**末帧的平均亮度（只存一个标量，不占内存）
         prev_luma = None
-        seam_window_used = 0
         total_frames = 0
         for i in range(count):
             try:
@@ -4293,32 +5362,11 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                     prompt_input.strip() if i == 0 and prompt_input else "[未找到H3提示词]")
 
             mention_names, h3 = _extract_mentions(h3)
-            ref_images = _collect_slots(scene, "image", 9)
-            ref_videos = _collect_slots(vid, "video", 3)
-            ref_audios = _collect_slots(aud, "audio", 3)
-            for mname in mention_names:
-                kind, data = _get_asset_by_name(mname)
-                if data is None:
-                    continue
-                if kind == "image" and len(ref_images) < 9:
-                    ref_images.append(data)
-                elif kind == "video" and len(ref_videos) < 3:
-                    ref_videos.append(data)
-                elif kind == "audio" and len(ref_audios) < 3:
-                    ref_audios.append(data)
-            while len(ref_images) + len(ref_videos) + len(ref_audios) > 12:
-                if ref_videos:
-                    ref_videos.pop()
-                elif ref_audios:
-                    ref_audios.pop()
-                elif ref_images:
-                    ref_images.pop()
+            ref_images, ref_videos, ref_audios, ref_names = _collect_refs_with_names(scene, vid, aud, mention_names)
 
             mode = "纯文本生成音视频-T2VA"
             if ref_videos or ref_images or ref_audios:
                 mode = "多参考生成音视频-REF2VA"
-            print(f"[JZL-无限时长] 第 {i + 1} 段生成模式 = {mode}"
-                  f"（本段参考：图 {len(ref_images)} / 视频 {len(ref_videos)} / 音频 {len(ref_audios)}）")
             can_generate = clip is not None and vae is not None and model is not None
             if (ref_videos or ref_audios) and audio_vae is None:
                 can_generate = False
@@ -4336,22 +5384,20 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
             #    落盘帧数 = 生成帧数 − 段首丢弃(窗口+过渡) ⇒ 逐段都会核对是否 ≈ 设定时长（见下方裁切日志）。
             seg_len = _seg_len_for(raw, gen_duration_lo)
             _saved_target = _seg_len_for(None, duration_lo)   # 本段落盘目标帧数（完整独立生成 = 设定时长）
-            print(f"[JZL-无限时长] ── 分段 {i + 1}/{count} 生成开始（{mode}，{seg_len} 帧"
+            print(f"[JZL-无限时长] 分段 {i + 1}/{count} 生成中（{mode}，{seg_len} 帧"
                   f"{f'，含段首衔接 {seam_window_cfg + seam_settle} 帧' if (i > 0 and seam_runway_sec > 0) else ''}"
-                  f"，种子 {seed}）──")
+                  f"，种子 {seed}，参考 {len(ref_images)}图/{len(ref_videos)}视频/{len(ref_audios)}音频）")
             try:
                 # ① 编码（ref2va，与官方 ReferenceToVideo 一致；**每段都重新注入原始参考**→ 抗长链漂移）
-                positive, latent = _encode_ref_to_video(
+                positive, latent = _encode_refs(
+                    "无限时长", f"分段 {i + 1}/{count} ",
                     clip, vae, audio_vae, h3, width, height, seg_len,
-                    ref_images=ref_images, ref_videos=ref_videos,
-                    ref_video_audios=ref_audios[:len(ref_videos)],
-                    ref_audios=ref_audios[len(ref_videos):],
-                    ref_scale=scale_factor)
+                    ref_images, ref_videos, ref_audios, ref_names, ref_scale=scale_factor, model=model)
                 positive_base = positive   # 未注入引导的“干净” positive（二采可能要用另一份引导重建）
 
                 # ② ♾️ 衔接：第 2 段起把上一段一采 latent 的尾部窗口钉成本段首帧引导
                 seam_plan = None
-                if i > 0 and prev_latent is not None:
+                if i > 0 and _seam_on and prev_latent is not None:
                     # 本段至少要装得下「窗口 + 过渡」，否则整段会被裁空（成片变 0 帧 / 只剩 1 帧）
                     _drop_need = seam_window_cfg + seam_settle
                     if seg_len <= _drop_need:
@@ -4369,8 +5415,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                                                      audio_link=seam_audio_link,
                                                      vae=vae, guide_source=seam_guide_source)
                     # 画布一致性兜底：引导 latent 必须与本次采样目标同画布（PackedLayout 按目标画布算行数）
-                    positive = _seam_fit_guides_to_canvas(positive, latent["samples"])
-                    seam_window_used = seam_plan["window"]
+                    positive = _seam_fit_guides_to_canvas(positive, latent["samples"], tag="无限时长")
                     if _kf is not None and int(_kf["latent"].shape[2]) != int(seam_plan["trim_tokens"]):
                         print(f"[JZL-无限时长] 分段 {i + 1}/{count}：⚠️ 引导 latent token 数 "
                               f"{int(_kf['latent'].shape[2])} ≠ 期望 {seam_plan['trim_tokens']}（衔接窗口可能不准）")
@@ -4379,13 +5424,12 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                     if seam_plan["adjusted"]:
                         print(f"[JZL-无限时长] 分段 {i + 1}/{count}：窗口按上段段长自动调整为 "
                               f"{seam_plan['window']} 帧（配置 {seam_window_cfg} 帧）")
-                    print(f"[JZL-无限时长] 分段 {i + 1}/{count} 衔接：上段尾部 "
-                          f"{seam_plan['window']} 帧（latent token {seam_plan['trim_tokens']} 个）"
-                          f"@{_kf['resolved_frame_index'] if _kf else 0} {_a_txt}；"
-                          f"本段解码后将裁掉开头 {seam_plan['window']} 帧")
+                    print(f"[JZL-无限时长] 分段 {i + 1}/{count} 衔接：上段尾部 {seam_plan['window']} 帧"
+                          f"（token {seam_plan['trim_tokens']}）{_a_txt}，解码后裁掉开头 {seam_plan['window']} 帧")
 
+                positive = _apply_semantic_bridge(positive, manager, tag="无限时长")
                 # ③ 第一次采样（衔接引导源 = 本段一采 latent，与下段目标 latent 同画布同空间）
-                first_samples = _sample_av(model, positive, latent, sample_decode, seed)
+                first_samples = _sample_first_pass(model, positive, latent, sample_decode, seed, vae, tag="无限时长")
                 samples = first_samples
 
                 # ④ latent 放大 + 第二次采样（可选）：二采结果只用于解码落盘
@@ -4393,18 +5437,16 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                 #      first（默认）= 复用本段一采引导（上段一采 latent）→ 内部按二采画布插值对齐
                 #      second        = 用上一段**二采** latent 尾部重建引导（与二采画布同画布、同 refined 版本）
                 _second = (sample_decode or {}).get("second") or {}
-                if _second.get("enabled"):
-                    print(f"[JZL-无限时长] 分段 {i + 1}/{count} 二次采样：视频latent放大 {upscale_scale}x"
+                if _second.get("enabled") and not _selflift_mode(sample_decode):
+                    print(f"[JZL-无限时长] 分段 {i + 1}/{count} 二次采样：latent 放大 {upscale_scale}x"
                           f"（{_second.get('sampler', 'euler')}/{_second.get('scheduler', 'simple')}，"
                           f"{_second.get('steps', 3)}步，denoise {_second.get('denoise', 0.3)}）…")
                     _pos2 = positive
                     if seam_second_guide == "second" and seam_plan is not None and prev_latent2 is not None:
-                        _pos2, _kf2 = _seam_apply_guide(positive_base, prev_latent2, seam_plan,
-                                                        audio_link=seam_audio_link, vae=None,
-                                                        guide_source="latent")
-                        print(f"[JZL-无限时长] 分段 {i + 1}/{count} 二采引导：上段二采 latent 尾部 "
-                              f"{seam_plan['trim_tokens']} token（与二采画布同尺寸，无需插值）")
-                    samples = _run_second_sampling(model, _pos2, first_samples, sample_decode, _second, upscale_scale, seed)
+                        _pos2 = _seam_apply_guide(positive_base, prev_latent2, seam_plan,
+                                                 audio_link=seam_audio_link, vae=None,
+                                                 guide_source="latent")[0]
+                    samples = _run_second_sampling(model, _pos2, first_samples, sample_decode, _second, upscale_scale, seed, tag="无限时长")
                     _t1 = int(first_samples.tensors[0].shape[2]) if getattr(first_samples, "is_nested", False) else int(first_samples.shape[2])
                     _t2 = int(samples.tensors[0].shape[2]) if getattr(samples, "is_nested", False) else int(samples.shape[2])
                     if _t2 != _t1:
@@ -4434,18 +5476,17 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                         samples = _seam_trim_head(samples, seam_plan, trim_audio=False,
                                                   drop_tokens=seam_latent_drop["tokens"])
                         print(f"[JZL-无限时长] 分段 {i + 1}/{count} latent 域裁切：丢开头 "
-                              f"{seam_latent_drop['tokens']} token（= {seam_latent_drop['frames']} 帧 = 窗口 "
-                              f"{seam_plan['window']} + 过渡 {seam_settle}）→ VAE 解码相位 0（不闪烁）")
+                              f"{seam_latent_drop['tokens']} token = {seam_latent_drop['frames']} 帧"
+                              f"（窗口 {seam_plan['window']} + 过渡 {seam_settle}）")
 
-                print(f"[JZL-无限时长] 分段 {i + 1}/{count} 采样完成，开始解码…")
-                image, audio = _decode_av(vae, audio_vae, samples, sample_decode)
+                image, audio = _decode_av(vae, audio_vae, samples, sample_decode, tag="无限时长")
                 _raw_frames = int(image.shape[0]) if image is not None else 0
                 if seam_plan is not None and seam_latent_drop is not None:
                     # latent 域：视频已在 token 域裁好 → 音频在波形域按「同一丢弃帧数」裁（与像素域同一套音画规则）
                     if seam_trim_audio:
                         audio = _seam_trim_audio_frames(audio, seam_latent_drop["frames"], _raw_frames)
                         print(f"[JZL-无限时长] 分段 {i + 1}/{count} latent 域裁切完成：解码 {_raw_frames} 帧"
-                              f"（已少解码 {seam_latent_drop['frames']} 帧）；音频按同一丢弃量裁剪，音画等长")
+                              f"（少解码 {seam_latent_drop['frames']} 帧），音频同步裁剪")
                     else:
                         print(f"[JZL-无限时长] 分段 {i + 1}/{count}：⚠️ 「音频同步裁剪」已关闭：画面已丢 "
                               f"{seam_latent_drop['frames']} 帧而音频不裁 → 音画错位 "
@@ -4457,24 +5498,23 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                     else:
                         image, audio = _seam_trim_decoded(image, audio, seam_plan,
                                                           settle_frames=seam_settle,
-                                                          trim_audio=seam_trim_audio)
+                                                          trim_audio=seam_trim_audio, tag="无限时长")
                         _kept = int(image.shape[0]) if image is not None else 0
-                        print(f"[JZL-无限时长] 分段 {i + 1}/{count} 像素域裁切：解码 {_raw_frames} 帧 "
-                              f"→ 丢开头 {seam_plan['window']} 帧衔接帧 + {seam_settle} 帧启动过渡 = {seam_plan['window'] + seam_settle} 帧 "
-                              f"→ 保留 {_kept} 帧（{_kept / 24.0:.3f}s）；"
-                              f"音频{'按保留帧数同步裁剪，音画等长' if seam_trim_audio else '未裁剪（音频同步裁剪已关闭·仅对比实验）'}")
+                        print(f"[JZL-无限时长] 分段 {i + 1}/{count} 像素域裁切：解码 {_raw_frames} 帧"
+                              f" − 衔接 {seam_plan['window']} − 过渡 {seam_settle} = 保留 {_kept} 帧"
+                              f"（{_kept / 24.0:.2f}s）"
+                              f"{'，音频同步裁剪' if seam_trim_audio else '，⚠️ 音频未裁剪（仅对比实验）'}")
                 _frames = int(image.shape[0]) if image is not None else 0
                 # ⭐ 帧账核对：落盘帧数应 ≈ 设定时长对应的帧数（生成 = 设定 + 跑道，裁掉跑道后回到设定）
                 if i > 0 and seam_runway_sec > 0 and seam_plan is not None and seam_trim_mode != "none":
                     _delta = _frames - _saved_target
-                    _dmsg = (f"生成 {seg_len} 帧（含段首衔接 {seam_window_cfg + seam_settle} 帧）"
-                             f" → 裁掉 {seg_len - _frames} 帧 → 落盘 {_frames} 帧 = {_frames / 24.0:.2f} 秒")
                     if abs(_delta) <= 2:
-                        print(f"[JZL-无限时长] 分段 {i + 1}/{count} {_dmsg}（= 设定时长 ✓）")
+                        print(f"[JZL-无限时长] 分段 {i + 1}/{count} 落盘 {_frames} 帧"
+                              f"（生成 {seg_len} − 裁切 {seg_len - _frames}）= {_frames / 24.0:.2f} 秒 ✓")
                     else:
-                        print(f"[JZL-无限时长] 分段 {i + 1}/{count} {_dmsg}；⚠️ 比设定时长差 {_delta:+d} 帧"
-                              f"（{_delta / 24.0:+.2f}s）：该段 **时长** 可能没按「设定 + 跑道」写，"
-                              f"或「设定时长 + 跑道」超出单段上限 15 秒（已自动取窗口上限）")
+                        print(f"[JZL-无限时长] 分段 {i + 1}/{count} 落盘 {_frames} 帧 = {_frames / 24.0:.2f} 秒；"
+                              f"⚠️ 比设定时长差 {_delta:+d} 帧（{_delta / 24.0:+.2f}s）：该段 **时长** 可能没按"
+                              f"「设定 + 跑道」写，或「设定时长 + 跑道」超出单段上限 20 秒")
                 total_frames += _frames
 
                 # ★ ♾️ 接缝亮度匹配（**只做亮度**）：把本段开头若干帧的平均亮度朝上一段末帧平滑过渡。
@@ -4483,12 +5523,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                 #   必须在落盘**之前**做（拼接是 -c copy，不会重编码）；诊断档「不裁切」时不动像素。
                 if (seam_luma_on and prev_luma is not None and seam_plan is not None
                         and seam_trim_mode != "none" and image is not None):
-                    image, _luma_ok, _luma_info = _seam_luma_ramp(image, prev_luma)
-                    if _luma_ok:
-                        print(f"[JZL-无限时长] 分段 {i + 1}/{count} 接缝亮度匹配：上段末帧亮度 "
-                              f"{_luma_info['y_start']:.3f} → 本段 {_luma_info['frames']} 帧渐入到 "
-                              f"{_luma_info['y_end']:.3f}（接缝差 {_luma_info['seam_gap']:.3f}，"
-                              f"限幅 ±{_luma_info['max_delta']:.2f}、只动亮度）")
+                    image = _seam_luma_ramp(image, prev_luma)[0]
 
                 # ★ 每段解码完立即 ffmpeg 落盘（拼接保存时额外保留一份无損 WAV，供最后音频统一编码）
                 _wav_keep = None
@@ -4500,8 +5535,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                                         story_name=_safe_story, counter=_seg_start + i, batch=_batch,
                                         keep_wav=_wav_keep)
                 saved_files.append(_sp)
-                print(f"[JZL-无限时长] 分段 {i + 1}/{count} 已即时落盘：{_sp}（{_frames} 帧"
-                      f"{'，已裁掉段首 ' + str(seam_plan['window']) + ' 帧衔接帧' if seam_plan is not None else ''}）")
+                print(f"[JZL-无限时长] 分段 {i + 1}/{count} 已落盘：{_sp}（{_frames} 帧）")
 
                 # ★ 衔接源：本段一采 latent 转 CPU 留一份给下一段（二采不影响它）
                 prev_latent = first_samples.to("cpu") if hasattr(first_samples, "to") else first_samples
@@ -4518,29 +5552,37 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                 except Exception:
                     pass
                 _clean_cache()
-                print(f"[JZL-无限时长] 分段 {i + 1}/{count} 完成，已释放该段显存/内存"
-                      f"（跑{count}段与跑1段占用不叠加；衔接源保留 1 份一采 latent）")
             except Exception as e:
                 err = str(e)
+                _tb_txt = ""
+                try:
+                    import traceback as _tb
+                    _tb_txt = _tb.format_exc()
+                except Exception:
+                    pass
+                _seg_fail_context(i + 1, _tb_txt)
                 if "no kernel image" in err:
                     err += (f"\n  [JZL提示] CUDA/ROCm 内核与显卡架构不匹配（no kernel image）：当前 torch 没有该 GPU 的编译内核。"
                             f"诊断：{_gpu_diag_hint()}\n"
                             f"  请确认云机显卡型号与 torch/CUDA 版本匹配。")
-                elif "CUDA error" in err or "cudaError" in err or "RuntimeError" in err:
-                    import traceback as _tb
-                    _tb.print_exc()
-                    err += (f"\n  [JZL提示] CUDA 运行时错误（非内核不匹配），诊断：{_gpu_diag_hint()}\n"
-                            f"  可能原因：驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、或某算子非法参数"
-                            f"（如 attention 后端/参考张量）。完整堆栈已打印到上方日志，请按其定位。")
+                elif "CUDA error" in err or "cudaError" in err or "out of memory" in err:
+                    err += (f"\n  [JZL提示] CUDA 运行时错误，诊断：{_gpu_diag_hint()}\n"
+                            f"  可能原因：显存不足、驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、或某算子非法参数"
+                            f"（如 attention 后端/参考张量）。")
+                _oom_hint = _oom_diag_hint(err, sample_decode, width, height,
+                                       _seg_len_for(raw, duration_lo))
+                if _oom_hint:
+                    err += _oom_hint
                 _attn_hint = _attention_diag_hint(err)
                 if _attn_hint:
                     err += _attn_hint
                 errors.append(f"第{i + 1}段生成失败：{err}")
-                _log_seg_error("无限时长", i + 1, err)
+                _log_seg_error("无限时长", i + 1, err, _tb_txt)
 
         # 采样种子回写：randomize 时把第 1 段实际种子回传前端
         if seed_mode == "randomize" and first_seed is not None:
-            _samp_ui = {"seed_update_sample": {"seed": int(first_seed), "seed_control": seed_mode}}
+            _samp_ui = {"seed_update_sample": [{"seed": str(int(first_seed)), "seed_control": seed_mode}]}
+            print(f"[JZL-无限时长] 采样种子（本轮第 1 段）={int(first_seed)} → 已回传前端显示")
             if _seed_ui:
                 _seed_ui = dict(_seed_ui)
                 _seed_ui.update(_samp_ui)
@@ -4548,8 +5590,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                 _seed_ui = _samp_ui
 
         if (sample_decode or {}).get("decode_cleanup") == "卸载显存模型":
-            _cleanup_vram("卸载显存模型")
-            print("[JZL-无限时长] 显存清理完成（卸载显存模型）")
+            _cleanup_vram("卸载显存模型", tag="无限时长")
 
         # ── 保存模式：分段保存（每段已即时落盘）/ 拼接保存（读盘 concat 成一个）──
         out_files = list(saved_files)
@@ -4559,8 +5600,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                     out_video_dir,
                     f"{_safe_story}_{_batch}次生成分段合并_{_next_counter(out_video_dir, f'{_safe_story}_{_batch}次生成分段合并'):05d}.mp4")
                 _merged = _merge_mp4_concat(saved_files, _merge_out, audio_wavs=_merge_wavs)
-                print(f"[JZL-无限时长] 拼接保存完成（读盘 {len(saved_files)} 段 concat 合并，"
-                      f"音频统一编码）：{_merged}")
+                print(f"[JZL-无限时长] 拼接保存完成（{len(saved_files)} 段按顺序合并）：{_merged}")
                 if auto_merge_delete:
                     _del_cnt = 0
                     for _sp in saved_files:
@@ -4569,31 +5609,27 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                                 os.remove(_sp); _del_cnt += 1
                         except Exception:
                             pass
-                    print(f"[JZL-无限时长] 已按「拼接保存后删除分段视频」删除 {_del_cnt} 个分段，仅保留合并结果：{_merged}")
+                    print(f"[JZL-无限时长] 已按配置删除 {_del_cnt} 个分段视频（仅保留合并结果）")
                 out_files = [_merged]
             except Exception as _me:
                 errors.append(f"拼接保存失败：{_me}（已保留各分段视频）")
 
         # 清理临时无損 WAV（已合入成片或不再需要）
         if _merge_wavs:
-            _wrm = 0
             for _w in _merge_wavs:
                 try:
                     if os.path.exists(_w):
-                        os.remove(_w); _wrm += 1
+                        os.remove(_w)
                 except Exception:
                     pass
-            if _wrm:
-                print(f"[JZL-无限时长] 已清理 {_wrm} 个分段临时音频（无损 WAV）")
 
         if errors:
             for e in errors:
                 print(f"[JZL-无限时长] {e}")
 
         _dur = (total_frames / float(VIDEO_FPS)) if total_frames else 0.0
-        print(f"[JZL-无限时长] 本次落盘目录：{out_video_dir}（视频 {len(saved_files)} 个，剧本 {len(prompt_input)} 字）")
-        print(f"[JZL-无限时长] 本次成片合计 {total_frames} 帧 = {_dur:.2f} 秒 @24fps"
-              f"（{count} 段；衔接窗口 {seam_window_used or 0} 帧 × {max(0, count - 1)} 次衔接已计入裁剪）")
+        print(f"[JZL-无限时长] 本次落盘：{out_video_dir}（视频 {len(saved_files)} 个）")
+        print(f"[JZL-无限时长] 本次成片合计 {total_frames} 帧 = {_dur:.2f} 秒 @24fps（{count} 段）")
         if seam_runway_sec > 0 and saved_files:
             _set_frames = _seg_len_for(None, duration_lo)
             print(f"[JZL-无限时长] ⏱️ 时长对照：设定 {_set_frames} 帧/段 = {_set_frames / float(VIDEO_FPS):.2f} 秒/段"
@@ -4601,8 +5637,660 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                   f"（每段生成时多出段首衔接跑道 {seam_window_cfg + seam_settle} 帧 = {seam_runway_sec:.2f} 秒，已在成片中裁掉）")
         if not saved_files:
             print("[JZL-无限时长] ⚠️ 本段未落盘任何视频（未连接模型/CLIP/VAE 或全部分段失败）")
+            _report_save_failure(
+                "无限时长", _out_root, out_video_dir, saved_files, errors,
+                [f"已连接：model={model is not None} CLIP={clip is not None} VAE={vae is not None} "
+                 f"audio_vae={audio_vae is not None}",
+                 f"计划段数={count} 实际分段块={len(shots)} 运行模式={run_mode}",
+                 f"保存模式={save_mode}"])
         return io.NodeOutput(prompt_input, ui=_seed_ui)
 
+
+
+class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
+    """JZL - 🤖 MiniMax-H3无限时长 — 段间 latent 引导衔接的逐段生成长视频链路。
+
+    与「短剧导演台Max」唯一差异在分段循环（LLM 拆解 / 资产 / 参数 / 逐段落盘 / 读盘拼接 / 显存释
+    放全部沿用同一套）：
+    · 每段仍按剧情拆解出的「新提示词」独立生成 → 剧情持续往前推进（不再是同一段提示词重复）；
+    · 第 2 段起，把上一段**一采 latent 的尾部窗口**（默认 22 帧 = 官方 Motion Context 基线）作为
+      keyframe 钉进本段时间轴起点（cond 行永不降噪、每步重注入）→ 画面 / 动作 / 色调跨段连续；
+    · 段首被钉住的窗口帧解码后裁掉；音频同步裁掉 round(窗口×5/3) 步（否则音画错位 W/24 秒）；
+    · 1 段时无上段 → 自动跳过衔接，行为与 Max 完全一致（单段 / 多段同一套逻辑）。
+    数学保证：段长恒为 17k+5、窗口恒为 17m+5 ⇒ 段长−窗口 = 17(k−m) 必为 17 的倍数 ⇒ 尾窗起点必落
+    在 latent token 边界（token 索引 5(k−m)）⇒ **相位自动对齐**，无需任何手工对齐参数。
+    """
+
+    @classmethod
+    def define_schema(cls):
+        story_styles = _story_style_options()
+        return io.Schema(
+            node_id="JZL_MiniMaxAssetManagerShortDrama",
+            display_name="JZL - 🤖 MiniMax-H3短剧导演台",
+            category="JZL/MiniMax",
+            description=("MiniMax-H3 短剧导演台：逐段「新剧情提示词」独立生成，并把上一段一采 latent 的尾部窗口"
+                         "钉成本段首帧引导（永不降噪、每步重注入）→ 画面连续 + 剧情推进；段首被钉住的窗口帧"
+                         "自动裁掉（音频同步裁剪）。逐段即时落盘 + 读盘 concat，跑 1 段与跑 N 段逻辑同一套、"
+                         "硬件占用不叠加。"),
+            inputs=[
+                io.Combo.Input("run_mode", options=RUN_MODE_EMOJI,
+                    default=RUN_MODE_EMOJI[0], display_name="运行模式",
+                    tooltip="与「短剧导演台Max」一致：故事拆解模式=按情节拆解为N段（每段一个独立新提示词，无限时长按此逐段推进剧情）；故事扩写模式=只扩写正文（纯文本输出）；穿透生成模式=跳过 LLM 直接用提示词生成；仅提示词输出=只输出拆解+增强后的分段剧本，不生成视频"),
+                io.String.Input("display_info", display_name="生成详情", default="分辨率：864x480丨每段帧数：124丨段数：剧情决定丨无限时长：开启丨成片总长：124~6944 帧 ≈ 5.17~289.33 秒",
+                    multiline=False, socketless=True,
+                    tooltip="只读显示：当前画幅/MP/时长/段数计算出的分辨率、每段帧数、段数、总帧数、总时长（对齐倍数固定 32）"),
+                io.Combo.Input("aspect_ratio", options=ASPECT_RATIO_OPTIONS, default="16:9 (Widescreen)",
+                    display_name="画幅比例", tooltip="画幅比例（分辨率按 MP×1024² 公式自动计算，对齐倍数固定 32）"),
+                io.Float.Input("megapixels", display_name="百万像素（MP）", default=0.4, min=0.1, max=3.6, step=0.1,
+                    tooltip="总像素数（MP），画幅×MP 决定分辨率"),
+                io.Combo.Input("duration", options=list(SEGMENT_DURATION_CHOICES), default=SEGMENT_DURATION_DEFAULT,
+                    display_name="每段视频时长", tooltip="每段视频时长（秒）：固定 4~20 秒 或 区间。等同「剧本与镜头处理器」的每段视频时长。无限时长下每段会往后损失「衔接窗口」帧长（默认 22 帧≈0.92 秒，被下一段复用），总时长 = Σ段长 − 窗口×(段数−1)"),
+                io.Float.Input("scale_factor", display_name="参考数值放大", default=1.0, min=1.0, max=5.0, step=0.1,
+                    tooltip="参考图放大系数"),
+                io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.1,
+                    tooltip="二采（Ref2va）放大倍数。开启二采不影响段间衔接：衔接恒用「一采 latent」，二采结果只用于解码落盘"),
+                io.Int.Input("video_count", default=0, min=0, max=SEGMENT_COUNT_MAX, step=1,
+                    display_name="生成视频数量",
+                    tooltip="参数：0 = LLM 按剧情时间线长度，自动计算需要生成多少段视频。\n"
+                            "参数：1~60 = 设置固定生成数量，最多支持一次生成60段视频！"),
+                io.Combo.Input("story_style", options=story_styles, default=story_styles[0],
+                    display_name="故事风格", tooltip="故事风格（剧本处理器按此风格拆解与润色）"),
+                io.String.Input("story_name", display_name="故事名称", default="机智罗",
+                    tooltip="故事名称（用于保存命名 / 落盘目录 output/jzl/{故事名} / 生成视频管理）"),
+                io.Model.Input("model", display_name="主模型", optional=True),
+                io.Clip.Input("clip", display_name="CLIP", optional=True),
+                io.Vae.Input("vae", display_name="视觉VAE", optional=True),
+                io.Vae.Input("audio_vae", display_name="音频VAE", optional=True),
+                io.String.Input("internal_prompt", display_name="节点内提示词", multiline=True,
+                    socketless=True,
+                    tooltip="节点内编辑的提示词（提示词来源，随工作流保存）"),
+                io.String.Input("manager_settings", display_name="节点配置", multiline=True,
+                    socketless=True, default="",
+                    tooltip="本节点独立保存的完整配置 JSON（资产/增强/采样解码/无限时长衔接/保存），随工作流保存，节点间互不影响"),
+            ],
+            outputs=[
+                io.String.Output("script", display_name="已处理剧本",
+                    tooltip="全部 LLM 处理后的剧本/提示词文本（供下游展示/保存用；「生成视频查看器」直接读盘）"),
+            ],
+            is_output_node=True,  # 自带逐段落盘+读盘拼接，单节点即可运行
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, manager_settings="", **kwargs):
+        try:
+            cfg = _parse_node_manager_settings(manager_settings)
+            enhance = cfg.get("enhance") or {}
+            sample_decode = cfg.get("sample_decode") or {}
+            llm_random = (enhance.get("seed_control") or "randomize") == "randomize"
+            samp_random = (sample_decode.get("seed_mode") or "randomize") == "randomize"
+            if llm_random or samp_random:
+                return f"random@{time.time_ns()}"
+            gen_keys = ["run_mode", "video_count", "story_style", "duration",
+                        "aspect_ratio", "megapixels", "scale_factor", "upscale_scale",
+                        "internal_prompt"]
+            gen_sig = {k: kwargs.get(k) for k in gen_keys}
+            return f"{cfg}|{gen_sig}"
+        except Exception:
+            return "no-manager"
+
+    @classmethod
+    def execute(cls, run_mode="拆解故事模式", video_count=VIDEO_COUNT_DEFAULT, aspect_ratio="16:9 (Widescreen)",
+                megapixels=1.0, duration="5-5", scale_factor=1.0, upscale_scale=1.5, display_info="",
+                story_style="热血战斗", story_name="",
+                internal_prompt=None, manager_settings="",
+                clip=None, vae=None, audio_vae=None, model=None) -> io.NodeOutput:
+        _vc_auto = _parse_video_count(video_count)[0] == "auto"   # 「剧情决定」标记（manager 建后写入）
+        video_count = _vc_count(video_count)     # 「剧情决定」→ 占位 6（拆解后按实际分段数覆盖）
+        """无限时长：LLM 拆解（每段新剧情）→ 逐段【上段衔接引导 + 编码 + 一采 + 二采 + 解码】→
+        每段即时落盘 → 裁掉段首被钉住的窗口帧 → 释放该段显存 → 下一段。跑 N 段与跑 1 段占用不叠加。"""
+        run_mode = _normalize_run_mode(run_mode)
+        pure_prompt = run_mode == "仅提示词输出"
+        expand_mode = run_mode == "故事扩写模式"
+        passthrough = run_mode == "穿透生成模式"
+        story_mode = "拆解模式 (Decompose)"
+
+        story_name = (story_name or "").strip()
+        if not story_name:
+            print("[JZL-短剧导演台] ⚠️ 必须填写「故事名称」才能生成（已终止）")
+            return io.NodeOutput("", block_execution="必须填写「故事名称」后才能生成",
+                                  ui={"manager_error": ["必须填写「故事名称」后才能生成"]})
+
+        manager = _parse_node_manager_settings(manager_settings)
+        manager["_jzl_auto_count"] = _vc_auto          # 「剧情决定」标记（供 _run_script_processor/日志用）
+        duration_lo, duration_hi, duration_desc = _parse_duration_spec(duration)
+        enhance = manager.get("enhance") or {}
+        assets_cfg = manager.get("assets") or {}
+        sample_decode = manager.get("sample_decode") or {}
+        # ♾️ 衔接设置（面板「🎭 采样解码设置 → 无限时长衔接」；缺省即官方 Motion Context 基线）
+        _inf = sample_decode.get("infinite") or {}
+        # 「无限时长衔接」总开关：关闭后每段独立生成（等价 Max 语义）
+        _seam_on = _inf.get("enabled", True) is not False
+        seam_window_cfg = _seam_resolve_window(_inf.get("window", SEAM_DEFAULT_WINDOW))
+        seam_audio_link = _seam_flag(_inf.get("audio_link"), True)
+        # 「音频同步裁剪」：默认**开启**（画面丢了衔接帧，音频必须同量裁掉，否则音画错位）。
+        # 存储语义：`audio_no_trim: true` 才表示关闭（仅供对比实验）；历史上的 `audio_trim: false`
+        # 视为误存（那时关掉会直接造成段尾画面冻结/音画错位）→ 一律按开启处理。
+        seam_trim_audio = not _seam_flag(_inf.get("audio_no_trim"), False)
+        # 裁切方式：pixel（默认）= latent 不裁 + 解码后丢帧（保 VAE 解码分组相位）；
+        # latent = 旧行为（已证会闪烁，仅作 A/B 对照）；none = 不裁（诊断用，成片会多出衔接帧）
+        _tm = str(_inf.get("trim_mode") or "")
+        seam_trim_mode = "latent" if "latent" in _tm else ("none" if "不裁" in _tm else "pixel")
+        # 过渡丢弃帧数（settling burn-in）：钉住窗口之外再多丢几帧，吸掉“模仿引导→启动新动作”的卡顿（hold→pop，官方默认 12）
+        seam_settle_cfg_raw = _seam_settle_cfg(_inf.get("settle"))
+        # ⭐ 「设定时长 = 落盘时长」的硬前提：丢弃量（窗口 + 过渡）必须是 **17 的倍数**。
+        #    生成帧数恒为 17K+5、落盘目标恒为 17k+5 ⇒ 丢弃 ≡ 0 (mod 17) ⇒ 过渡 ≡ 12 (mod 17) ⇒ 12/29/46。
+        #    这组值同时满足「latent 域裁切要求丢弃 token 是 5 的倍数」→ 两套约束天然一致，不会互相打架。
+        seam_settle = _seam_snap_settle(seam_window_cfg, seam_settle_cfg_raw)
+        if seam_settle != seam_settle_cfg_raw:
+            print(f"[JZL-短剧导演台] 过渡丢弃 {seam_settle_cfg_raw} 帧 → 自动对齐为 {seam_settle} 帧"
+                  f"（只有「窗口 {seam_window_cfg} + 过渡」是 17 的倍数时，落盘帧数才能精确 = 设定帧数）")
+        # 引导来源：latent（默认）= 上段一采 latent 尾部切片直传；pixel = 官方 AddGuide 同款（尾帧→VAE重编码）
+        seam_guide_source = "pixel" if "重编码" in str(_inf.get("guide_source") or "") else "latent"
+        # 二采引导源：first（默认）= 上段一采 latent 尾部（插值对齐二采画布）；
+        #   second = 上段**二采** latent 尾部（与二采画布天然同画布、同 refined 版本，更准；
+        #   代价：CPU 常驻一份尾部切片，只留“配置窗口”所需 token，通常几~几十 MB）
+        _sg2 = str(_inf.get("second_guide") or "")
+        seam_second_guide = "second" if ("二采" in _sg2 or _sg2.strip().lower() == "second") else "first"
+        # ⭐ 段首衔接跑道（秒）= (窗口 + 过渡) / 24：段 2+ 的**生成时长 = 设定时长 + 跑道**。
+        #    段首这一段是「承接上一段末帧」的锁定画面 + 模型启动过渡，成片会整段裁掉 ⇒ 落盘时长精确 = 用户设定。
+        #    单段（count=1）或诊断档「不裁切」时跑道 = 0（没有衔接就没有额外生成内容）。
+        _seg_count_probe = _vc_count(video_count)
+        seam_runway_sec = _seam_runway_seconds(seam_window_cfg, seam_settle,
+                                               enabled=(_seam_on and _seg_count_probe > 1 and seam_trim_mode != "none"))
+        if seam_runway_sec > 0:
+            print(f"[JZL-短剧导演台] 段首衔接跑道 {seam_runway_sec:.3f} 秒（窗口 {seam_window_cfg} + 过渡 {seam_settle} "
+                  f"= {seam_window_cfg + seam_settle} 帧/24fps）→ 第 2 段起生成时长 = 设定时长 + 跑道，成片裁掉 ⇒ 落盘 = 设定时长")
+        # ♾️ 接缝亮度匹配（只做亮度）：把每段开头若干帧的亮度朝上段末帧平滑过渡（加性、限幅）
+        # 缺省 = 开（与官方 Director 一致：该做法是他们试错后**保留**的那一种，只动亮度不动 RGB）
+        seam_luma_on = _seam_flag(_inf.get("luma_match"), True)
+        _save_cfg = manager.get("save") or {}
+        save_mode = (_save_cfg.get("mode") or "分段保存").strip() or "分段保存"
+        auto_merge_delete = bool(_save_cfg.get("auto_merge_delete"))
+        prompt_lang = (enhance.get("prompt_lang") or "中文 [ZH]").strip() or "中文 [ZH]"
+
+        if not isinstance(internal_prompt, str):
+            internal_prompt = ""
+        prompt_input = (internal_prompt or "").strip()
+
+        seed_control = (enhance.get("seed_control") or "randomize").strip() or "randomize"
+        current_seed = int(enhance.get("seed", 0) or 0)
+        if seed_control == "randomize":
+            llm_seed = int(torch.randint(0, 0x7fffffffffffffff, (1,)).item())
+        else:
+            llm_seed = current_seed
+        _trim_label = {"pixel": "像素域裁切（保解码相位）", "latent": "latent域裁切（旧·诊断）",
+                       "none": "不裁切（诊断）"}.get(seam_trim_mode, seam_trim_mode)
+        # 只在「非默认配置」时追加提示，默认档（像素域裁切 / 亮度匹配开 / 一采 latent 引导）不再逐项刷屏
+        _banner_extra = ""
+        if seam_trim_mode != "pixel":
+            _banner_extra += f" | 裁切={_trim_label}"
+        if seam_runway_sec > 0 and not seam_luma_on:
+            _banner_extra += " | 亮度匹配=关"
+        if not seam_audio_link:
+            _banner_extra += " | 音频衔接=关"
+        if not seam_trim_audio:
+            _banner_extra += " | 音频同步裁剪=关"
+        if seam_guide_source == "pixel":
+            _banner_extra += " | 引导=上段尾帧→VAE重编码"
+        if seam_second_guide == "second":
+            _banner_extra += " | 二采引导=上段二采latent尾部"
+        if expand_mode:
+            _banner_extra += f" | 扩写≈{int(enhance.get('expand_words') or 500)}字"
+        _run_banner("短剧导演台", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
+                    story_style, story_name, enhance, _banner_extra)
+
+        # ── 故事扩写模式：只按「故事风格 + 扩写字数」扩写正文，不拆解；纯文本输出，不生成视频 ──
+        if expand_mode:
+            if not prompt_input:
+                _llm_finish(enhance)
+                return io.NodeOutput("")
+            _ew = int(enhance.get("expand_words") or 500)
+            _esrc = str(enhance.get("expand_source") or "素材")
+            from .nodes_llama import _next_generation_dir
+            gen_dir = _next_generation_dir(story_name)
+            _xri, _xrv, _xra, _ = _build_asset_intro(assets_cfg)
+            expanded, x_err = _run_story_expander(
+                prompt_input, manager, story_style, story_name, prompt_lang, llm_seed,
+                expand_words=_ew, expand_source=_esrc,
+                ref_image_intro=_xri, ref_video_intro=_xrv, ref_audio_intro=_xra,
+                gen_dir=gen_dir)
+            if x_err:
+                print(f"[JZL-短剧导演台] LLM/API 出错，终止：{x_err}")
+                return io.NodeOutput("", block_execution=f"⚠️ LLM/API 出错，已终止：{x_err}")
+            if expanded:
+                _save_last_script(story_name, expanded)
+            _llm_finish(enhance)
+            _seed_ui = _build_seed_ui(manager, enhance, seed_control, current_seed, llm_seed)
+            return io.NodeOutput(expanded, ui=_seed_ui)
+
+        # ── 仅提示词输出：拆解 + 增强（不含扩写），只 LLM 处理，不生成视频 ──
+        if pure_prompt:
+            if not prompt_input:
+                _llm_finish(enhance)
+                return io.NodeOutput("")
+            _pcount = _vc_count(video_count)
+            ri, rv, ra, _ = _build_asset_intro(assets_cfg)
+            _pe, _pp, _pv, _pa = _detect_enables(prompt_input, assets_cfg)
+            from .nodes_llama import _next_generation_dir
+            gen_dir = _next_generation_dir(story_name)
+            processed, p_err = _run_script_processor(
+                prompt_input, manager, _pcount, story_style, story_name, duration, prompt_lang, llm_seed,
+                ref_image_intro=ri, ref_video_intro=rv, ref_audio_intro=ra,
+                enable_scene=_pe, enable_props=_pp, enable_video=_pv, enable_audio=_pa,
+                mode="拆解模式 (Decompose)", gen_dir=gen_dir)
+            if p_err:
+                print(f"[JZL-短剧导演台] LLM/API 出错，终止：{p_err}")
+                return io.NodeOutput("", block_execution=f"⚠️ LLM/API 出错，已终止：{p_err}")
+            if enhance.get("enabled", False):
+                processed, p_err2 = _run_prompt_enhancer(processed, manager, duration, story_style, prompt_lang, llm_seed, story_name, gen_dir)
+                if p_err2:
+                    print(f"[JZL-短剧导演台] LLM/API 出错，终止：{p_err2}")
+                    return io.NodeOutput("", block_execution=f"⚠️ LLM/API 出错，已终止：{p_err2}")
+            if processed:
+                _save_last_script(story_name, processed)
+            _llm_finish(enhance)
+            _seed_ui = _build_seed_ui(manager, enhance, seed_control, current_seed, llm_seed)
+            return io.NodeOutput(processed, ui=_seed_ui)
+
+        # 清空重建池，避免旧资产残留
+        JZL_ASSET_POOL.clear()
+        JZL_SLOT_MAP.clear()
+        manifest, errors = _load_assets_into_pool(assets_cfg)
+
+        width, height = _resolve_gen_size(aspect_ratio, megapixels)
+        length = _resolve_length(duration_hi)
+        count = video_count
+
+        ref_image_intro, ref_video_intro, ref_audio_intro, slot_to_asset = _build_asset_intro(assets_cfg)
+        JZL_SLOT_MAP.update(slot_to_asset)
+        enable_scene, enable_props, enable_video, enable_audio = _detect_enables(prompt_input, assets_cfg)
+
+        # 故事拆解 / 故事扩写：输入必须是自然语言故事；含六段式标签（已拆解提示词）→ 报错终止
+        if run_mode in ("故事拆解模式", "故事扩写模式"):
+            _nl_err = _check_natural_language_input(prompt_input)
+            if _nl_err:
+                print(f"[JZL-短剧导演台] ❌ {_nl_err}（已终止）")
+                return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_nl_err}",
+                                     ui={"manager_error": [_nl_err]})
+        has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
+        # ⭐ 衔接跑道：段 2+ 的「生成时长 = 设定时长 + 跑道」（段首跑道会被裁掉 ⇒ 落盘时长 = 设定时长）。
+        #    `gen_duration_lo` = 生成时长下限（块内缺 **时长** 字段时的兜底，也按生成时长算）。
+        gen_duration_lo = duration_lo + seam_runway_sec
+        if seam_runway_sec > 0 and has_shots:
+            print(f"[JZL-短剧导演台] ⚠️ 你自带了 [SHOT_START] 剧本块：本节点会再裁掉段首 "
+                  f"{seam_window_cfg + seam_settle} 帧跑道 → 落盘 = 生成 − 跑道；"
+                  f"若要落盘 = 设定时长，请把每段 **时长** 写成「设定时长 + {seam_runway_sec:.2f} 秒」")
+        gen_dir = None
+        if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
+            from .nodes_llama import _next_generation_dir
+            gen_dir = _next_generation_dir(story_name)
+            prompt_input, err = _run_script_processor(
+                prompt_input, manager, count, story_style, story_name, duration, prompt_lang, llm_seed,
+                ref_image_intro=ref_image_intro, ref_video_intro=ref_video_intro, ref_audio_intro=ref_audio_intro,
+                enable_scene=enable_scene, enable_props=enable_props,
+                enable_video=enable_video, enable_audio=enable_audio, mode=story_mode, gen_dir=gen_dir,
+                seam_runway=seam_runway_sec)
+            if err:
+                print(f"[JZL-短剧导演台] LLM/API 出错，终止生成：{err}")
+                return io.NodeOutput(prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
+
+        if not passthrough and enhance.get("enabled", False):
+            if gen_dir is None:
+                from .nodes_llama import _next_generation_dir
+                gen_dir = _next_generation_dir(story_name)
+            prompt_input, err = _run_prompt_enhancer(prompt_input, manager, duration, story_style, prompt_lang, llm_seed, story_name, gen_dir,
+                                                     seam_runway=seam_runway_sec)
+            if err:
+                print(f"[JZL-短剧导演台] LLM/API 出错，终止生成：{err}")
+                return io.NodeOutput(prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
+
+        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        if passthrough:
+            _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
+                                                      auto_count=bool(manager.get("_jzl_auto_count")), tag="短剧导演台")
+            if _pt_err:
+                print(f"[JZL-短剧导演台] ❌ {_pt_err}（已终止）")
+                return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_pt_err}",
+                                     ui={"manager_error": [_pt_err]})
+            count = _pt_n
+
+        prompt_input = _normalize_dispatch_slots(prompt_input, slot_to_asset)
+        prompt_input = _normalize_scene_slots(prompt_input, slot_to_asset)
+        prompt_input = _prune_fantasy_assets(prompt_input, slot_to_asset)
+
+        if not passthrough and prompt_input:
+            _save_last_script(story_name, prompt_input)
+
+        _llm_finish(enhance)
+        _seed_ui = _build_seed_ui(manager, enhance, seed_control, current_seed, llm_seed)
+
+        # ── 分段：按 [SHOT_START] 块切分（每段一个独立新提示词 → 剧情持续推进）──
+        shots = re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', prompt_input or "", re.DOTALL)
+        if manager.get("_jzl_auto_count") and shots:
+            count = max(1, min(SEGMENT_COUNT_MAX, len(shots)))   # 「剧情决定」：以实际拆解出的分段数为准
+        base_seed = int(sample_decode.get("seed", 0) or 0)
+        seed_mode = sample_decode.get("seed_mode", "randomize") or "randomize"
+
+        saved_files = []
+        _JZL_SEG_TRACEBACKS.clear()   # 本次运行的分段失败调用栈（诊断报告用）
+        _JZL_SEG_ERR_SEEN.clear()     # 每轮重置去重表：否则本轮第 1 段失败会被上一轮抑制掉调用栈
+        _out_root = os.path.abspath(folder_paths.get_output_directory())
+        _jzl_dir = os.path.join(_out_root, "jzl")
+        _safe_story = _safe_story_name(story_name)
+        out_video_dir = os.path.join(_jzl_dir, _safe_story)
+        try:
+            os.makedirs(out_video_dir, exist_ok=True)
+        except Exception as _me:
+            errors.append(f"无法创建输出目录：{out_video_dir}（{_me}）")
+        _batch = _next_batch(out_video_dir, _safe_story)
+        _seg_start = _next_counter(out_video_dir, f"{_safe_story}_{_batch}次生成分段")
+        first_seed = None
+        # ♾️ 拼接保同时收集各段无損 WAV → 合并时「音频统一编码一次」（消除段边界 AAC 误差）
+        _merge_wavs = [] if save_mode == "拼接保存" else None
+        # ♾️ 衔接状态：只保留「上一段一采 latent」一份（CPU，千万级元素≈20MB，恒定不叠加）
+        prev_latent = None
+        # ♾️ 二采引导状态（仅 second 模式保留）：上段二采 latent 的**尾部切片**（CPU，只留配置窗口所需 token）
+        prev_latent2 = None
+        # ♾️ 接缝亮度匹配参考：上一段**落盘后**末帧的平均亮度（只存一个标量，不占内存）
+        prev_luma = None
+        total_frames = 0
+        for i in range(count):
+            try:
+                _clean_cache()
+            except Exception:
+                pass
+            raw = shots[i].strip() if i < len(shots) else ""
+            if i > 0 and not raw:
+                print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 剧本里没有第 {i + 1} 段"
+                      f"（[SHOT_START] 块只有 {len(shots)} 个）→ 本段只能用占位提示词，请核对拆解结果")
+            h3, scene, vid, aud = _parse_four_in_one(raw)
+            if not h3:
+                h3 = raw.strip() if raw.strip() else (
+                    prompt_input.strip() if i == 0 and prompt_input else "[未找到H3提示词]")
+
+            mention_names, h3 = _extract_mentions(h3)
+            ref_images, ref_videos, ref_audios, ref_names = _collect_refs_with_names(scene, vid, aud, mention_names)
+
+            mode = "纯文本生成音视频-T2VA"
+            if ref_videos or ref_images or ref_audios:
+                mode = "多参考生成音视频-REF2VA"
+            can_generate = clip is not None and vae is not None and model is not None
+            if (ref_videos or ref_audios) and audio_vae is None:
+                can_generate = False
+            seed = _resolve_seed(seed_mode, base_seed, i)
+            if first_seed is None:
+                first_seed = seed
+            if not can_generate:
+                _need = "model/CLIP/VAE"
+                if (ref_videos or ref_audios) and audio_vae is None:
+                    _need = "model/CLIP/VAE/audio_vae（本段含视频或音频参考）"
+                errors.append(f"第{i + 1}段跳过：未连接 {_need}，仅完成剧本分段（未生成视频）")
+                continue
+
+            # ⭐ 段 2+ 的 **时长** 字段 = 生成时长（设定 + 跑道）；缺字段时兜底也用生成时长。
+            #    落盘帧数 = 生成帧数 − 段首丢弃(窗口+过渡) ⇒ 逐段都会核对是否 ≈ 设定时长（见下方裁切日志）。
+            seg_len = _seg_len_for(raw, gen_duration_lo)
+            _saved_target = _seg_len_for(None, duration_lo)   # 本段落盘目标帧数（完整独立生成 = 设定时长）
+            print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 生成中（{mode}，{seg_len} 帧"
+                  f"{f'，含段首衔接 {seam_window_cfg + seam_settle} 帧' if (i > 0 and seam_runway_sec > 0) else ''}"
+                  f"，种子 {seed}，参考 {len(ref_images)}图/{len(ref_videos)}视频/{len(ref_audios)}音频）")
+            try:
+                # ① 编码（ref2va，与官方 ReferenceToVideo 一致；**每段都重新注入原始参考**→ 抗长链漂移）
+                positive, latent = _encode_refs(
+                    "短剧导演台", f"分段 {i + 1}/{count} ",
+                    clip, vae, audio_vae, h3, width, height, seg_len,
+                    ref_images, ref_videos, ref_audios, ref_names, ref_scale=scale_factor, model=model)
+                positive_base = positive   # 未注入引导的“干净” positive（二采可能要用另一份引导重建）
+
+                # ② ♾️ 衔接：第 2 段起把上一段一采 latent 的尾部窗口钉成本段首帧引导
+                seam_plan = None
+                if i > 0 and _seam_on and prev_latent is not None:
+                    # 本段至少要装得下「窗口 + 过渡」，否则整段会被裁空（成片变 0 帧 / 只剩 1 帧）
+                    _drop_need = seam_window_cfg + seam_settle
+                    if seg_len <= _drop_need:
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 本段 {seg_len} 帧装不下"
+                              f"「衔接窗口 {seam_window_cfg} + 过渡 {seam_settle} = {_drop_need} 帧」"
+                              f"→ 本段跳过衔接（该段落盘 {seg_len} 帧 = 设定时长，无跑道可裁；"
+                              f"若落盘明显偏短，请检查剧本该段 **时长** 是否按「设定 + 跑道」写）")
+                    else:
+                        seam_plan = _seam_plan(prev_latent, seam_window_cfg)
+                        if seam_plan is None:
+                            print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 上段 latent 不满足衔接条件"
+                                  f"（{seam_window_cfg} 帧窗口放不下或段长非 17k+5），本段按独立生成处理")
+                if seam_plan is not None:
+                    positive, _kf = _seam_apply_guide(positive, prev_latent, seam_plan,
+                                                     audio_link=seam_audio_link,
+                                                     vae=vae, guide_source=seam_guide_source)
+                    # 画布一致性兜底：引导 latent 必须与本次采样目标同画布（PackedLayout 按目标画布算行数）
+                    positive = _seam_fit_guides_to_canvas(positive, latent["samples"], tag="短剧导演台")
+                    if _kf is not None and int(_kf["latent"].shape[2]) != int(seam_plan["trim_tokens"]):
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 引导 latent token 数 "
+                              f"{int(_kf['latent'].shape[2])} ≠ 期望 {seam_plan['trim_tokens']}（衔接窗口可能不准）")
+                    _a_txt = (f"＋音频尾部 {seam_plan['trim_audio']} 步"
+                              if (_kf and "audio_latent" in _kf) else "（音频不衔接）")
+                    if seam_plan["adjusted"]:
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：窗口按上段段长自动调整为 "
+                              f"{seam_plan['window']} 帧（配置 {seam_window_cfg} 帧）")
+                    print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 衔接：上段尾部 {seam_plan['window']} 帧"
+                          f"（token {seam_plan['trim_tokens']}）{_a_txt}，解码后裁掉开头 {seam_plan['window']} 帧")
+
+                positive = _apply_semantic_bridge(positive, manager, tag="短剧导演台")
+                # ③ 第一次采样（衔接引导源 = 本段一采 latent，与下段目标 latent 同画布同空间）
+                first_samples = _sample_first_pass(model, positive, latent, sample_decode, seed, vae, tag="短剧导演台")
+                samples = first_samples
+
+                # ④ latent 放大 + 第二次采样（可选）：二采结果只用于解码落盘
+                #    二采引导源（面板「二采引导来源」）：
+                #      first（默认）= 复用本段一采引导（上段一采 latent）→ 内部按二采画布插值对齐
+                #      second        = 用上一段**二采** latent 尾部重建引导（与二采画布同画布、同 refined 版本）
+                _second = (sample_decode or {}).get("second") or {}
+                if _second.get("enabled") and not _selflift_mode(sample_decode):
+                    print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 二次采样：latent 放大 {upscale_scale}x"
+                          f"（{_second.get('sampler', 'euler')}/{_second.get('scheduler', 'simple')}，"
+                          f"{_second.get('steps', 3)}步，denoise {_second.get('denoise', 0.3)}）…")
+                    _pos2 = positive
+                    if seam_second_guide == "second" and seam_plan is not None and prev_latent2 is not None:
+                        _pos2 = _seam_apply_guide(positive_base, prev_latent2, seam_plan,
+                                                 audio_link=seam_audio_link, vae=None,
+                                                 guide_source="latent")[0]
+                    samples = _run_second_sampling(model, _pos2, first_samples, sample_decode, _second, upscale_scale, seed, tag="短剧导演台")
+                    _t1 = int(first_samples.tensors[0].shape[2]) if getattr(first_samples, "is_nested", False) else int(first_samples.shape[2])
+                    _t2 = int(samples.tensors[0].shape[2]) if getattr(samples, "is_nested", False) else int(samples.shape[2])
+                    if _t2 != _t1:
+                        raise RuntimeError(
+                            f"二次采样改变了时间轴长度（一采 {_t1} token → 二采 {_t2} token），"
+                            f"无法保证段间衔接裁切正确；请关闭二次采样后重试")
+                    # ♾️ second 模式：把本段二采 latent 的尾部切片（配置窗口所需 token）留给下一段做同画布引导
+                    if seam_second_guide == "second":
+                        prev_latent2 = _seam_keep_tail(samples, seam_window_cfg)
+                else:
+                    prev_latent2 = None
+
+                # ⑤ ♾️ 裁掉段首被 keyframe 钉住的窗口帧
+                #    默认「像素域」：latent 完全不裁（VAE 解码器必须看到完整 5k+2 序列 → 分组相位 0），解码后再丢帧
+                #    「latent 域」：先裁 latent 再解码（解码量更少、保留帧不含被裁内容），但**丢弃 token 数必须是 5 的倍数**
+                #    （= 丢弃帧数是 17 的倍数 ⇒ 过渡=12/29/46）；不满足时按方案 A 自动回退像素域（永不闪烁）
+                seam_trim_in_latent = (seam_plan is not None and seam_trim_mode == "latent")
+                seam_latent_drop = None
+                if seam_trim_in_latent:
+                    seam_latent_drop = _seam_latent_drop(seam_plan["window"], seam_settle)
+                    if seam_latent_drop is None:
+                        seam_trim_in_latent = False
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：latent 域裁切要求「窗口 "
+                              f"{seam_plan['window']} + 过渡 {seam_settle}」是 17 的倍数（过渡需为 12/29/46）"
+                              f"→ 自动回退像素域裁切（保证不闪烁）")
+                    else:
+                        samples = _seam_trim_head(samples, seam_plan, trim_audio=False,
+                                                  drop_tokens=seam_latent_drop["tokens"])
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} latent 域裁切：丢开头 "
+                              f"{seam_latent_drop['tokens']} token = {seam_latent_drop['frames']} 帧"
+                              f"（窗口 {seam_plan['window']} + 过渡 {seam_settle}）")
+
+                image, audio = _decode_av(vae, audio_vae, samples, sample_decode, tag="短剧导演台")
+                _raw_frames = int(image.shape[0]) if image is not None else 0
+                if seam_plan is not None and seam_latent_drop is not None:
+                    # latent 域：视频已在 token 域裁好 → 音频在波形域按「同一丢弃帧数」裁（与像素域同一套音画规则）
+                    if seam_trim_audio:
+                        audio = _seam_trim_audio_frames(audio, seam_latent_drop["frames"], _raw_frames)
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} latent 域裁切完成：解码 {_raw_frames} 帧"
+                              f"（少解码 {seam_latent_drop['frames']} 帧），音频同步裁剪")
+                    else:
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 「音频同步裁剪」已关闭：画面已丢 "
+                              f"{seam_latent_drop['frames']} 帧而音频不裁 → 音画错位 "
+                              f"{seam_latent_drop['frames'] / 24.0:.3f}s（仅作对比实验）")
+                elif seam_plan is not None:
+                    if seam_trim_mode == "none":
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 诊断模式「不裁切」→ 成片开头会保留 "
+                              f"{seam_plan['window']} 帧衔接帧（重复上段尾部），仅用于定位问题")
+                    else:
+                        image, audio = _seam_trim_decoded(image, audio, seam_plan,
+                                                          settle_frames=seam_settle,
+                                                          trim_audio=seam_trim_audio, tag="短剧导演台")
+                        _kept = int(image.shape[0]) if image is not None else 0
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 像素域裁切：解码 {_raw_frames} 帧"
+                              f" − 衔接 {seam_plan['window']} − 过渡 {seam_settle} = 保留 {_kept} 帧"
+                              f"（{_kept / 24.0:.2f}s）"
+                              f"{'，音频同步裁剪' if seam_trim_audio else '，⚠️ 音频未裁剪（仅对比实验）'}")
+                _frames = int(image.shape[0]) if image is not None else 0
+                # ⭐ 帧账核对：落盘帧数应 ≈ 设定时长对应的帧数（生成 = 设定 + 跑道，裁掉跑道后回到设定）
+                if i > 0 and seam_runway_sec > 0 and seam_plan is not None and seam_trim_mode != "none":
+                    _delta = _frames - _saved_target
+                    if abs(_delta) <= 2:
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 落盘 {_frames} 帧"
+                              f"（生成 {seg_len} − 裁切 {seg_len - _frames}）= {_frames / 24.0:.2f} 秒 ✓")
+                    else:
+                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 落盘 {_frames} 帧 = {_frames / 24.0:.2f} 秒；"
+                              f"⚠️ 比设定时长差 {_delta:+d} 帧（{_delta / 24.0:+.2f}s）：该段 **时长** 可能没按"
+                              f"「设定 + 跑道」写，或「设定时长 + 跑道」超出单段上限 20 秒")
+                total_frames += _frames
+
+                # ★ ♾️ 接缝亮度匹配（**只做亮度**）：把本段开头若干帧的平均亮度朝上一段末帧平滑过渡。
+                #   只做加性（R=G=B）、单帧限幅 ±0.10、前 12 帧渐入、三项差都 < 0.008 时零改动。
+                #   官方 Director 实测结论：乘法增益 / 长 RGB 混合 / 开口亮度渐变都出问题，只有这一种安全。
+                #   必须在落盘**之前**做（拼接是 -c copy，不会重编码）；诊断档「不裁切」时不动像素。
+                if (seam_luma_on and prev_luma is not None and seam_plan is not None
+                        and seam_trim_mode != "none" and image is not None):
+                    image = _seam_luma_ramp(image, prev_luma)[0]
+
+                # ★ 每段解码完立即 ffmpeg 落盘（拼接保存时额外保留一份无損 WAV，供最后音频统一编码）
+                _wav_keep = None
+                if _merge_wavs is not None and audio is not None:
+                    _wav_keep = os.path.join(
+                        out_video_dir, f"._jzl_seg{i + 1}_{_seg_start + i}_{os.getpid()}.wav")
+                    _merge_wavs.append(_wav_keep)   # 先登记：即使落盘失败也能在收尾时一起清理
+                _sp = _save_segment_mp4(image, audio, out_video_dir, i + 1,
+                                        story_name=_safe_story, counter=_seg_start + i, batch=_batch,
+                                        keep_wav=_wav_keep)
+                saved_files.append(_sp)
+                print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 已落盘：{_sp}（{_frames} 帧）")
+
+                # ★ 衔接源：本段一采 latent 转 CPU 留一份给下一段（二采不影响它）
+                prev_latent = first_samples.to("cpu") if hasattr(first_samples, "to") else first_samples
+                # ★ 接缝亮度匹配参考：只记「本段**落盘后**末帧的平均亮度」一个标量（零内存开销）
+                if image is not None and hasattr(image, "shape") and int(image.shape[0]) > 0:
+                    try:
+                        prev_luma = _seam_frame_luma(image[-1])
+                    except Exception:
+                        prev_luma = None
+
+                # ★ 释放该段全部显存/内存（跑 N 段与跑 1 段占用不叠加）
+                try:
+                    del image, audio, samples, positive, latent, first_samples
+                except Exception:
+                    pass
+                _clean_cache()
+            except Exception as e:
+                err = str(e)
+                _tb_txt = ""
+                try:
+                    import traceback as _tb
+                    _tb_txt = _tb.format_exc()
+                except Exception:
+                    pass
+                _seg_fail_context(i + 1, _tb_txt)
+                if "no kernel image" in err:
+                    err += (f"\n  [JZL提示] CUDA/ROCm 内核与显卡架构不匹配（no kernel image）：当前 torch 没有该 GPU 的编译内核。"
+                            f"诊断：{_gpu_diag_hint()}\n"
+                            f"  请确认云机显卡型号与 torch/CUDA 版本匹配。")
+                elif "CUDA error" in err or "cudaError" in err or "out of memory" in err:
+                    err += (f"\n  [JZL提示] CUDA 运行时错误，诊断：{_gpu_diag_hint()}\n"
+                            f"  可能原因：显存不足、驱动/算子在 Blackwell(sm120) 不兼容、dtype/精度、或某算子非法参数"
+                            f"（如 attention 后端/参考张量）。")
+                _oom_hint = _oom_diag_hint(err, sample_decode, width, height,
+                                       _seg_len_for(raw, duration_lo))
+                if _oom_hint:
+                    err += _oom_hint
+                _attn_hint = _attention_diag_hint(err)
+                if _attn_hint:
+                    err += _attn_hint
+                errors.append(f"第{i + 1}段生成失败：{err}")
+                _log_seg_error("短剧导演台", i + 1, err, _tb_txt)
+
+        # 采样种子回写：randomize 时把第 1 段实际种子回传前端
+        if seed_mode == "randomize" and first_seed is not None:
+            _samp_ui = {"seed_update_sample": [{"seed": str(int(first_seed)), "seed_control": seed_mode}]}
+            print(f"[JZL-短剧导演台] 采样种子（本轮第 1 段）={int(first_seed)} → 已回传前端显示")
+            if _seed_ui:
+                _seed_ui = dict(_seed_ui)
+                _seed_ui.update(_samp_ui)
+            else:
+                _seed_ui = _samp_ui
+
+        if (sample_decode or {}).get("decode_cleanup") == "卸载显存模型":
+            _cleanup_vram("卸载显存模型", tag="短剧导演台")
+
+        # ── 保存模式：分段保存（每段已即时落盘）/ 拼接保存（读盘 concat 成一个）──
+        out_files = list(saved_files)
+        if save_mode == "拼接保存" and saved_files:
+            try:
+                _merge_out = os.path.join(
+                    out_video_dir,
+                    f"{_safe_story}_{_batch}次生成分段合并_{_next_counter(out_video_dir, f'{_safe_story}_{_batch}次生成分段合并'):05d}.mp4")
+                _merged = _merge_mp4_concat(saved_files, _merge_out, audio_wavs=_merge_wavs)
+                print(f"[JZL-短剧导演台] 拼接保存完成（{len(saved_files)} 段按顺序合并）：{_merged}")
+                if auto_merge_delete:
+                    _del_cnt = 0
+                    for _sp in saved_files:
+                        try:
+                            if os.path.exists(_sp):
+                                os.remove(_sp); _del_cnt += 1
+                        except Exception:
+                            pass
+                    print(f"[JZL-短剧导演台] 已按配置删除 {_del_cnt} 个分段视频（仅保留合并结果）")
+                out_files = [_merged]
+            except Exception as _me:
+                errors.append(f"拼接保存失败：{_me}（已保留各分段视频）")
+
+        # 清理临时无損 WAV（已合入成片或不再需要）
+        if _merge_wavs:
+            for _w in _merge_wavs:
+                try:
+                    if os.path.exists(_w):
+                        os.remove(_w)
+                except Exception:
+                    pass
+
+        if errors:
+            for e in errors:
+                print(f"[JZL-短剧导演台] {e}")
+
+        _dur = (total_frames / float(VIDEO_FPS)) if total_frames else 0.0
+        print(f"[JZL-短剧导演台] 本次落盘：{out_video_dir}（视频 {len(saved_files)} 个）")
+        print(f"[JZL-短剧导演台] 本次成片合计 {total_frames} 帧 = {_dur:.2f} 秒 @24fps（{count} 段）")
+        if seam_runway_sec > 0 and saved_files:
+            _set_frames = _seg_len_for(None, duration_lo)
+            print(f"[JZL-短剧导演台] ⏱️ 时长对照：设定 {_set_frames} 帧/段 = {_set_frames / float(VIDEO_FPS):.2f} 秒/段"
+                  f" × {len(saved_files)} 段 = {_set_frames * len(saved_files) / float(VIDEO_FPS):.2f} 秒"
+                  f"（每段生成时多出段首衔接跑道 {seam_window_cfg + seam_settle} 帧 = {seam_runway_sec:.2f} 秒，已在成片中裁掉）")
+        if not saved_files:
+            print("[JZL-短剧导演台] ⚠️ 本段未落盘任何视频（未连接模型/CLIP/VAE 或全部分段失败）")
+            _report_save_failure(
+                "无限时长", _out_root, out_video_dir, saved_files, errors,
+                [f"已连接：model={model is not None} CLIP={clip is not None} VAE={vae is not None} "
+                 f"audio_vae={audio_vae is not None}",
+                 f"计划段数={count} 实际分段块={len(shots)} 运行模式={run_mode}",
+                 f"保存模式={save_mode}"])
+        return io.NodeOutput(prompt_input, ui=_seed_ui)
 
 class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
     """JZL - 🤖 MiniMax-H3短剧导演台Mini — 只做「资产管理和编码」，采样/解码交给下游。
@@ -4714,7 +6402,7 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
             # 也不会让下游采样 slice_dict 对空列表 v[-1] 崩溃
             return io.NodeOutput(model, vae, audio_vae, upscale_scale, [None], [None], "",
                                  block_execution="必须填写「故事名称」后才能生成",
-                                 ui={"manager_error": "必须填写「故事名称」后才能生成"})
+                                 ui={"manager_error": ["必须填写「故事名称」后才能生成"]})
 
         manager = _parse_node_manager_settings(manager_settings)
         manager["_jzl_auto_count"] = _vc_auto          # 「剧情决定」标记（供 _run_script_processor/日志用）
@@ -4736,8 +6424,9 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
             llm_seed = int(torch.randint(0, 0x7fffffffffffffff, (1,)).item())
         else:
             llm_seed = current_seed
-        print(f"[JZL-Mini] 运行模式={run_mode} | LLM种子={llm_seed}({seed_control}) | 共"
-              f"{'剧情决定' if manager.get('_jzl_auto_count') else str(_vc_count(video_count)) + ' 段'}")
+        _run_banner("Mini", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
+                    story_style, story_name, enhance,
+                    f" | 扩写≈{int(enhance.get('expand_words') or 500)}字" if expand_mode else "")
 
         # ── 纯文本模式提前返回（不编码/不生成，直接经「已拆解剧本」端口输出文本）──
         # 故事扩写模式：只扩写正文；仅提示词输出：拆解+增强。
@@ -4755,14 +6444,12 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
             if expand_mode:
                 _ew = int(enhance.get("expand_words") or 500)
                 _esrc = str(enhance.get("expand_source") or "素材")
-                print(f"[JZL-Mini] 故事扩写模式：扩写到约 {_ew} 字正文 | 范围={'按素材' if _esrc != '自由' else '自由发挥'}（纯文本，不编码）")
                 processed, err = _run_story_expander(
                     prompt_input, manager, story_style, story_name, prompt_lang, llm_seed,
                     expand_words=_ew, expand_source=_esrc,
                     ref_image_intro=ri, ref_video_intro=rv, ref_audio_intro=ra,
                     gen_dir=gen_dir)
             else:
-                print(f"[JZL-Mini] 仅提示词输出：按「拆解模式(Decompose)」拆解 + 增强（纯文本，不编码）")
                 _pcount = _vc_count(video_count)
                 processed, err = _run_script_processor(
                     prompt_input, manager, _pcount, story_style, story_name, duration, prompt_lang, llm_seed,
@@ -4804,11 +6491,11 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
                 print(f"[JZL-Mini] ❌ {_nl_err}（已终止）")
                 return io.NodeOutput(model, vae, audio_vae, upscale_scale, [None], [None], prompt_input or "",
                                      block_execution=f"❌ {_nl_err}",
-                                     ui={"manager_error": _nl_err})
+                                     ui={"manager_error": [_nl_err]})
         # ① 故事拆解（剧本处理器）
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
         gen_dir = None
-        if not passthrough and not has_shots and prompt_input:
+        if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
             from .nodes_llama import _next_generation_dir
             gen_dir = _next_generation_dir(story_name)
             prompt_input, err = _run_script_processor(
@@ -4842,7 +6529,7 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
                 print(f"[JZL-Mini] ❌ {_pt_err}（已终止）")
                 return io.NodeOutput(model, vae, audio_vae, upscale_scale, [None], [None], prompt_input or "",
                                      block_execution=f"❌ {_pt_err}",
-                                     ui={"manager_error": _pt_err})
+                                     ui={"manager_error": [_pt_err]})
             count = _pt_n
 
         # 调度指令规范化 + 场景槽位校正 + 幻想素材清理（与 Pro 一致）
@@ -4883,26 +6570,7 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
             # @ 引用
             mention_names, h3 = _extract_mentions(h3)
             # 参考提取
-            ref_images = _collect_slots(scene, "image", 9)
-            ref_videos = _collect_slots(vid, "video", 3)
-            ref_audios = _collect_slots(aud, "audio", 3)
-            for mname in mention_names:
-                kind, data = _get_asset_by_name(mname)
-                if data is None:
-                    continue
-                if kind == "image" and len(ref_images) < 9:
-                    ref_images.append(data)
-                elif kind == "video" and len(ref_videos) < 3:
-                    ref_videos.append(data)
-                elif kind == "audio" and len(ref_audios) < 3:
-                    ref_audios.append(data)
-            while len(ref_images) + len(ref_videos) + len(ref_audios) > 12:
-                if ref_videos:
-                    ref_videos.pop()
-                elif ref_audios:
-                    ref_audios.pop()
-                elif ref_images:
-                    ref_images.pop()
+            ref_images, ref_videos, ref_audios, ref_names = _collect_refs_with_names(scene, vid, aud, mention_names)
             # 本段含视频/音频参考但无 audio_vae → 跳过该段编码（列表该位留空）
             if (ref_videos or ref_audios) and audio_vae is None:
                 print(f"[JZL-Mini] ⚠️ 第{i + 1}段含视频/音频参考但未连接 audio_vae，跳过编码")
@@ -4910,12 +6578,11 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
                 latents.append(None)
                 continue
             print(f"[JZL-Mini] 编码第 {i + 1}/{len(shots)} 段（{width}x{height}，{length}帧，参考 {len(ref_images)}图/{len(ref_videos)}视频/{len(ref_audios)}音频）")
-            positive, latent = _encode_ref_to_video(
+            positive, latent = _encode_refs(
+                "Mini", f"第 {i + 1}/{len(shots)} 段 ",
                 clip, vae, audio_vae, h3, width, height, _seg_len_for(raw, duration_lo),
-                ref_images=ref_images, ref_videos=ref_videos,
-                ref_video_audios=ref_audios[:len(ref_videos)],
-                ref_audios=ref_audios[len(ref_videos):],
-                ref_scale=scale_factor)
+                ref_images, ref_videos, ref_audios, ref_names, ref_scale=scale_factor, model=model)
+            positive = _apply_semantic_bridge(positive, manager, tag="Mini")
             positives.append(positive)
             latents.append(latent)
 
@@ -5035,5 +6702,59 @@ class JZL_MiniMaxVideoViewer(io.ComfyNode):
                         _files.append(os.path.join(_d, _fn))
         except Exception:
             _files = []
-        print(f"[JZL-Viewer] execute：故事={_sn or '(空)'} 视频={len(_files)} 个")
+        return io.NodeOutput(_files if _files else [None])
+
+
+class JZL_MiniMaxScriptViewer(io.ComfyNode):
+    """JZL - 📝 生成剧本查看器：画布内直接查看某故事名最后一次生成/增强的剧本。
+
+    等同「生成视频查看器」的剧本侧：随图自动同步「导演台」的故事名称，
+    读盘 output/jzl/{故事名}/ —— 优先「已增强剧本」目录，未开启增强则读「故事拆解」。
+    顶部「刷新目录 / 复制剧本 / 编辑剧本 / 选择剧本（可进子文件夹）」，
+    下方显示窗直接展示剧本文本。无采样解码，不参与生成。
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="JZL_MiniMaxScriptViewer",
+            display_name="JZL - 📝 生成剧本查看器",
+            category="JZL/MiniMax",
+            description="画布末端查看节点：自动识别「导演台」的故事名称，直接读盘 output/jzl/{故事名}/ 下最后一次生成或增强的剧本"
+                        "（优先「已增强剧本」，未增强则「故事拆解」）；下方显示窗展示全文，「选择剧本」可进子文件夹挑选任意剧本文件。"
+                        "不再经端口传递（0 个物理输入端口）。",
+            inputs=[
+                io.String.Input("story_name", display_name="当前故事", default="", advanced=True, socketless=True,
+                    tooltip="当前查看的故事（socketless 隐藏无端口）：前端自动识别导演台故事名或手动下拉选择时写入；execute 按此列盘"),
+            ],
+            outputs=[io.String.Output("script_files", display_name="剧本文件", is_output_list=True,
+                tooltip="output/jzl/{故事名}/ 下所有剧本文档（.txt/.md，含子文件夹）的绝对路径列表（本节点主要作画布末端查看，剧本直接读盘）")],
+            is_output_node=True,  # 末端查看节点：标记输出节点 → 单节点可运行不报 prompt_no_outputs
+        )
+
+    @classmethod
+    def execute(cls, story_name=""):
+        # 末端查看节点：按 story_name（socketless 隐藏 widget，前端自动识别/手动选择写入）递归列盘输出剧本文件。
+        # 剧本内容展示由前端 REST 直读磁盘（/jzl/story_latest_script 与 /jzl/fs_read）完成，不依赖本 execute 回传。
+        _sn = (story_name or "").strip()
+        _files = []
+        try:
+            if _sn:
+                _d = os.path.join(os.path.abspath(folder_paths.get_output_directory()), "jzl", _safe_story_name(_sn))
+                if os.path.isdir(_d):
+                    _found = []
+                    for _root, _dirs, _fns in os.walk(_d):
+                        _dirs.sort()
+                        for _fn in _fns:
+                            if _fn.lower().endswith((".txt", ".md")):
+                                _fp = os.path.join(_root, _fn)
+                                try:
+                                    _found.append((os.path.getmtime(_fp), _fp))
+                                except Exception:
+                                    _found.append((0.0, _fp))
+                    # 最新修改的排前面（与「优先最后一次生成」的语义一致）
+                    _found.sort(key=lambda t: t[0], reverse=True)
+                    _files = [fp for _mt, fp in _found]
+        except Exception:
+            _files = []
         return io.NodeOutput(_files if _files else [None])

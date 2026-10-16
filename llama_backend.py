@@ -124,21 +124,6 @@ def comfy_gpu_desc() -> str:
         return "unknown"
 
 
-def log_gpu_plan(backend: str, gpu_device):
-    """打印本地 LLM 将使用的显卡（自动与 ComfyUI 对齐）。gpu_device: 'auto' / 数字 / None。"""
-    pref = None
-    if isinstance(gpu_device, str):
-        pref = None if gpu_device in ("auto", "None", "") else gpu_device
-    if backend == "llama-server":
-        note = ("自动匹配 ComfyUI GPU（llama-server --list-devices 按显卡名匹配，默认推荐）"
-                if pref is None else f"手动指定设备 {pref}")
-    else:
-        note = ("使用主 GPU（CUDA_VISIBLE_DEVICES 首卡，与 ComfyUI 同环境）"
-                if pref is None else f"手动指定 {pref}（注意：llama-cpp-python 可能忽略手动编号，建议用「跟随 ComfyUI」）")
-    print(f"[JZL-llama] 本地 LLM 显卡计划 [{backend}]：{note}")
-    print(f"[JZL-llama] ComfyUI 使用显卡：{comfy_gpu_desc()}")
-
-
 def print_gpu_info():
     """打印 GPU 信息用于调试"""
     gpu_type = "ROCm (AMD)" if is_rocm() else ("CUDA (NVIDIA)" if is_nvidia() else "CPU")
@@ -147,9 +132,18 @@ def print_gpu_info():
     arch = get_amd_arch() if is_rocm() else ""
     factor = get_vram_factor()
     arch_str = f", arch={arch}" if arch else ""
-    print(f"[JZL-llama] GPU 检测: {gpu_type}, {gpu_name}, VRAM={vram:.1f}GB{arch_str}, factor={factor}")
+    print(f"[JZL-llama] GPU: {gpu_type} {gpu_name} VRAM={vram:.1f}GB{arch_str}, factor={factor}")
+
+
+def _quiet_native_load_logs():
+    """压制 llama.cpp 原生库加载期的固定刷屏（如 Qwen-VL 的 load_hparams 提示）。
+
+    只按子串过滤这几条与生成无关的加载提示，其余原生日志（设备/显存/错误）照常输出；
+    llama-cpp-python 未提供该接口时静默跳过。
+    """
     try:
-        print(f"[JZL-llama] ComfyUI 使用显卡: {comfy_gpu_desc()}")
+        from llama_cpp import _logger as _native_logger
+        _native_logger.add_log_filters(["load_hparams", "issues/16842"])
     except Exception:
         pass
 
@@ -287,12 +281,10 @@ class LLAMA_CPP_STORAGE:
         mm.soft_empty_cache()
 
     @classmethod
-    def load_model(cls, config):
+    def load_model(cls, config, purpose=""):
+        """加载本地 LLM。purpose = 本次加载服务的 LLM 步骤（仅用于日志，如「拆解剧本」/「增强提示词」）。"""
+        print(f"[JZL-llama] 开始加载本地模型{purpose}中...")
         backend = str(config.get("backend") or "llama-cpp-python").strip().lower()
-        try:
-            log_gpu_plan(backend, config.get("gpu_device"))
-        except Exception:
-            pass
         if backend == "llama-cpp-python":
             cls._load_model_llama_cpp(config)
         else:
@@ -330,19 +322,14 @@ class LLAMA_CPP_STORAGE:
             if vram_limit != -1:
                 mmproj_size = os.path.getsize(mmproj_path) * vram_factor / (1024 ** 3)
                 n_gpu_layers = max(1, int((vram_limit - mmproj_size) / gguf_layer_size))
-
-            print(f"[JZL-llama] 加载视觉模块: {mmproj}")
-        else:
-            if vram_limit != -1:
-                n_gpu_layers = max(1, int(vram_limit / gguf_layer_size))
+        elif vram_limit != -1:
+            n_gpu_layers = max(1, int(vram_limit / gguf_layer_size))
 
         cls.chat_handler = chat_handler
 
-        print(f"[JZL-llama] 加载模型: {model} (llama-server)")
-        print(f"[JZL-llama] n_gpu_layers = {n_gpu_layers} (0=仅CPU, -1=全部GPU)")
-        gpu_device = config.get("gpu_device")
-        if isinstance(gpu_device, str):
-            gpu_device = None if gpu_device in ("auto", "None", "") else gpu_device
+        _gpu_device = config.get("gpu_device")
+        if isinstance(_gpu_device, str):
+            _gpu_device = None if _gpu_device in ("auto", "None", "") else _gpu_device
         cls.llm = LlamaServerBackend(
             model_path,
             mmproj_path=mmproj_path,
@@ -350,12 +337,13 @@ class LLAMA_CPP_STORAGE:
             n_gpu_layers=n_gpu_layers,
             image_min_tokens=image_min_tokens,
             image_max_tokens=image_max_tokens,
-            device=gpu_device,
+            device=_gpu_device,
         )
 
     @classmethod
     def _load_model_llama_cpp(cls, config):
         Llama, handlers = _import_llama_cpp_handlers()
+        _quiet_native_load_logs()
 
         def get_handler(name):
             if name == "None":
@@ -398,8 +386,6 @@ class LLAMA_CPP_STORAGE:
                 mmproj_size = os.path.getsize(mmproj_path) * vram_factor / (1024 ** 3)
                 n_gpu_layers = max(1, int((vram_limit - mmproj_size) / gguf_layer_size))
 
-            print(f"[JZL-llama] 加载视觉模块: {mmproj}")
-
             think_mode = "Thinking" in chat_handler
             kwargs = {"clip_model_path": mmproj_path, "verbose": False}
             if chat_handler in ["Qwen3-VL", "Qwen3-VL-Thinking"]:
@@ -416,15 +402,8 @@ class LLAMA_CPP_STORAGE:
         else:
             if vram_limit != -1:
                 n_gpu_layers = max(1, int(vram_limit / gguf_layer_size))
-            if handler is not None:
-                print(
-                    f"[JZL-llama] 提示: chat_handler={chat_handler} 但未选择 mmproj，"
-                    f"已按纯文本模式加载（视觉 handler 被忽略）"
-                )
             cls.chat_handler = None
 
-        print(f"[JZL-llama] 加载模型: {model} (llama-cpp-python)")
-        print(f"[JZL-llama] n_gpu_layers = {n_gpu_layers} (0=仅CPU, -1=全部GPU)")
         cls.llm = Llama(
             model_path,
             chat_handler=cls.chat_handler,
@@ -446,7 +425,6 @@ if not hasattr(mm, "unload_all_models_backup"):
         return result
 
     mm.unload_all_models = patched_unload_all_models
-    print("[JZL-llama] 模型卸载钩子已注册!")
 
 # LLM 模型文件夹注册
 llm_extensions = ['.ckpt', '.pt', '.bin', '.pth', '.safetensors', '.gguf']

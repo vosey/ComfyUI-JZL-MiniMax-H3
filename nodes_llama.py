@@ -22,6 +22,9 @@ from .support_llama.presets.minimax_fl2va import MINIMAX_FL2VA_EN, MINIMAX_FL2VA
 from .support_llama.presets.minimax_l2va import MINIMAX_L2VA_EN, MINIMAX_L2VA_ZH
 from .support_llama.presets.minimax_ref2va import MINIMAX_REF2VA_EN, MINIMAX_REF2VA_ZH
 
+# (provider, model)：同一次会话里每个模型只提示一次「调用」，避免逐段/逐次刷屏
+_JZL_API_LOG_SEEN = set()
+
 
 # ═══════════════════════════════════════════════════════════════
 #  工具函数
@@ -237,7 +240,7 @@ class JZL_MiniMaxH3Preference:
     「随机组合」不是瞎猜：给 LLM 一个候选范围，让它根据剧情与故事风格在范围内自由选择。
     """
 
-    _SHOT_SIZES = ["根据剧情", "随机组合", "远景为主", "全景为主", "中景为主", "近景为主", "特写为主"]
+    _SHOT_SIZES = ["根据剧情", "随机组合", "远景为主", "全景为主", "中景为主", "近景为主", "特写为主", "大特写为主"]
     _SHOT_SIZE_HINTS = {
         "根据剧情": "景别根据剧情需要主动搭配：不同 [Shot N] 用最合适的景别，并按剧情递进（建立→推进→高潮→收束）安排远景/全景/中景/近景/特写的层次变化，禁止整段只用一两种",
         "随机组合": "一个视频内多种景别混合使用（远景/全景/中景/近景/特写随剧情递进变化）。不同 [Shot N] 用不同景别，禁止整段只用一种景别；根据时长与剧情灵活搭配——长视频（10秒以上）用 4-6 种景别递进（建立→推进→高潮→收束），短视频用 2-3 种即可，绝不要只用一两种",
@@ -246,6 +249,7 @@ class JZL_MiniMaxH3Preference:
         "中景为主": "以中景为主，角色腰部以上入画，兼顾肢体动作与面部表情",
         "近景为主": "以近景为主，角色胸部以上入画，突出表情、情绪与细节",
         "特写为主": "以特写为主，聚焦面部、手部或关键道具细节，强调关键瞬间与冲击力",
+        "大特写为主": "以大特写（Extreme Close-Up / Macro）为主，极近距聚焦眼睛、嘴唇、指尖或关键道具的局部，制造最强冲击与心理压迫",
     }
 
     _CAMERA_MOVES = ["根据剧情", "随机组合", "固定机位", "推拉", "摇移", "俯仰", "升降", "环绕", "跟拍", "手持晃动", "旋转", "一镜到底"]
@@ -262,6 +266,42 @@ class JZL_MiniMaxH3Preference:
         "手持晃动": "以手持晃动（Shake Slightly / Shake Strongly）为主，增强临场感与紧张感",
         "旋转": "以旋转镜头（Roll）为主，制造动感、眩晕或心理失衡",
         "一镜到底": "全程一镜到底，只用运镜改变视角，禁止切镜（无 [Shot N] 时间戳）",
+    }
+
+    # ── 视角机位（official h3-prompt-writing 只对「运镜」给了封闭词表；
+    #    机位/角度走自然语言，因此这里用「中文指令 + 官方英文写法」注入）
+    _ANGLE_VIEWS = [
+        "根据剧情", "随机组合",
+        "视线平视", "高角度俯拍", "鸟瞰顶视", "低角度仰拍", "虫眼极低", "航拍视角",
+        "第一人称POV", "过肩镜头", "第三人称跟随", "偷窥视角", "监控摄像头", "手机自拍",
+        "正反打", "侧面视角", "背身视角", "四分之三侧", "镜像反射",
+        "斜角荷兰角", "希区柯克变焦", "鱼眼广角", "框中框构图", "长焦压缩视角",
+    ]
+    _ANGLE_HINTS = {
+        "根据剧情": "机位根据剧情需要主动搭配：不同 [Shot N] 用最合适的机位角度，随情绪切换（平静用平视、弱势/压迫用俯拍或仰拍、对峙用低角度、心理失衡用荷兰角），禁止整段只用一种机位",
+        "随机组合": "一个视频内多种机位角度混合使用（平视/俯拍/仰拍/过肩/侧拍/背身等穿插）。不同 [Shot N] 用不同机位，禁止整段只用一种机位；长视频用 3-5 种机位，短视频用 2-3 种即可",
+        "视线平视": "以视线平视（eye-level）机位为主，摄影机与角色眼睛同高，客观、中性、亲近",
+        "高角度俯拍": "以高角度俯拍（high-angle shot looking down）机位为主，摄影机高于视线向下拍，角色显弱、环境压迫",
+        "鸟瞰顶视": "以鸟瞰顶视（bird's-eye view, top-down）机位为主，垂直向下俯视，强调空间布局与人物渺小",
+        "低角度仰拍": "以低角度仰拍（low-angle shot looking up）机位为主，摄影机低于视线向上拍，角色显强、有英雄感与压迫感",
+        "虫眼极低": "以虫眼极低（worm's-eye view, extreme low angle）机位为主，贴近地面向上拍，夸张高度与威胁感",
+        "航拍视角": "以航拍（aerial shot）机位为主，高位大范围俯瞰移动，展现地理规模与宏大场面",
+        "第一人称POV": "以第一人称主观视角（POV，官方运镜词表原生项）为主，镜头即角色眼睛，观众代入角色所见",
+        "过肩镜头": "以过肩镜头（over-the-shoulder shot）为主，从角色肩后越过拍向前方对象，强调对话与对峙关系",
+        "第三人称跟随": "以第三人称背身跟随（third-person view from behind）为主，镜头跟在角色身后随之移动，强调前进、探索与代入感",
+        "偷窥视角": "以偷窥视角（voyeuristic view through a gap or blinds）为主，透过门缝、百叶窗或遮挡物窥视，制造悬念与被监视感",
+        "监控摄像头": "以监控摄像头（CCTV / security-camera angle）机位为主，高位广角固定、略带畸变，营造纪实与监视感",
+        "手机自拍": "以手机自拍视角（selfie / front-camera handheld view）为主，近距广角、手持轻微晃动，营造真实社交感",
+        "正反打": "以正反打（reverse angle, shot-reverse-shot）机位为主，对话双方用交替的反向机位切换",
+        "侧面视角": "以侧面（profile / side view）机位为主，摄影机与角色视线约成 90 度，强调轮廓剪影与动作轨迹",
+        "背身视角": "以背身（rear view）机位为主，摄影机正对角色背面，强调朝向、未知前方与孤独感",
+        "四分之三侧": "以四分之三侧（three-quarter view）机位为主，同时保留面部信息与空间纵深，最自然通用的叙事角度",
+        "镜像反射": "以镜像反射（view seen in a mirror reflection）机位为主，通过镜子、水面或玻璃呈现，制造分裂、自省或双重感",
+        "斜角荷兰角": "以斜角荷兰角（Dutch angle）机位为主，画面水平线倾斜，用官方运镜词 Roll Clockwise / Roll Counterclockwise 表达；仅用于追逐、失衡、惊吓或荒诞节拍",
+        "希区柯克变焦": "以希区柯克变焦（dolly zoom：camera pushes in while zooming out）为主，主体大小不变而背景急剧缩放，制造眩晕与心理失衡；⚠️ 官方运镜词表无此项，只能靠英文自然语言描述，模型响应可能不稳定，建议配合固定机位使用",
+        "鱼眼广角": "以鱼眼广角（fisheye lens, extreme wide-angle distortion）机位为主，画面边缘强烈畸变，用于夸张、滑稽或眩晕感",
+        "框中框构图": "以框中框构图（frame within a frame）视角为主，用门框、窗框、缝隙、镜框或前景遮挡把主体框在画面内部，强化聚焦与被困/窥视感",
+        "长焦压缩视角": "以长焦压缩视角（telephoto compression, compressed perspective）为主，用长焦压缩前后景距离、让背景贴近主体，适合对峙、凝视与密集人群",
     }
 
     _CUT_RHYTHMS = ["根据剧情", "随机组合", "一镜到底", "2~5镜", "5~9镜", "9~13镜", "13~18镜"]
@@ -318,6 +358,8 @@ class JZL_MiniMaxH3Preference:
                 "详细描述字数": (s._DETAIL_LENGTHS, {"default": "标准 (350-500字)"}),
                 "自定义镜头语言": ("STRING", {"default": "", "multiline": True,
                     "placeholder": "选填。自由描述镜头要求，如：多用低角度仰拍、结尾慢动作定格、关键道具给特写..."}),
+                # ⚠️ 新参数必须追加在末尾：ComfyUI 的 widgets_values 按顺序保存，插在中间会让旧工作流的取值错位
+                "视角机位": (s._ANGLE_VIEWS, {"default": "根据剧情"}),
             }
         }
 
@@ -326,10 +368,17 @@ class JZL_MiniMaxH3Preference:
     FUNCTION = "build"
     CATEGORY = "JZL/MiniMax"
 
-    def build(self, 景别偏好, 运镜偏好, 切镜节奏, 转场偏好, 音乐风格, 创作要求, 详细描述字数, 自定义镜头语言):
+    def build(self, 景别偏好, 运镜偏好, 切镜节奏, 转场偏好, 音乐风格, 创作要求, 详细描述字数, 自定义镜头语言,
+              视角机位="根据剧情"):
         lines = ["## 镜头语言偏好（本批分段必须严格遵守）"]
 
         lines.append(f"- 景别：{self._SHOT_SIZE_HINTS.get(景别偏好, 景别偏好)}")
+
+        _angle = (视角机位 or "根据剧情").strip() or "根据剧情"
+        lines.append(f"- 机位：{self._ANGLE_HINTS.get(_angle, _angle)}")
+        if _angle not in ("根据剧情", "随机组合"):
+            lines.append("- 机位优先：机位与运镜/景别描述冲突时一律以机位为准"
+                         "（如机位为荷兰角时不要再在运镜里写 Roll 旋转，机位为 POV 时不要再写环绕或跟拍）")
 
         lines.append(f"- 运镜：{self._CAMERA_HINTS.get(运镜偏好, 运镜偏好)}")
 
@@ -676,6 +725,9 @@ class JZL_MiniMax_ScriptProcessor:
         lines.append(f"分段共{segment_count}个")
         return "\n".join(lines)
 
+    # 素材类型前缀白名单（含音频子分类 音色/配乐/念白 —— 它们的槽位名带各自前缀）
+    _INTRO_TYPE_RE = r'^(角色|场景|道具|视频|音频|音色|配乐|念白|分镜|音效|音乐|其他)'
+
     @classmethod
     def _build_slot_map(cls, ref_image_intro, ref_video_intro, ref_audio_intro):
         """构建槽位映射：type_map["角色A"]=(类型,素材名)、name_map["孙悟空"]="角色A"，用于 slots 二次纠错。"""
@@ -687,7 +739,7 @@ class JZL_MiniMax_ScriptProcessor:
                 line = line.strip()
                 if not line:
                     continue
-                m = re.match(r'^(角色|场景|道具|视频|音频|分镜|音效|音乐|其他)\s*([A-Za-z])\s*[=＝:：]\s*(.+)', line)
+                m = re.match(cls._INTRO_TYPE_RE + r'\s*([A-Za-z])\s*[=＝:：]\s*(.+)', line)
                 if not m:
                     continue
                 typ, slot, rest = m.group(1), m.group(2).upper(), m.group(3).strip()
@@ -717,7 +769,7 @@ class JZL_MiniMax_ScriptProcessor:
             # name 是素材名 → 反查正确槽位 key（如「孙悟空」→「角色A」）
             if name in name_map:
                 key = name_map[name]
-                m = re.match(r'^(角色|场景|道具|视频|音频|分镜|音效|音乐|其他)([A-Za-z])$', key)
+                m = re.match(cls._INTRO_TYPE_RE + r'([A-Za-z])$', key)
                 if m:
                     fixed.append(f"{m.group(1)}:{key}")
                     changed = True
@@ -775,13 +827,16 @@ class JZL_MiniMax_ScriptProcessor:
 
         合法格式（与调度节点 _match_name 的宽松匹配一致）：
         - 「类型:槽位名」；类型 = 场景/角色/道具/视频/音频（或 scene/character/prop/video/audio）
-        - 槽位名 = A~Z 字母（如「音频:D」）或 类型前缀+A~Z（如「音频:音频D」）
+        - 槽位名 = A~Z 字母（如「音频:D」）或 前缀+A~Z —— 图片/视频用类型前缀（如「角色A」「视频A」），
+          音频按子分类带独立前缀（音色A / 配乐A / 念白A，其它音频走「音频A」）
         - 尾冒号/尾空格自动容错
         """
         warnings = []
         zh_types = ("场景", "角色", "道具", "视频", "音频")
         en_types = ("scene", "character", "prop", "video", "audio")
-        name_pat = re.compile(r'^(?:场景|角色|道具|视频|音频|scene|character|prop|video|audio)?[A-Z]$', re.IGNORECASE)
+        name_pat = re.compile(
+            r'^(?:场景|角色|道具|视频|音频|音色|配乐|念白|音效|音乐'
+            r'|scene|character|prop|video|audio|voice|music|narration)?[A-Z]$', re.IGNORECASE)
         for label, info in (("场景", scene_info), ("视频", video_info), ("音频", audio_info)):
             try:
                 d = json.loads(info) if isinstance(info, str) else (info or {})
@@ -794,7 +849,7 @@ class JZL_MiniMax_ScriptProcessor:
                 typ = typ.strip()
                 name = name.strip().rstrip(":：")
                 if (typ not in zh_types and typ not in en_types) or not name_pat.match(name):
-                    warnings.append(f"[⚠️ 槽位名异常] 第{shot_num if shot_num else '?'}段 {label}调度 slots 含「{slot}」——槽位名必须是 A~Z 字母（如「音频:D」）或 类型+A~Z（如「音频:音频D」），不是素材名/描述")
+                    warnings.append(f"[⚠️ 槽位名异常] 第{shot_num if shot_num else '?'}段 {label}调度 slots 含「{slot}」——槽位名必须是 A~Z 字母（如「音频:D」）或 前缀+A~Z（如「音频:音频D」「音频:音色A」），不是素材名/描述")
         return warnings
 
     @staticmethod
@@ -849,31 +904,22 @@ class JZL_MiniMax_ScriptProcessor:
 
     @staticmethod
     def _call_api(config, system_prompt, user_msg):
-        """根据 API 配置调用大模型 API，返回生成文本。
-
-        user_msg 可为字符串，也可为 OpenAI 多模态 content 数组（识图：text + image_url）。
-        仅 OpenAI 兼容协议支持数组；Anthropic / Gemini 会自动降级为纯文本（丢弃参考图）并打印提示。
-        """
+        """根据 API 配置调用大模型 API，返回生成文本。"""
         try:
             cfg = json.loads(config) if isinstance(config, str) else (config or {})
         except Exception:
             return "[API 配置错误] 无法解析 API 配置 JSON"
         provider = cfg.get("provider", "")
-        if isinstance(user_msg, list):
-            from .vision_utils import has_images, flatten_user_content
-            if has_images(user_msg):
-                if ("Anthropic" in provider) or ("Gemini" in provider):
-                    print(f"[JZL-API] ⚠️ {provider} 暂不支持识图（仅 OpenAI 兼容协议的 image_url）→ 已丢弃参考图，按纯文本调用")
-                    user_msg = flatten_user_content(user_msg)
-                else:
-                    print("[JZL-API] 已附带参考图（多模态识图消息）")
         model = (cfg.get("model") or "").strip()
         api_key = (cfg.get("api_key") or "").strip()
         base_url = (cfg.get("base_url") or "").strip()
         temperature = cfg.get("temperature", 0.6)
         max_tokens = cfg.get("max_tokens", 81920)
         thinking = cfg.get("thinking")  # "enabled" / "disabled" / None
-        print(f"[JZL-API] 调用 {provider}，模型：{model}")
+        _log_key = (provider, model)
+        if _log_key not in _JZL_API_LOG_SEEN:
+            _JZL_API_LOG_SEEN.add(_log_key)
+            print(f"[JZL-API] 调用 {provider}，模型：{model}")
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
@@ -892,7 +938,7 @@ class JZL_MiniMax_ScriptProcessor:
                 enable_scene, enable_props, enable_video, enable_audio,
                 seed, force_offload, save_states,
                 llm_backend="local", llama_model=None, parameters=None, api_config=None, preference=None, custom_rule_path=None, gen_dir=None,
-                seam_runway=0.0, vision_images=None):
+                seam_runway=0.0, llm_purpose="拆解剧本"):
         """seam_runway：「无限时长」节点传入的段首衔接跑道（秒），0 = 未启用衔接。
         启用时第 2 段起的**生成时长 = 设定时长 + 跑道**（跑道承接上段末帧、成片裁掉 ⇒ 落盘 = 设定时长），
         会写进「**时长**」字段要求与 user 消息（见 presets/script.py::_duration_spec_with_runway）。
@@ -938,31 +984,17 @@ class JZL_MiniMax_ScriptProcessor:
                        "绝不切成很多短段）" if _auto_count else f"请生成恰好 {segment_count} 个分段")
         user_msg = f"{_seg_clause}，{_dur_clause}，输出 [SHOT_START]...[SHOT_END] 完整块（分段信息 + 六段提示词 + 调度指令）。"
 
-        # 识图（开启「拆解识图」时由管理器传入与故事同名的参考图）
-        #   本地：需 mmproj + chat_handler（未配置自动跳过）；在线 API：需选择视觉模型（如 deepseek-v4-flash-vision-exp）
-        _vimgs = list(vision_images or [])
-        _vu = None
-        if _vimgs:
-            from . import vision_utils as _vu
-            if not _vu.vision_local_ready(llm_backend, (llama_model if isinstance(llama_model, dict) else {}) or {}):
-                _vimgs = []
-            else:
-                system_prompt = system_prompt + _vu.vision_note(_vimgs)
-        _user_content = _vu.vision_user_content(user_msg, _vimgs) if (_vimgs and _vu) else user_msg
-
         if "api" in str(llm_backend) and api_config:
-            print("[JZL-API] 使用在线 API 生成，跳过本地模型加载")
-            result = self._call_api(api_config, system_prompt, _user_content)
+            result = self._call_api(api_config, system_prompt, user_msg)
         elif "local" in str(llm_backend) and llama_model is not None:
             if not LLAMA_CPP_STORAGE.llm or LLAMA_CPP_STORAGE.current_config != llama_model:
-                print("[JZL-llama] 开始加载模型...")
-                LLAMA_CPP_STORAGE.load_model(llama_model)
+                LLAMA_CPP_STORAGE.load_model(llama_model, llm_purpose)
             try:
                 _params = parameters.copy() if parameters else {}
                 _params.pop("present_penalty", None)
                 _params.pop("state_uid", None)
                 output = LLAMA_CPP_STORAGE.llm.create_chat_completion(
-                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": _user_content}],
+                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_msg}],
                     seed=seed, **_params)
                 result = output["choices"][0]["message"]["content"]
             except Exception as e:
