@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-jzl-minimax-h3"
 description = "JZL MiniMax H3 nodes for ComfyUI: reference-to-video conditioning, one-click comic creation tools and llama-cpp model loader (V1 + V3 hybrid)."
-version = "0.9.02"
+version = "0.9.03"
 license = { file = "LICENSE" }
 dependencies = []
 requires-python = ">=3.10"
@@ -15,4 +15,5 @@ Documentation = "https://github.com/wjluoxiao/ComfyUI-JZL-MiniMax-H3#readme"
 PublisherId = "wjluoxiao"
 DisplayName = "ComfyUI-JZL-MiniMax-H3"
 Icon = "icon.png"
-web = "js"
+# 注意：不要再写 web = "js"。__init__.py 已用 WEB_DIRECTORY 注册 js 目录，
+# 两处同时写会让 EXTENSION_WEB_DIRS 出现两个同路径条目，前端把每个 JS 引入两遍。

@@ -30,8 +30,14 @@ import comfy.model_management
 import comfy.sample
 import comfy.samplers
 import comfy.utils
-import comfy.audio
 import comfy.nested_tensor
+# comfy.audio 是 ComfyUI 0.37.0（2026-09-21）才加入的核心模块：**不能**在模块顶层硬导入，
+# 否则 0.29.0~0.36.x（已有 MiniMax H3 支持）的用户会 ModuleNotFoundError → 整个节点包不加载（一个节点都没有）。
+# 缺失时自动回退 torchaudio（见 _encode_ref_audio），语义一致。
+try:
+    import comfy.audio as _comfy_audio
+except Exception:
+    _comfy_audio = None
 from PIL import Image, ImageOps
 from comfy_api.latest import io
 
@@ -803,9 +809,10 @@ def _encode_ref_audio(audio_vae, audio):
     sr = audio["sample_rate"]
     vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
     if sr != vae_sr:
-        try:
-            waveform = comfy.audio.resample(waveform, sr, vae_sr)
-        except AttributeError:                      # 老版 ComfyUI 没有 comfy.audio.resample
+        _rs = getattr(_comfy_audio, "resample", None)
+        if _rs is not None:
+            waveform = _rs(waveform, sr, vae_sr)
+        else:                                       # ComfyUI < 0.37.0 没有 comfy.audio → 回退 torchaudio
             waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
     z = audio_vae.encode(waveform[:1].movedim(1, -1))  # [1, 32, 2, T]
     return z, z.shape[-1]

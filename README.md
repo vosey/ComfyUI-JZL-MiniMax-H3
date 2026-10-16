@@ -29,10 +29,32 @@ MiniMax H3 视频生成节点（基于 ComfyUI V3 `io.Schema` 机制）。
 New-Item -ItemType Junction -Path "D:\...\ComfyUI\custom_nodes\ComfyUI-JZL-MiniMax-H3" -Target "D:\AI_JZL\ComfyUI-JZL-MiniMax-H3"
 ```
 
+> ⚠️ **解压最常见的坑：不要多套一层目录。** 正确的结构是
+> `custom_nodes\ComfyUI-JZL-MiniMax-H3\__init__.py`。
+> 若解压后变成 `custom_nodes\ComfyUI-JZL-MiniMax-H3\ComfyUI-JZL-MiniMax-H3\__init__.py`，
+> ComfyUI 找不到入口文件，**一个节点都不会出现**（日志里是 `Cannot import ... module for custom nodes`）。
+
+### 加载日志（排查「节点不显示」）
+
+启动时本插件会打印一行加载结果，可直接判断：
+
+- ✅ 成功：`[JZL MiniMax H3] ✅ 加载成功：37 个节点 ｜ v0.9.02 ｜ ComfyUI 0.41.2 ｜ …`
+- ⚠️ 部分失败：`⚠️ 部分模块加载失败（N 组正常…）` 并在下方逐条列出失败的模块与处置建议（其余节点仍可用）
+- ❌ 整体失败：`❌ 节点包加载失败：ComfyUI-JZL-MiniMax-H3（节点列表里不会出现本插件）`，
+  附带**失败模块 / 原因 / 处置建议 / 排查步骤**；核心模块（官方编码链路）失败时该结构才会出现。
+
+一行命令拿到完整环境报告（排障时把这行输出发回即可）：
+
+```powershell
+<你的 ComfyUI python> "custom_nodes\ComfyUI-JZL-MiniMax-H3\jzl_diagnose.py"
+```
+
 ## 依赖
 
-- ComfyUI（含 `comfy_api.latest`，即官方 MiniMax H3 节点可用的较新版本）
-- `torch`、`torchaudio`
+- **ComfyUI ≥ 0.29.0**（含官方 MiniMax H3 支持；`comfy_api.latest` 自 0.3.47 起、H3 核心自 0.29.0 起）
+  - 推荐 **≥ 0.37.0**：低于它时缺 `comfy.audio`，音频重采样会**自动回退 torchaudio**（功能不受影响）。
+  - ComfyUI **0.41.x 已实测通过**（加载 37 个节点）。
+- `torch`、`torchaudio`（缺失或与 torch 版本不匹配会导致本插件整个不加载，日志会直接指出）
 
 ## 本地 LLM 运行时（llama-server）
 

@@ -6,6 +6,10 @@
 """
 
 import os
+import re
+import sys
+import time
+import platform
 # ── 云机多段生成显存碎片抑制（须早于任何 CUDA 分配执行才生效）──
 # NVIDIA(CUDA) 构建且外部未显式配置时启用 expandable_segments，缓解缓存分配器碎片
 # 导致的 CUDA error: invalid argument / 分配失败（本地 ROCm 构建不适用，自动跳过）。
@@ -20,134 +24,273 @@ except Exception:
 from server import PromptServer
 from aiohttp import web
 
-from .nodes import JZL_MiniMaxH3ReferenceToVideo, JZL_MiniMaxH3ReferenceToVideo2, JZL_MiniMaxH3CondSync, JZL_MiniMaxH3ImageToVideoDual
-from .nodes_hailuo_video import JZL_HailuoH3VideoParams, JZL_HailuoH3VideoParamsPro
-from .nodes_list_dispatcher import JZL_ListDispatcher
-from .story_nodes import (
-    JZL_MiniMax_ShotFormatter,
-    JZL_MiniMax_SceneDispatcher,
-    JZL_MiniMax_VideoDispatcher,
-    JZL_MiniMax_AudioDispatcher,
-    JZL_MiniMax_SceneDispatcher2,
-    JZL_MiniMax_VideoDispatcher2,
-    JZL_MiniMax_AudioDispatcher2,
-)
-from .nodes_llama import (
-    JZL_LlamaModelLoaderPro,
-    JZL_MiniMax_ScriptProcessor,
-    JZL_MiniMaxPreset,
-    JZL_MiniMaxRef2vaPreset,
-    JZL_MiniMaxH3Preference,
-    JZL_MiniMaxAPISettings,
-    _read_api_settings,
-    _write_api_settings,
-)
-from .nodes_music import JZL_MiniMaxMusicCaption, JZL_MiniMaxMusicCaptionDuet
-from .nodes_music_lyrics import JZL_MiniMaxMusicLyricsEditor
-from .nodes_h3_editor import JZL_MiniMaxH3PromptEditor
-from .nodes_ref_bus import JZL_MiniMaxH3RefBusOut, JZL_MiniMaxH3RefBusIn
-from .nodes_ref2va_bus import JZL_MiniMaxH3Ref2vaBusOut, JZL_MiniMaxH3Ref2vaBusIn
-from .nodes_prompt_enhancer import JZL_MiniMaxPromptEnhancer
-from .nodes_asset_manager import (
-    JZL_MiniMaxAssetManager,
-    JZL_MiniMaxAssetManagerMax,
-    JZL_MiniMaxAssetManagerInfinite,
-    JZL_MiniMaxAssetManagerShortDrama,
-    JZL_MiniMaxAssetManagerMini,
-    JZL_MiniMaxVideoSaveDistributor,
-    JZL_MiniMaxVideoViewer,
-    JZL_MiniMaxScriptViewer,
-    _read_asset_settings,
-    _write_asset_settings,
-    _read_manager_settings,
-    _write_manager_settings,
-    _resolve_asset_path,
-    _safe_story_name,
-    _load_last_script,
+# ═══════════════════════════════════════════════════════════════════════════
+#  加载自检与加载日志
+#  目的：把「解压到 custom_nodes 了，但节点列表里一个都没有」变成一条能自解释的日志。
+#  设计：按功能分组导入 → 单组失败不拖垮其他组；核心组失败才判定整包未加载。
+# ═══════════════════════════════════════════════════════════════════════════
+
+_JZL_PACK_DIR = os.path.dirname(os.path.abspath(__file__))
+_JZL_PACK_NAME = os.path.basename(_JZL_PACK_DIR)
+_JZL_LOAD_T0 = time.perf_counter()
+_JZL_LOAD_FAILS = []      # [(组名, 模块名, 异常)]
+
+# 我们对 ComfyUI 的硬性要求（写在这里是为了失败时能直接告诉用户要升到哪个版本）
+_JZL_REQ_COMFY = "0.29.0（含官方 MiniMax H3 支持）"
+_JZL_REQ_COMFY_API = "0.3.47（comfy_api.latest）"
+
+
+def _jzl_comfy_version():
+    try:
+        import comfyui_version
+        return str(getattr(comfyui_version, "__version__", "?"))
+    except Exception:
+        return "?"
+
+
+def _jzl_pack_version():
+    """从本目录 pyproject.toml 读版本（避免与常量重复导致漂移）。"""
+    try:
+        with open(os.path.join(_JZL_PACK_DIR, "pyproject.toml"), "r", encoding="utf-8") as f:
+            m = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"', f.read())
+        return m.group(1) if m else "?"
+    except Exception:
+        return "?"
+
+
+def _jzl_runtime_desc():
+    desc = [f"ComfyUI {_jzl_comfy_version()}", f"Python {platform.python_version()}"]
+    try:
+        import torch
+        desc.append(f"torch {torch.__version__}")
+        try:
+            if torch.cuda.is_available():
+                desc.append(torch.cuda.get_device_name(0))
+        except Exception:
+            pass
+    except Exception:
+        desc.append("torch 未就绪")
+    return " ｜ ".join(desc)
+
+
+# ── 导入分组：(组名, 是否核心组, ((模块, (属性…)), …)) ──────────────────────
+# 核心组（官方编码链路 + 端口）失败 ⇒ 整包判定未加载（节点全缺，必须显式报错，不能静默半残）。
+_JZL_IMPORT_GROUPS = (
+    ("核心编码/端口", True, (
+        (".nodes", ("JZL_MiniMaxH3ReferenceToVideo", "JZL_MiniMaxH3ReferenceToVideo2",
+                    "JZL_MiniMaxH3CondSync", "JZL_MiniMaxH3ImageToVideoDual")),
+        (".nodes_hailuo_video", ("JZL_HailuoH3VideoParams", "JZL_HailuoH3VideoParamsPro")),
+        (".nodes_list_dispatcher", ("JZL_ListDispatcher",)),
+    )),
+    ("桥段调度", False, (
+        (".story_nodes", ("JZL_MiniMax_ShotFormatter", "JZL_MiniMax_SceneDispatcher",
+                          "JZL_MiniMax_VideoDispatcher", "JZL_MiniMax_AudioDispatcher",
+                          "JZL_MiniMax_SceneDispatcher2", "JZL_MiniMax_VideoDispatcher2",
+                          "JZL_MiniMax_AudioDispatcher2")),
+    )),
+    ("LLM/剧本", False, (
+        (".nodes_llama", ("JZL_LlamaModelLoaderPro", "JZL_MiniMax_ScriptProcessor",
+                          "JZL_MiniMaxPreset", "JZL_MiniMaxRef2vaPreset",
+                          "JZL_MiniMaxH3Preference", "JZL_MiniMaxAPISettings",
+                          "_read_api_settings", "_write_api_settings")),
+        (".nodes_prompt_enhancer", ("JZL_MiniMaxPromptEnhancer",)),
+    )),
+    ("导演台/资产管理", False, (
+        (".nodes_asset_manager", ("JZL_MiniMaxAssetManager", "JZL_MiniMaxAssetManagerMax",
+                                  "JZL_MiniMaxAssetManagerInfinite", "JZL_MiniMaxAssetManagerShortDrama",
+                                  "JZL_MiniMaxAssetManagerMini", "JZL_MiniMaxVideoSaveDistributor",
+                                  "JZL_MiniMaxVideoViewer", "JZL_MiniMaxScriptViewer",
+                                  "_read_asset_settings", "_write_asset_settings",
+                                  "_read_manager_settings", "_write_manager_settings",
+                                  "_resolve_asset_path", "_safe_story_name", "_load_last_script")),
+    )),
+    ("音乐", False, (
+        (".nodes_music", ("JZL_MiniMaxMusicCaption", "JZL_MiniMaxMusicCaptionDuet")),
+        (".nodes_music_lyrics", ("JZL_MiniMaxMusicLyricsEditor",)),
+    )),
+    ("提示词/总线", False, (
+        (".nodes_h3_editor", ("JZL_MiniMaxH3PromptEditor",)),
+        (".nodes_ref_bus", ("JZL_MiniMaxH3RefBusOut", "JZL_MiniMaxH3RefBusIn")),
+        (".nodes_ref2va_bus", ("JZL_MiniMaxH3Ref2vaBusOut", "JZL_MiniMaxH3Ref2vaBusIn")),
+    )),
 )
 
-WEB_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js")
-
-NODE_CLASS_MAPPINGS = {
-    "JZL_MiniMaxH3ReferenceToVideo": JZL_MiniMaxH3ReferenceToVideo,
-    "JZL_MiniMaxH3ReferenceToVideo2": JZL_MiniMaxH3ReferenceToVideo2,
-    "JZL_MiniMaxH3CondSync": JZL_MiniMaxH3CondSync,
-    "JZL_MiniMaxH3ImageToVideoDual": JZL_MiniMaxH3ImageToVideoDual,
-    "JZL_HailuoH3VideoParams": JZL_HailuoH3VideoParams,
-    "JZL_HailuoH3VideoParamsPro": JZL_HailuoH3VideoParamsPro,
-    "JZL_ListDispatcher": JZL_ListDispatcher,
-    "JZL_MiniMax_ShotFormatter": JZL_MiniMax_ShotFormatter,
-    "JZL_MiniMax_SceneDispatcher": JZL_MiniMax_SceneDispatcher,
-    "JZL_MiniMax_VideoDispatcher": JZL_MiniMax_VideoDispatcher,
-    "JZL_MiniMax_AudioDispatcher": JZL_MiniMax_AudioDispatcher,
-    "JZL_MiniMax_SceneDispatcher2": JZL_MiniMax_SceneDispatcher2,
-    "JZL_MiniMax_VideoDispatcher2": JZL_MiniMax_VideoDispatcher2,
-    "JZL_MiniMax_AudioDispatcher2": JZL_MiniMax_AudioDispatcher2,
-    "JZL_LlamaModelLoaderPro": JZL_LlamaModelLoaderPro,
-    "JZL_MiniMax_ScriptProcessor": JZL_MiniMax_ScriptProcessor,
-    "JZL_MiniMaxPreset": JZL_MiniMaxPreset,
-    "JZL_MiniMaxRef2vaPreset": JZL_MiniMaxRef2vaPreset,
-    "JZL_MiniMaxH3Preference": JZL_MiniMaxH3Preference,
-    "JZL_MiniMaxAPISettings": JZL_MiniMaxAPISettings,
-    "JZL_MiniMaxMusicCaption": JZL_MiniMaxMusicCaption,
-    "JZL_MiniMaxMusicCaptionDuet": JZL_MiniMaxMusicCaptionDuet,
-    "JZL_MiniMaxMusicLyricsEditor": JZL_MiniMaxMusicLyricsEditor,
-    "JZL_MiniMaxH3PromptEditor": JZL_MiniMaxH3PromptEditor,
-    "JZL_MiniMaxH3RefBusOut": JZL_MiniMaxH3RefBusOut,
-    "JZL_MiniMaxH3RefBusIn": JZL_MiniMaxH3RefBusIn,
-    "JZL_MiniMaxH3Ref2vaBusOut": JZL_MiniMaxH3Ref2vaBusOut,
-    "JZL_MiniMaxH3Ref2vaBusIn": JZL_MiniMaxH3Ref2vaBusIn,
-    "JZL_MiniMaxPromptEnhancer": JZL_MiniMaxPromptEnhancer,
-    "JZL_MiniMaxAssetManager": JZL_MiniMaxAssetManager,
-    "JZL_MiniMaxAssetManagerMax": JZL_MiniMaxAssetManagerMax,
-    "JZL_MiniMaxAssetManagerInfinite": JZL_MiniMaxAssetManagerInfinite,
-    "JZL_MiniMaxAssetManagerShortDrama": JZL_MiniMaxAssetManagerShortDrama,
-    "JZL_MiniMaxAssetManagerMini": JZL_MiniMaxAssetManagerMini,
-    "JZL_MiniMaxVideoSaveDistributor": JZL_MiniMaxVideoSaveDistributor,
-    "JZL_MiniMaxVideoViewer": JZL_MiniMaxVideoViewer,
-    "JZL_MiniMaxScriptViewer": JZL_MiniMaxScriptViewer,
+# 路由处理函数用到的辅助函数：对应模块导入失败时打桩，避免访问端点时 NameError
+_JZL_ROUTE_STUBS = {
+    "_read_api_settings": lambda: {},
+    "_write_api_settings": lambda settings: settings or {},
+    "_read_asset_settings": lambda: {},
+    "_write_asset_settings": lambda settings: settings or {},
+    "_read_manager_settings": lambda: {},
+    "_write_manager_settings": lambda settings: settings or {},
+    "_resolve_asset_path": lambda path: os.path.abspath(str(path or "")),
+    "_safe_story_name": lambda name: re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(name or "")).strip()[:64],
+    "_load_last_script": lambda: None,
 }
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "JZL_MiniMaxH3ReferenceToVideo": "JZL - 🎬 MiniMax H3 参考编码",
-    "JZL_MiniMaxH3ReferenceToVideo2": "JZL - 🎬 MiniMax H3 参考编码2",
-    "JZL_MiniMaxH3CondSync": "JZL - 🌊 海螺H3二采条件同步",
-    "JZL_MiniMaxH3ImageToVideoDual": "JZL - 🎬 MiniMax H3 二采编码",
-    "JZL_HailuoH3VideoParams": "JZL - 🌊 海螺H3视频参数",
-    "JZL_HailuoH3VideoParamsPro": "JZL - 🌊 海螺H3视频参数Pro",
-    "JZL_ListDispatcher": "JZL - 📋 列表分发",
-    "JZL_MiniMax_ShotFormatter": "JZL - 📋 分段处理中心",
-    "JZL_MiniMax_SceneDispatcher": "JZL - 🎯 场景元素调度",
-    "JZL_MiniMax_VideoDispatcher": "JZL - 🎬 视频调度",
-    "JZL_MiniMax_AudioDispatcher": "JZL - 🎧 音频调度",
-    "JZL_MiniMax_SceneDispatcher2": "JZL - 🎯 场景元素调度2",
-    "JZL_MiniMax_VideoDispatcher2": "JZL - 🎬 视频调度2",
-    "JZL_MiniMax_AudioDispatcher2": "JZL - 🎧 音频调度2",
-    "JZL_LlamaModelLoaderPro": "JZL - 🚀 模型加载Pro",
-    "JZL_MiniMax_ScriptProcessor": "JZL - 🎬 剧本与镜头处理器",
-    "JZL_MiniMaxPreset": "JZL - ✨ MiniMax-fl2va提示词预设",
-    "JZL_MiniMaxRef2vaPreset": "JZL - ✨ MiniMax-ref2va提示词预设",
-    "JZL_MiniMaxH3Preference": "JZL - 🎯 MiniMax H3 偏好设置",
-    "JZL_MiniMaxAPISettings": "JZL - 🌐 LLM-API 设置",
-    "JZL_MiniMaxMusicCaption": "JZL - 🎵 MiniMax Music3 提示词预设",
-    "JZL_MiniMaxMusicCaptionDuet": "JZL - 🎵 MiniMax Music3 提示词预设（双人）",
-    "JZL_MiniMaxMusicLyricsEditor": "JZL - 🎵 MiniMax Music3 歌词编辑",
-    "JZL_MiniMaxH3PromptEditor": "JZL - 📝 MiniMax H3 手写提示词",
-    "JZL_MiniMaxH3RefBusOut": "JZL - 🔗 MiniMax H3 参考总线（打包）",
-    "JZL_MiniMaxH3RefBusIn": "JZL - 🔗 MiniMax H3 参考总线（解包）",
-    "JZL_MiniMaxH3Ref2vaBusOut": "JZL - 🔗 MiniMax H3 ref2va参考总线（打包）",
-    "JZL_MiniMaxH3Ref2vaBusIn": "JZL - 🔗 MiniMax H3 ref2va参考总线（解包）",
-    "JZL_MiniMaxPromptEnhancer": "JZL - ✨ 提示词增强",
-    "JZL_MiniMaxAssetManager": "JZL - 🤖 MiniMax-H3短剧导演台Pro",
-    "JZL_MiniMaxAssetManagerMax": "JZL - 🤖 MiniMax-H3短剧导演台Max",
-    "JZL_MiniMaxAssetManagerInfinite": "JZL - 🤖 MiniMax-H3无限时长",
-    "JZL_MiniMaxAssetManagerShortDrama": "JZL - 🤖 MiniMax-H3短剧导演台",
-    "JZL_MiniMaxAssetManagerMini": "JZL - 🤖 MiniMax-H3短剧导演台Mini",
-    "JZL_MiniMaxVideoSaveDistributor": "JZL - 💾 视频保存分配",
-    "JZL_MiniMaxVideoViewer": "JZL - 🎬 生成视频查看器",
-    "JZL_MiniMaxScriptViewer": "JZL - 📝 生成剧本查看器",
-}
 
+def _jzl_do_imports():
+    """按组导入节点模块（单组失败不影响其他组）；返回核心组的异常（None = 核心正常）。"""
+    import importlib
+    fatal = None
+    for group, required, modules in _JZL_IMPORT_GROUPS:
+        for mod_name, attrs in modules:
+            try:
+                mod = importlib.import_module(mod_name, __package__)
+            except Exception as e:
+                _JZL_LOAD_FAILS.append((group, mod_name, e))
+                if required and fatal is None:
+                    fatal = e
+                continue
+            for attr in attrs:
+                try:
+                    globals()[attr] = getattr(mod, attr)
+                except Exception as e:
+                    _JZL_LOAD_FAILS.append((group, f"{mod_name}.{attr}", e))
+                    if required and fatal is None:
+                        fatal = e
+    return fatal
+
+
+def _jzl_install_route_stubs():
+    for name, stub in _JZL_ROUTE_STUBS.items():
+        if name not in globals():
+            globals()[name] = stub
+
+
+# 常见导入失败 → 处置建议（按关键字匹配异常文本，命中第一条）
+_JZL_FAIL_HINTS = (
+    ("No module named 'comfy_api'",
+     f"ComfyUI 版本过旧：需要 ≥ {_JZL_REQ_COMFY_API} 才能用官方 V3 节点机制。请更新 ComfyUI 后重启。"),
+    ("No module named 'comfy.audio'",
+     "ComfyUI 版本过旧（comfy.audio 自 0.37.0 起才存在）。本插件已内置回退，若仍报此行说明还有其它新旧差异，建议更新 ComfyUI。"),
+    ("No module named 'comfy",
+     f"ComfyUI 核心模块缺失或版本过旧：请确认 ComfyUI ≥ {_JZL_REQ_COMFY}，并确认插件放在 custom_nodes 下（不要嵌套两层同名目录）。"),
+    ("No module named 'comfyui_version'",
+     "当前 python 不是 ComfyUI 自带的那个：请用 ComfyUI 自己的 python 启动（便携包 = python_embeded\\python.exe）。"),
+    ("torchaudio",
+     "torchaudio 缺失或与 torch 版本不匹配（手动升级 torch 后最常见）。请按 torch 版本重装："
+     "pip install --force-reinstall torchaudio"),
+    ("No module named 'PIL'",
+     "缺少 Pillow：pip install Pillow"),
+    ("No module named 'numpy'",
+     "缺少 numpy：pip install numpy"),
+    ("No module named 'llama_cpp'",
+     "本插件已不再依赖 llama-cpp-python；出现此行说明目录里混入了旧版文件，请删掉插件目录后重新解压。"),
+    ("cannot import name",
+     "多为「覆盖安装后残留旧 .py / __pycache__」或 ComfyUI 与插件版本不匹配：请删掉本插件目录后重新解压，"
+     "并删除目录内所有 __pycache__ 再重启。"),
+)
+
+_JZL_FAIL_FOOTER = (
+    "  排查步骤：\n"
+    "   1) 确认目录层级（最常见的坑）：\n"
+    "      custom_nodes\\{0}\\__init__.py        ← 正确\n"
+    "      custom_nodes\\{0}\\{0}\\__init__.py    ← 错误（解压时多套了一层，包不会被加载）\n"
+    "   2) 确认用 ComfyUI 自带的 python 启动（便携包 = python_embeded\\python.exe）。\n"
+    "   3) 跑一次自检并把输出发我：\n"
+    "      <你的 ComfyUI python> \"{1}\"\n"
+    "   4) 覆盖安装后请删除本插件目录下所有 __pycache__ 再重启。"
+)
+
+
+def _jzl_report_load_result(fatal):
+    """加载日志：成功一行；局部失败逐条列出；整体失败打印带处置建议的整段报告。"""
+    n_nodes = len(NODE_CLASS_MAPPINGS)
+    if fatal is None and not _JZL_LOAD_FAILS:
+        print(f"[JZL MiniMax H3] ✅ 加载成功：{n_nodes} 个节点 ｜ v{_jzl_pack_version()} ｜ "
+              f"{_jzl_runtime_desc()} ｜ {time.perf_counter() - _JZL_LOAD_T0:.2f}s")
+        print(f"[JZL MiniMax H3] 路径：{_JZL_PACK_DIR}")
+        return
+
+    _all = " ".join(f"{type(e).__name__}: {e}" for _, _, e in _JZL_LOAD_FAILS)
+    _hint = next((h for k, h in _JZL_FAIL_HINTS if k in _all), "")
+    _self_check = os.path.join(_JZL_PACK_DIR, "jzl_diagnose.py")
+
+    if fatal is not None:
+        print("\n" + "=" * 78)
+        print(f"[JZL MiniMax H3] ❌ 节点包加载失败：{_JZL_PACK_NAME}（节点列表里不会出现本插件）")
+        print(f"  路径：{_JZL_PACK_DIR}")
+        print(f"  环境：v{_jzl_pack_version()} ｜ {_jzl_runtime_desc()}")
+        print(f"  失败模块：{', '.join(sorted({m for _, m, _ in _JZL_LOAD_FAILS}))}")
+        print(f"  原因：{type(fatal).__name__}: {fatal}")
+        if _hint:
+            print(f"  ⮕ 处置：{_hint}")
+        print(_JZL_FAIL_FOOTER.format(_JZL_PACK_NAME, _self_check))
+        print("=" * 78 + "\n")
+        return
+
+    _ok_groups = len(_JZL_IMPORT_GROUPS) - len({g for g, _, _ in _JZL_LOAD_FAILS})
+    print(f"[JZL MiniMax H3] ⚠️ 部分模块加载失败（{_ok_groups} 组正常，已加载 {n_nodes} 个节点）"
+          f" ｜ v{_jzl_pack_version()} ｜ {_jzl_runtime_desc()}")
+    for group, mod, err in _JZL_LOAD_FAILS:
+        print(f"[JZL MiniMax H3]    ✗ [{group}] {mod} → {type(err).__name__}: {err}")
+    if _hint:
+        print(f"[JZL MiniMax H3]    ⮕ 处置：{_hint}")
+    print(f"[JZL MiniMax H3]    自检：<ComfyUI python> \"{_self_check}\"")
+
+
+_JZL_FATAL_IMPORT_ERROR = _jzl_do_imports()
+_jzl_install_route_stubs()
+
+WEB_DIRECTORY = os.path.join(_JZL_PACK_DIR, "js")
+
+# 节点表：(node_id, 显示名)。注册时按 globals() 里是否存在该类筛选 ——
+# 这样任一模块导入失败时，其余节点照样注册（不会再「一个模块挂掉、整包消失」）。
+_JZL_NODE_TABLE = (
+    ("JZL_MiniMaxH3ReferenceToVideo", "JZL - 🎬 MiniMax H3 参考编码"),
+    ("JZL_MiniMaxH3ReferenceToVideo2", "JZL - 🎬 MiniMax H3 参考编码2"),
+    ("JZL_MiniMaxH3CondSync", "JZL - 🌊 海螺H3二采条件同步"),
+    ("JZL_MiniMaxH3ImageToVideoDual", "JZL - 🎬 MiniMax H3 二采编码"),
+    ("JZL_HailuoH3VideoParams", "JZL - 🌊 海螺H3视频参数"),
+    ("JZL_HailuoH3VideoParamsPro", "JZL - 🌊 海螺H3视频参数Pro"),
+    ("JZL_ListDispatcher", "JZL - 📋 列表分发"),
+    ("JZL_MiniMax_ShotFormatter", "JZL - 📋 分段处理中心"),
+    ("JZL_MiniMax_SceneDispatcher", "JZL - 🎯 场景元素调度"),
+    ("JZL_MiniMax_VideoDispatcher", "JZL - 🎬 视频调度"),
+    ("JZL_MiniMax_AudioDispatcher", "JZL - 🎧 音频调度"),
+    ("JZL_MiniMax_SceneDispatcher2", "JZL - 🎯 场景元素调度2"),
+    ("JZL_MiniMax_VideoDispatcher2", "JZL - 🎬 视频调度2"),
+    ("JZL_MiniMax_AudioDispatcher2", "JZL - 🎧 音频调度2"),
+    ("JZL_LlamaModelLoaderPro", "JZL - 🚀 模型加载Pro"),
+    ("JZL_MiniMax_ScriptProcessor", "JZL - 🎬 剧本与镜头处理器"),
+    ("JZL_MiniMaxPreset", "JZL - ✨ MiniMax-fl2va提示词预设"),
+    ("JZL_MiniMaxRef2vaPreset", "JZL - ✨ MiniMax-ref2va提示词预设"),
+    ("JZL_MiniMaxH3Preference", "JZL - 🎯 MiniMax H3 偏好设置"),
+    ("JZL_MiniMaxAPISettings", "JZL - 🌐 LLM-API 设置"),
+    ("JZL_MiniMaxMusicCaption", "JZL - 🎵 MiniMax Music3 提示词预设"),
+    ("JZL_MiniMaxMusicCaptionDuet", "JZL - 🎵 MiniMax Music3 提示词预设（双人）"),
+    ("JZL_MiniMaxMusicLyricsEditor", "JZL - 🎵 MiniMax Music3 歌词编辑"),
+    ("JZL_MiniMaxH3PromptEditor", "JZL - 📝 MiniMax H3 手写提示词"),
+    ("JZL_MiniMaxH3RefBusOut", "JZL - 🔗 MiniMax H3 参考总线（打包）"),
+    ("JZL_MiniMaxH3RefBusIn", "JZL - 🔗 MiniMax H3 参考总线（解包）"),
+    ("JZL_MiniMaxH3Ref2vaBusOut", "JZL - 🔗 MiniMax H3 ref2va参考总线（打包）"),
+    ("JZL_MiniMaxH3Ref2vaBusIn", "JZL - 🔗 MiniMax H3 ref2va参考总线（解包）"),
+    ("JZL_MiniMaxPromptEnhancer", "JZL - ✨ 提示词增强"),
+    ("JZL_MiniMaxAssetManager", "JZL - 🤖 MiniMax-H3短剧导演台Pro"),
+    ("JZL_MiniMaxAssetManagerMax", "JZL - 🤖 MiniMax-H3短剧导演台Max"),
+    ("JZL_MiniMaxAssetManagerInfinite", "JZL - 🤖 MiniMax-H3无限时长"),
+    ("JZL_MiniMaxAssetManagerShortDrama", "JZL - 🤖 MiniMax-H3短剧导演台"),
+    ("JZL_MiniMaxAssetManagerMini", "JZL - 🤖 MiniMax-H3短剧导演台Mini"),
+    ("JZL_MiniMaxVideoSaveDistributor", "JZL - 💾 视频保存分配"),
+    ("JZL_MiniMaxVideoViewer", "JZL - 🎬 生成视频查看器"),
+    ("JZL_MiniMaxScriptViewer", "JZL - 📝 生成剧本查看器"),
+)
+
+NODE_CLASS_MAPPINGS = {}
+NODE_DISPLAY_NAME_MAPPINGS = {}
+for _node_id, _node_display in _JZL_NODE_TABLE:
+    _node_cls = globals().get(_node_id)
+    if _node_cls is not None:
+        NODE_CLASS_MAPPINGS[_node_id] = _node_cls
+        NODE_DISPLAY_NAME_MAPPINGS[_node_id] = _node_display
+
+_jzl_report_load_result(_JZL_FATAL_IMPORT_ERROR)
+
+if _JZL_FATAL_IMPORT_ERROR is not None:
+    # 核心模块没起来 → 不做半残注册，让 ComfyUI 明确标记本包 IMPORT FAILED
+    # （原因与处置建议已在上面的报告里打印）
+    raise _JZL_FATAL_IMPORT_ERROR
 
 # ── 后端端点（分段处理中心「重拍」文件选择器） ─────────────────
 
