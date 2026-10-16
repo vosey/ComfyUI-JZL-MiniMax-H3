@@ -3,7 +3,12 @@
 #
 # 原插件：comfyui-SelfLift（ComfyUI/custom_nodes/comfyui-SelfLift）
 # 文件：  h3_tiling.py
-# 校验：  SHA-256 dd285f1af595c945d974de8e734b779bc4dad5bf125bc312895070bfa31a83bd
+# 校验：  SHA-256 dd285f1af595c945d974de8e734b779bc4dad5bf125bc312895070bfa31a83bd（上游原文件）
+# 本地补丁：2026-10-16 _tile_payload 分块时同步裁窄 keyframe 的 cond（标记 JZL_LOCAL_PATCH_TILE_KEYFRAME）
+#           —— 上游原文在有 minimax_refs 时会漏掉重建，导致「分段衔接 + 参考素材 + 分块≥2块」行数不匹配崩溃。
+#           （补丁后文件 SHA-256 与上游原文不同，属预期；请在函数内按标记核对补丁是否还在。）
+#           升级上游时若补丁消失，nodes_asset_manager.py 的 _selflift_tiling_keyframe_patched() 会检测到，
+#           并自动关闭本次「高分辨率分块」并在日志告警（不会静默崩）。
 # 论文：  SelfLift arXiv:2609.02036 ；TST arXiv:2609.08505
 #         可选 H3 latent upscaler 权重：LBH-123-AI/Minimax_h3_latent_Upscaler
 #
@@ -70,8 +75,17 @@ def _tile_payload(payload, context, video, audio, axis, start, end):
             keyframes.append({**keyframe, "latent": comfy.ldm.common_dit.pad_to_patch_size(
                 region, (1, 2, 2)).contiguous()})
         tiled["keyframes"] = keyframes
-        if not payload.get("refs"):
-            tiled["cond_video_latents"] = [keyframe["latent"] for keyframe in keyframes]
+        # ── JZL_LOCAL_PATCH_TILE_KEYFRAME ────────────────────────────────────────
+        # 上游原文：`if not payload.get("refs"): tiled["cond_video_latents"] = [...]`
+        # 缺陷：有 refs 时整个重建被跳过，cond_video_latents 仍指向**未分块的全画布 keyframe latent**
+        #       → comfy/ldm/minimax/model.py:_embed_and_pack 里 `all_video_rows[~img_update] = cond_video_rows`
+        #         行数不匹配 → RuntimeError: shape mismatch: value tensor of shape [N, 96] cannot be
+        #         broadcast to indexing result of shape [M, 96]
+        #       触发条件：minimax_keyframes（分段衔接）+ minimax_refs（参考素材）+ 高分辨率分块≥2块
+        # 修法：与 comfy/model_base.py:2202 同序重建（keyframe 在前、refs 在后），且始终执行。
+        # ─────────────────────────────────────────────────────────────────────────
+        tiled["cond_video_latents"] = [keyframe["latent"] for keyframe in keyframes] + \
+            [reference["latent"] for reference in (payload.get("refs") or []) if "latent" in reference]
     tile_height = end - start if axis == 3 else height
     tile_width = end - start if axis == 4 else width
     layout = _packed_layout((context.shape[1], video.shape[2], (tile_height + 1) // 2 * 2,

@@ -548,6 +548,20 @@ def _load_last_script():
         return None
 
 
+def _shot_blocks(script):
+    """提示词里的 [SHOT_START]…[SHOT_END] 分段块列表。"""
+    return [s.strip() for s in re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', script or "", re.DOTALL)]
+
+
+def _pt_seg_count(script):
+    """穿透生成模式的生成段数：提示词里有几段就生成几段（0 = 未识别到分段块）。
+
+    不使用「生成视频数量」设定值：设定值与剧本实际段数不一致时，旧逻辑会直接报错终止，
+    或按设定值多生成空占位段。现在一律以提示词实际分段数为准（上限 SEGMENT_COUNT_MAX）。
+    """
+    return min(SEGMENT_COUNT_MAX, len(_shot_blocks(script)))
+
+
 def _validate_script(script, video_count=6):
     """生产规范校验：重拍模式加载提示词时检查，返回错误/警告描述列表（空 = 通过）。"""
     errs = []
@@ -566,33 +580,38 @@ def _validate_script(script, video_count=6):
 
 
 def _check_decomposed_script(script, video_count, auto_count=False, tag="管理器"):
-    """穿透生成模式 / 重拍模式前置校验：必须使用「拆解模式」拆解好的提示词。
+    """穿透生成模式前置校验：必须使用「拆解模式」拆解好的提示词。
 
     返回 (err_msg | None, 实际分段数)。err_msg 非空 → 调用方报错终止、不生成。
-    ① 必须有 [SHOT_START]…[SHOT_END] 分段块；② 每段必须含 ===H3_PROMPT=== 六段正文；
-    ③ 非「剧情决定」时，段数必须与「生成视频数量」一致（否则会多生成空占位段）。
+    ① 必须有 [SHOT_START]…[SHOT_END] 分段块；② 每段必须含 ===H3_PROMPT=== 六段正文。
+    ③ 段数一律自动对齐提示词实际分段数（不再受「生成视频数量」约束）：设定值与剧本不一致时
+       既不报错终止，也不会按设定值多生成空占位段，只打印一行提示。
     """
-    shots = [s.strip() for s in re.findall(r'\[SHOT_START\](.*?)\[SHOT_END\]', script or "", re.DOTALL)]
+    shots = _shot_blocks(script)
     if not shots:
         return ("提示词格式不正确：未识别到 [SHOT_START]…[SHOT_END] 分段块。"
-                "穿透生成模式与重拍必须使用「拆解模式」拆解好的提示词（纯文本故事 / 手写草稿不能直接生成）。", 0)
+                "穿透生成模式必须使用「拆解模式」拆解好的提示词（纯文本故事 / 手写草稿不能直接生成）。", 0)
     noh3 = [i + 1 for i, s in enumerate(shots) if "===H3_PROMPT===" not in s]
     if noh3:
         return (f"提示词格式不正确：第 {', '.join(str(x) for x in noh3[:6])}{'…' if len(noh3) > 6 else ''} 段"
                 f"缺少 ===H3_PROMPT=== 六段提示词正文（不是「拆解模式」的输出）。", len(shots))
+    pt_n = min(SEGMENT_COUNT_MAX, len(shots))
+    if len(shots) > SEGMENT_COUNT_MAX:
+        print(f"[JZL-{tag}] ⚠️ 提示词有 {len(shots)} 段，超过段数上限 {SEGMENT_COUNT_MAX} 段 → "
+              f"只生成前 {SEGMENT_COUNT_MAX} 段")
     if not auto_count:
         try:
             want = int(video_count)
         except Exception:
             want = 0
-        if want and len(shots) != want:
-            return (f"提示词分段数与「生成视频数量」不一致：剧本实际 {len(shots)} 段，节点选了「生成{want}段」。"
-                    f"请把「生成视频数量」改为「剧情决定」，或改选与剧本段数一致的分段数。", len(shots))
+        if want and want != pt_n:
+            print(f"[JZL-{tag}] 🔒 穿透生成：提示词实际 {pt_n} 段，已忽略「生成{want}段」设定 → "
+                  f"按提示词 {pt_n} 段自动对齐（不报错、也不会多生成空占位段）")
     miss = [i + 1 for i, s in enumerate(shots) if not re.search(r"\*\*(?:时长|Duration)\*\*\s*[:：]", s)]
     if miss:
         print(f"[JZL-{tag}] 提示：第 {', '.join(str(x) for x in miss[:6])}{'…' if len(miss) > 6 else ''} 段未写 "
               f"**时长**/**Duration** 字段 → 该段按节点设定时长生成（用「拆解模式」产物才能逐段动态时长）")
-    return (None, len(shots))
+    return (None, pt_n)
 
 
 _SCRIPT_TAG_HINTS = (
@@ -1271,6 +1290,15 @@ def _sample_av_selflift(model, positive, latent, sample_decode, seed, vae, tag="
               (" + 像素锚点修正" if (rho > 0.0 and w_max > 0.0) else "")
     # 「二次采样」在 SelfLift 下无意义（SelfLift 自身即渐进分辨率采样）→ 并进本行说明，不再另占一行
     _skip2 = "（已跳过二次采样）" if (sample_decode or {}).get("second", {}).get("enabled") else ""
+    # 「高分辨率分块」+ 衔接 keyframe + 参考素材：上游 h3_tiling 会在 _embed_and_pack 行数不匹配处崩。
+    # 内置副本已打补丁（JZL_LOCAL_PATCH_TILE_KEYFRAME）；若补丁因覆盖升级消失则本次自动关闭分块。
+    highres_tiling = bool(sl.get("highres_tiling", False))
+    if highres_tiling and _selflift_seam_needs_tiling_patch(positive) and not _selflift_tiling_keyframe_patched():
+        highres_tiling = False
+        _log_once(f"[JZL-{tag}] ⚠️ 本次自动关闭 SelfLift「高分辨率分块」：vendor_selflift/h3_tiling.py 缺少"
+                  f"「分块时同步裁窄衔接 keyframe」补丁（多为用上游文件覆盖过该目录所致）；"
+                  f"开着会因 cond 行数不匹配直接崩。请按该文件顶部说明重新套用补丁后重启 ComfyUI。"
+                  f"本次改用整画布高分辨率（显存占用更高）")
     print(f"[JZL-{tag}] SelfLift 采样：步数 {steps}（低分辨率 {ts} 步 + 高分辨率 {steps - ts} 步）｜"
           f"低分辨率缩放 {sl.get('lowres_scale', 0.5)}｜rho {rho}｜权重 {w_min}/{w_max}｜"
           f"放大模型 {up}｜路径 {_routes}{_skip2}")
@@ -1282,7 +1310,7 @@ def _sample_av_selflift(model, positive, latent, sample_decode, seed, vae, tag="
         lowres_scale=float(sl.get("lowres_scale", 0.5)),
         rho=rho, w_min=w_min, w_max=w_max,
         upscaler_model=up,
-        highres_tiling=bool(sl.get("highres_tiling", False)),
+        highres_tiling=highres_tiling,
         upscaler_unload=bool(sl.get("upscaler_unload", True)),
     )[0]
     # SelfLift 节点声明 RETURN_TYPES=("LATENT",)，其 progressive_sample 返回的是
@@ -1296,6 +1324,38 @@ def _sample_av_selflift(model, positive, latent, sample_decode, seed, vae, tag="
 def _selflift_mode(sample_decode):
     """「采样分类」是否为 SelfLift采样。"""
     return str((sample_decode or {}).get("sample_mode") or SAMPLE_MODE_NORMAL) == SAMPLE_MODE_SELFLIFT
+
+
+# 内置 vendor_selflift 的「分块时同步裁窄 keyframe cond」补丁标记（见 h3_tiling.py 顶部「本地补丁」）
+_JZL_SL_TILING_PATCH_MARK = "JZL_LOCAL_PATCH_TILE_KEYFRAME"
+_JZL_SL_TILING_PATCHED = {"checked": False, "value": True}
+
+
+def _selflift_tiling_keyframe_patched():
+    """内置 SelfLift 副本的 _tile_payload 是否带该补丁。
+
+    用户若按 vendor_selflift/h3_tiling.py 顶部说明「用上游新版覆盖本目录」→ 补丁消失。
+    检测失败一律按「已修」处理（不误伤正常路径）。
+    """
+    if not _JZL_SL_TILING_PATCHED["checked"]:
+        ok = True
+        try:
+            import inspect as _inspect
+            from .vendor_selflift import h3_tiling as _h3t
+            ok = _JZL_SL_TILING_PATCH_MARK in _inspect.getsource(_h3t._tile_payload)
+        except Exception:
+            ok = True
+        _JZL_SL_TILING_PATCHED.update({"checked": True, "value": ok})
+    return _JZL_SL_TILING_PATCHED["value"]
+
+
+def _selflift_seam_needs_tiling_patch(positive):
+    """本次采样是否会踩到该缺陷：positive 同时带衔接 keyframe 与参考素材（缺一则行数仍一致）。"""
+    try:
+        meta = (positive or [])[0][1] or {}
+        return bool(meta.get("minimax_keyframes")) and bool(meta.get("minimax_refs"))
+    except Exception:
+        return False
 
 
 def _sample_first_pass(model, positive, latent, sample_decode, seed, vae, tag="管理器"):
@@ -1977,7 +2037,7 @@ def _oom_diag_hint(err_text="", sample_decode=None, width=0, height=0, length=0)
         items.append(f"降低「每段视频时长」或「百万像素」：占用 ≈ 画布面积 × 时长，"
                      f"当前 {int(length)} 帧偏长（124 帧只有它的 42%）。")
         if sl.get("transition_step"):
-            items.append("段间衔接的引导 keyframe 也会占用条件 token → 把「无限时长衔接 → 窗口」"
+            items.append("段间衔接的引导 keyframe 也会占用条件 token → 把「无限时长衔接⚠实验性功能 → 窗口」"
                          "调小（如 22 → 5）可省一部分。")
     else:
         items.append("降低「每段视频时长」或「百万像素」（占用 ≈ 画布面积 × 时长）。")
@@ -4060,7 +4120,7 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.05,
                     tooltip="二采（Ref2va）放大倍数"),
                 io.Combo.Input("video_count", options=list(VIDEO_COUNT_CHOICES), default=VIDEO_COUNT_DEFAULT,
-                    display_name="生成视频数量", tooltip="生成视频数量：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数（优先用足每段时长、防短剧情生成超多段）；也可固定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段（统一控制：提示词拆解段数 / 分发列表数 / 采样数 / 分段保存数）"),
+                    display_name="生成视频数量", tooltip="生成视频数量：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数（优先用足每段时长、防短剧情生成超多段）；也可固定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段（统一控制：提示词拆解段数 / 分发列表数 / 采样数 / 分段保存数）。🪄 穿透生成模式下忽略此设定：一律按提示词实际 [SHOT_START] 段数生成（上限 60 段）"),
                 # ③提示词：剧本处理器参数（主界面显示）
                 io.Combo.Input("story_style", options=story_styles, default=story_styles[0],
                     display_name="故事风格", tooltip="故事风格（剧本处理器按此风格拆解与润色）"),
@@ -4165,8 +4225,10 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
             llm_seed = int(torch.randint(0, 0x7fffffffffffffff, (1,)).item())
         else:
             llm_seed = current_seed
-        _run_banner("管理器", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
-                    story_style, story_name, enhance,
+        # 穿透生成：段数按提示词实际分段数定（横幅与实际生成段数保持一致）
+        _pt_seg = _pt_seg_count(prompt_input) if passthrough else 0
+        _seg_lbl = f"{_pt_seg}段" if _pt_seg else _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count))
+        _run_banner("管理器", run_mode, _seg_lbl, story_style, story_name, enhance,
                     f" | 扩写≈{int(enhance.get('expand_words') or 500)}字" if expand_mode else "")
 
         # 故事扩写模式：只按「故事风格 + 扩写字数」把故事扩写为丰满正文，不拆解；
@@ -4281,7 +4343,7 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 print(f"[JZL-管理器] LLM/API 出错，终止生成：{err}")
                 return io.NodeOutput([None], [None], prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
 
-        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        # 穿透生成模式：必须使用「拆解模式」拆解好的提示词；格式不对直接终止；段数自动对齐提示词实际分段数
         if passthrough:
             _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
                                                       auto_count=bool(manager.get("_jzl_auto_count")), tag="管理器")
@@ -4290,7 +4352,7 @@ class JZL_MiniMaxAssetManager(io.ComfyNode):
                 return io.NodeOutput([None], [None], prompt_input or "",
                                      block_execution=f"❌ {_pt_err}",
                                      ui={"manager_error": [_pt_err]})
-            count = _pt_n          # 以剧本实际分段数为准（避免多生成空占位段）
+            count = _pt_n          # 以提示词实际分段数为准（忽略「生成视频数量」设定，避免多生成空占位段）
 
         # 调度指令规范化：LLM 可能把 slots 写成素材名（角色:兔子），用槽位映射反查纠正为槽位名（角色:角色A），
         # 保证下游调度严格按「类型:槽位名」匹配（对齐官方设定词「严禁写素材名」）
@@ -4596,7 +4658,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.05,
                     tooltip="二采（Ref2va）放大倍数"),
                 io.Combo.Input("video_count", options=list(VIDEO_COUNT_CHOICES), default=VIDEO_COUNT_DEFAULT,
-                    display_name="生成视频数量", tooltip="生成视频数量：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数（优先用足每段时长、防短剧情生成超多段）；也可固定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段。逐段即时落盘，段数再多也不叠加内存"),
+                    display_name="生成视频数量", tooltip="生成视频数量：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数（优先用足每段时长、防短剧情生成超多段）；也可固定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段。逐段即时落盘，段数再多也不叠加内存。🪄 穿透生成模式下忽略此设定：一律按提示词实际 [SHOT_START] 段数生成（上限 60 段）"),
                 io.Combo.Input("story_style", options=story_styles, default=story_styles[0],
                     display_name="故事风格", tooltip="故事风格（剧本处理器按此风格拆解与润色）"),
                 io.String.Input("story_name", display_name="故事名称", default="机智罗",
@@ -4687,8 +4749,10 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
             llm_seed = int(torch.randint(0, 0x7fffffffffffffff, (1,)).item())
         else:
             llm_seed = current_seed
-        _run_banner("Max", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
-                    story_style, story_name, enhance,
+        # 穿透生成：段数按提示词实际分段数定（横幅与实际生成段数保持一致）
+        _pt_seg = _pt_seg_count(prompt_input) if passthrough else 0
+        _seg_lbl = f"{_pt_seg}段" if _pt_seg else _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count))
+        _run_banner("Max", run_mode, _seg_lbl, story_style, story_name, enhance,
                     f" | 扩写≈{int(enhance.get('expand_words') or 500)}字" if expand_mode else "")
 
         # 故事扩写模式：只按「故事风格 + 扩写字数」扩写正文，不拆解；纯文本输出，不生成视频
@@ -4790,7 +4854,7 @@ class JZL_MiniMaxAssetManagerMax(io.ComfyNode):
                 print(f"[JZL-Max] LLM/API 出错，终止生成：{err}")
                 return io.NodeOutput(prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
 
-        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        # 穿透生成模式：必须使用「拆解模式」拆解好的提示词；格式不对直接终止；段数自动对齐提示词实际分段数
         if passthrough:
             _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
                                                       auto_count=bool(manager.get("_jzl_auto_count")), tag="Max")
@@ -5040,7 +5104,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.05,
                     tooltip="二采（Ref2va）放大倍数。开启二采不影响段间衔接：衔接恒用「一采 latent」，二采结果只用于解码落盘"),
                 io.Combo.Input("video_count", options=list(VIDEO_COUNT_CHOICES), default=VIDEO_COUNT_DEFAULT,
-                    display_name="生成视频数量", tooltip="段数：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数；1 段=普通单段生成（不启用衔接）；≥2 段=无限时长链路。逐段即时落盘，段数再多也不叠加内存"),
+                    display_name="生成视频数量", tooltip="段数：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数；1 段=普通单段生成（不启用衔接）；≥2 段=无限时长链路。逐段即时落盘，段数再多也不叠加内存。🪄 穿透生成模式下忽略此设定：一律按提示词实际 [SHOT_START] 段数生成（上限 60 段）"),
                 io.Combo.Input("story_style", options=story_styles, default=story_styles[0],
                     display_name="故事风格", tooltip="故事风格（剧本处理器按此风格拆解与润色）"),
                 io.String.Input("story_name", display_name="故事名称", default="机智罗",
@@ -5112,9 +5176,9 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         enhance = manager.get("enhance") or {}
         assets_cfg = manager.get("assets") or {}
         sample_decode = manager.get("sample_decode") or {}
-        # ♾️ 衔接设置（面板「🎭 采样解码设置 → 无限时长衔接」；缺省即官方 Motion Context 基线）
+        # ♾️ 衔接设置（面板「🎭 采样解码设置 → 无限时长衔接⚠实验性功能」；缺省即官方 Motion Context 基线）
         _inf = sample_decode.get("infinite") or {}
-        # 「无限时长衔接」总开关：关闭后每段独立生成（等价 Max 语义）
+        # 「无限时长衔接⚠实验性功能」总开关：关闭后每段独立生成（等价 Max 语义）
         _seam_on = _inf.get("enabled", True) is not False
         seam_window_cfg = _seam_resolve_window(_inf.get("window", SEAM_DEFAULT_WINDOW))
         seam_audio_link = _seam_flag(_inf.get("audio_link"), True)
@@ -5145,7 +5209,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         # ⭐ 段首衔接跑道（秒）= (窗口 + 过渡) / 24：段 2+ 的**生成时长 = 设定时长 + 跑道**。
         #    段首这一段是「承接上一段末帧」的锁定画面 + 模型启动过渡，成片会整段裁掉 ⇒ 落盘时长精确 = 用户设定。
         #    单段（count=1）或诊断档「不裁切」时跑道 = 0（没有衔接就没有额外生成内容）。
-        _seg_count_probe = _vc_count(video_count)
+        _seg_count_probe = (_pt_seg_count(prompt_input) if passthrough else 0) or _vc_count(video_count)
         seam_runway_sec = _seam_runway_seconds(seam_window_cfg, seam_settle,
                                                enabled=(_seam_on and _seg_count_probe > 1 and seam_trim_mode != "none"))
         if seam_runway_sec > 0:
@@ -5189,8 +5253,10 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
             _banner_extra += " | 二采引导=上段二采latent尾部"
         if expand_mode:
             _banner_extra += f" | 扩写≈{int(enhance.get('expand_words') or 500)}字"
-        _run_banner("无限时长", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
-                    story_style, story_name, enhance, _banner_extra)
+        # 穿透生成：段数按提示词实际分段数定（横幅与实际生成段数保持一致）
+        _pt_seg = _pt_seg_count(prompt_input) if passthrough else 0
+        _seg_lbl = f"{_pt_seg}段" if _pt_seg else _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count))
+        _run_banner("无限时长", run_mode, _seg_lbl, story_style, story_name, enhance, _banner_extra)
 
         # ── 故事扩写模式：只按「故事风格 + 扩写字数」扩写正文，不拆解；纯文本输出，不生成视频 ──
         if expand_mode:
@@ -5297,7 +5363,7 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
                 print(f"[JZL-无限时长] LLM/API 出错，终止生成：{err}")
                 return io.NodeOutput(prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
 
-        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        # 穿透生成模式：必须使用「拆解模式」拆解好的提示词；格式不对直接终止；段数自动对齐提示词实际分段数
         if passthrough:
             _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
                                                       auto_count=bool(manager.get("_jzl_auto_count")), tag="无限时长")
@@ -5692,7 +5758,8 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
                 io.Int.Input("video_count", default=0, min=0, max=SEGMENT_COUNT_MAX, step=1,
                     display_name="生成视频数量",
                     tooltip="参数：0 = LLM 按剧情时间线长度，自动计算需要生成多少段视频。\n"
-                            "参数：1~60 = 设置固定生成数量，最多支持一次生成60段视频！"),
+                            "参数：1~60 = 设置固定生成数量，最多支持一次生成60段视频！\n"
+                            "🪄 穿透生成模式下忽略此设定：一律按提示词实际 [SHOT_START] 段数生成"),
                 io.Combo.Input("story_style", options=story_styles, default=story_styles[0],
                     display_name="故事风格", tooltip="故事风格（剧本处理器按此风格拆解与润色）"),
                 io.String.Input("story_name", display_name="故事名称", default="机智罗",
@@ -5761,9 +5828,9 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
         enhance = manager.get("enhance") or {}
         assets_cfg = manager.get("assets") or {}
         sample_decode = manager.get("sample_decode") or {}
-        # ♾️ 衔接设置（面板「🎭 采样解码设置 → 无限时长衔接」；缺省即官方 Motion Context 基线）
+        # ♾️ 衔接设置（面板「🎭 采样解码设置 → 无限时长衔接⚠实验性功能」；缺省即官方 Motion Context 基线）
         _inf = sample_decode.get("infinite") or {}
-        # 「无限时长衔接」总开关：关闭后每段独立生成（等价 Max 语义）
+        # 「无限时长衔接⚠实验性功能」总开关：关闭后每段独立生成（等价 Max 语义）
         _seam_on = _inf.get("enabled", True) is not False
         seam_window_cfg = _seam_resolve_window(_inf.get("window", SEAM_DEFAULT_WINDOW))
         seam_audio_link = _seam_flag(_inf.get("audio_link"), True)
@@ -5794,7 +5861,7 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
         # ⭐ 段首衔接跑道（秒）= (窗口 + 过渡) / 24：段 2+ 的**生成时长 = 设定时长 + 跑道**。
         #    段首这一段是「承接上一段末帧」的锁定画面 + 模型启动过渡，成片会整段裁掉 ⇒ 落盘时长精确 = 用户设定。
         #    单段（count=1）或诊断档「不裁切」时跑道 = 0（没有衔接就没有额外生成内容）。
-        _seg_count_probe = _vc_count(video_count)
+        _seg_count_probe = (_pt_seg_count(prompt_input) if passthrough else 0) or _vc_count(video_count)
         seam_runway_sec = _seam_runway_seconds(seam_window_cfg, seam_settle,
                                                enabled=(_seam_on and _seg_count_probe > 1 and seam_trim_mode != "none"))
         if seam_runway_sec > 0:
@@ -5836,8 +5903,10 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
             _banner_extra += " | 二采引导=上段二采latent尾部"
         if expand_mode:
             _banner_extra += f" | 扩写≈{int(enhance.get('expand_words') or 500)}字"
-        _run_banner("短剧导演台", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
-                    story_style, story_name, enhance, _banner_extra)
+        # 穿透生成：段数按提示词实际分段数定（横幅与实际生成段数保持一致）
+        _pt_seg = _pt_seg_count(prompt_input) if passthrough else 0
+        _seg_lbl = f"{_pt_seg}段" if _pt_seg else _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count))
+        _run_banner("短剧导演台", run_mode, _seg_lbl, story_style, story_name, enhance, _banner_extra)
 
         # ── 故事扩写模式：只按「故事风格 + 扩写字数」扩写正文，不拆解；纯文本输出，不生成视频 ──
         if expand_mode:
@@ -5944,7 +6013,7 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
                 print(f"[JZL-短剧导演台] LLM/API 出错，终止生成：{err}")
                 return io.NodeOutput(prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
 
-        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        # 穿透生成模式：必须使用「拆解模式」拆解好的提示词；格式不对直接终止；段数自动对齐提示词实际分段数
         if passthrough:
             _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
                                                       auto_count=bool(manager.get("_jzl_auto_count")), tag="短剧导演台")
@@ -6325,7 +6394,7 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
                 io.Float.Input("scale_factor", display_name="参考数值放大", default=1.0, min=1.0, max=5.0, step=0.1,
                     tooltip="参考图放大系数"),
                 io.Combo.Input("video_count", options=list(VIDEO_COUNT_CHOICES), default=VIDEO_COUNT_DEFAULT,
-                    display_name="生成视频数量", tooltip="生成视频数量：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数；也可固定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段（统一控制：提示词拆解段数）"),
+                    display_name="生成视频数量", tooltip="生成视频数量：默认「剧情决定」= LLM 按剧情时间线长度 ÷ 每段时长自动定段数；也可固定 1/2/3/4/6/9/12/16/20/26/32/40/48/56 段（统一控制：提示词拆解段数）。🪄 穿透生成模式下忽略此设定：一律按提示词实际 [SHOT_START] 段数生成（上限 60 段）"),
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.05,
                     tooltip="二采（Ref2va）放大倍数，从「Latent放大参数」输出给下游二采放大节点"),
                 # ③提示词：剧本处理器参数（主界面显示）
@@ -6424,8 +6493,10 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
             llm_seed = int(torch.randint(0, 0x7fffffffffffffff, (1,)).item())
         else:
             llm_seed = current_seed
-        _run_banner("Mini", run_mode, _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count)),
-                    story_style, story_name, enhance,
+        # 穿透生成：段数按提示词实际分段数定（横幅与实际生成段数保持一致）
+        _pt_seg = _pt_seg_count(prompt_input) if passthrough else 0
+        _seg_lbl = f"{_pt_seg}段" if _pt_seg else _seg_label(manager.get("_jzl_auto_count"), _vc_count(video_count))
+        _run_banner("Mini", run_mode, _seg_lbl, story_style, story_name, enhance,
                     f" | 扩写≈{int(enhance.get('expand_words') or 500)}字" if expand_mode else "")
 
         # ── 纯文本模式提前返回（不编码/不生成，直接经「已拆解剧本」端口输出文本）──
@@ -6521,7 +6592,7 @@ class JZL_MiniMaxAssetManagerMini(io.ComfyNode):
                 return io.NodeOutput(model, vae, audio_vae, upscale_scale, [None], [None], prompt_input or "",
                                      block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
 
-        # 穿透生成模式 / 重拍：必须使用「拆解模式」拆解好的提示词；格式不对直接终止，不生成
+        # 穿透生成模式：必须使用「拆解模式」拆解好的提示词；格式不对直接终止；段数自动对齐提示词实际分段数
         if passthrough:
             _pt_err, _pt_n = _check_decomposed_script(prompt_input, video_count,
                                                       auto_count=bool(manager.get("_jzl_auto_count")), tag="Mini")

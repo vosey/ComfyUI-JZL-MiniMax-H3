@@ -17,7 +17,7 @@ import { api } from "../../scripts/api.js";
 const NODE_TYPE = "JZL_MiniMaxAssetManager";
 const MINI_NODE_TYPE = "JZL_MiniMaxAssetManagerMini";
 const MAX_NODE_TYPE = "JZL_MiniMaxAssetManagerMax";
-// ♾️ 无限时长：与 Max 同一套面板/落盘语义，额外多一个「无限时长衔接」设置分区
+// ♾️ 无限时长：与 Max 同一套面板/落盘语义，额外多一个「无限时长衔接⚠实验性功能」设置分区
 const INF_NODE_TYPE = "JZL_MiniMaxAssetManagerInfinite";
 // 🎬 短剧导演台：克隆「无限时长」，按钮改为「2 + 4 + 4」三排（多了「生成设定」「视频参数」两个面板）
 const SHORTDRAMA_NODE_TYPE = "JZL_MiniMaxAssetManagerShortDrama";
@@ -293,6 +293,12 @@ function videoCountComboOptions(w) {
         if (m) out.push({ n: Number(m[1]), text: s });
     }
     return out;
+}
+
+// 提示词里 [SHOT_START]…[SHOT_END] 分段块数（穿透生成的段数对齐用，与后端 _pt_seg_count 同规则）。
+function countShotBlocks(text) {
+    const m = String(text ?? "").match(/\[SHOT_START\][\s\S]*?\[SHOT_END\]/g);
+    return m ? m.length : 0;
 }
 
 // 返回段数：0 = 剧情决定/自动；n = 固定 n 段。两套写法（数字 / 「生成N段」）都能解析。
@@ -2680,6 +2686,8 @@ function setupInternalPrompt(node, box, ipWidget) {
     // 提示词来源只有节点内编辑框（外部提示词端口已删除）：输入同步到 internal_prompt
     const syncInternal = () => {
         if (ipWidget) setWidgetValue(ipWidget, getPromptText(box));
+        // 穿透生成的「生成详情 → 段数」随提示词里的 [SHOT_START] 段数联动
+        try { node?.__jzlUpdateDisplay?.(); } catch (_) {}
     };
     box.addEventListener("input", () => {
         syncInternal();
@@ -3572,7 +3580,7 @@ function renderPreferenceSettingsPanel(c, s) {
 const RUN_MODE_TIPS = {
     "🛠️ 故事拆解模式": "使用 LLM 模型，对提示词按设定拆解，然后采样生成视频。",
     "📚 故事扩写模式": "使用 LLM 模型，把故事扩写为丰满正文，只输出文本不生成视频。",
-    "🪄 穿透生成模式": "跳过 LLM 模型，直接用现有提示词，进行采样生成视频。",
+    "🪄 穿透生成模式": "跳过 LLM 模型，直接用现有提示词，按提示词段数出片。",
     "📝 仅提示词输出": "使用 LLM 模型，拆解并增强提示词，只输出剧本不生成视频。",
 };
 
@@ -3685,7 +3693,8 @@ function renderVideoParamsPanel(c, s, node) {
         { min: 0, max: 60, step: 1 }, _setVC)));
     c.append(el("div", "font-size:12px;color:var(--descrip-text,#999);margin:-4px 0 10px 172px;line-height:1.7;white-space:pre-line;",
         "参数：0 = LLM 按剧情时间线长度，自动计算需要生成多少段视频。\n"
-        + "参数：1~60 = 设置固定生成数量，最多支持一次生成60段视频！"
+        + "参数：1~60 = 设置固定生成数量，最多支持一次生成60段视频！\n"
+        + "🪄 穿透生成模式下忽略此设定：按提示词实际段数生成。"
         + (_vcNum ? "" : "（本节点该参数以下拉形式保存，面板里按数值显示与修改）")));
 
     c.append(makeSectionTitle("参考与放大"));
@@ -3964,12 +3973,12 @@ function renderPrefPanel(c, s, d, node) {
     c.append(field("解码前清理", selectControl(OPTIONS.decodeCleanup, p.decode_cleanup || OPTIONS.decodeCleanup[0], v => { p.decode_cleanup = v; })));
     c.append(field("音频解码", el("div", "font-size:13px;color:var(--fg-color,#ddd);padding:6px 10px;background:var(--comfy-input-bg,#2a2a2a);border:1px solid var(--border-color,#444);border-radius:4px;", "VAE解码（音频）")));
 
-    // ── ♾️ 无限时长衔接（「JZL - 🤖 MiniMax-H3无限时长」与「🎬 短剧导演台」显示）──
+    // ── ♾️ 无限时长衔接⚠实验性功能（「JZL - 🤖 MiniMax-H3无限时长」与「🎬 短剧导演台」显示）──
     // 后端读取 sample_decode.infinite = { enabled, window, audio_no_trim, settle, trim_mode, guide_source, second_guide }
     const isInfNode = !!node && (node.type === INF_NODE_TYPE || node.type === SHORTDRAMA_NODE_TYPE);
     if (isInfNode) {
         const inf = p.infinite || (p.infinite = { enabled: true, window: 22, audio_link: true, audio_no_trim: false, luma_match: true });
-        c.append(makeSectionTitle("无限时长衔接"));
+        c.append(makeSectionTitle("无限时长衔接⚠实验性功能"));
         // ⭐ 总开关：关闭后本节点按「无衔接」独立生成每一段（等价 Max 语义）
         c.append(field("启用跨段衔接", checkboxControl(inf.enabled !== false,
             "开启：第 2 段起用上段 latent 尾部衔接（画面连续）；关闭：每段独立生成（等价 Max）",
@@ -4141,7 +4150,8 @@ const USAGE_FALLBACK_HTML = `
 </ul>
 <p style="margin:4px 0;">推荐流程：📝 仅提示词输出 调提示词 → 满意后切 🪄 穿透生成模式 出片。</p>
 <p style="margin:4px 0;">⚠️ 拆解 / 扩写吃<b>自然语言故事</b>；含已拆解标签（===H3_PROMPT===、[SHOT_START]、subject_definitions:、### Video_001 等）会报错终止，请改用 🪄 穿透生成模式。</p>
-<p style="margin:4px 0;">⚠️ 穿透 / 重拍只接受<b>拆解产物</b>：需含 [SHOT_START]…[SHOT_END] 且每段含 ===H3_PROMPT=== 六段正文，格式不对直接终止；段数需与「生成视频数量」匹配；段内 <b>时长：N</b>（英文 <b>Duration：N</b>）决定该段时长，缺失时回退节点「每段视频时长」。</p>
+<p style="margin:4px 0;">⚠️ 穿透 / 重拍只接受<b>拆解产物</b>：需含 [SHOT_START]…[SHOT_END] 且每段含 ===H3_PROMPT=== 六段正文，格式不对直接终止；段内 <b>时长：N</b>（英文 <b>Duration：N</b>）决定该段时长，缺失时回退节点「每段视频时长」。</p>
+<p style="margin:4px 0;">🔒 <b>穿透生成段数自动对齐</b>：一律按提示词里实际的 [SHOT_START] 段数生成，<b>「生成视频数量」设定被忽略</b>（不再因两者不一致而终止 / 多生成空占位段），上限 60 段。</p>
 <h4 style="margin:10px 0 4px;color:var(--fg-color,#eee);">三、素材与参考调度</h4>
 <ul style="padding-left:20px;margin:4px 0;">
 <li>上限：图片 ≤9 / 视频 ≤3 / 音频 ≤3，总参考 ≤12（官方上限）</li>
@@ -5330,8 +5340,14 @@ app.registerExtension({
                 }
                 const vcRaw = String(gv("video_count") ?? "").trim();
                 // 「剧情决定」：字符串「剧情决定」或数值 0（短剧导演台的 0 = 剧情决定）
-                const vcAuto = /剧情决定|自动/.test(vcRaw) || (/^\d+(\.\d+)?$/.test(vcRaw) && Number(vcRaw) === 0);
-                const count = (vcRaw.match(/\d+/) || [0])[0] * 1 || 6;
+                let vcAuto = /剧情决定|自动/.test(vcRaw) || (/^\d+(\.\d+)?$/.test(vcRaw) && Number(vcRaw) === 0);
+                let count = (vcRaw.match(/\d+/) || [0])[0] * 1 || 6;
+                // 🪄 穿透生成：段数按提示词里实际的 [SHOT_START] 段数算（后端同规则，忽略「生成视频数量」）
+                if (/穿透生成/.test(String(gv("run_mode") ?? ""))) {
+                    const ptTxt = String(gv("internal_prompt") ?? "") || (self.__promptBox ? getPromptText(self.__promptBox) : "");
+                    const ptN = Math.min(60, countShotBlocks(ptTxt));
+                    if (ptN) { vcAuto = false; count = ptN; }
+                }
                 // 动态参数用范围简写（如 1~60）
                 const cntLo = vcAuto ? 1 : count, cntHi = vcAuto ? 60 : count;
                 const cntTxt = vcAuto ? `${cntLo}~${cntHi}` : `${count}`;
