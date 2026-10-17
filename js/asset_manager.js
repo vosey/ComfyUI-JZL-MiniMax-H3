@@ -301,6 +301,98 @@ function countShotBlocks(text) {
     return m ? m.length : 0;
 }
 
+// ── Nodes 2.0（设置 →「Comfy.VueNodes.Enabled」）下 DOM widget 的尺寸与滚轮 ─────────
+// 前端源码事实（comfyui-frontend 1.55.x）：
+//   · 每个 widget 排进 CSS grid 的一行；DOM widget 的 hasLayoutSize 恒为 true
+//     （deriveWidgetRenderState: typeof computeLayoutSize === 'function'，而 DOMWidgetImpl 原型就有），
+//     于是行高 = `auto` = 内容的 max-content ⇒ 内容一长（长剧本 / 视频宫格）节点就被撑到最大。
+//   · 我们的容器 `height:100%` + 内部 `flex:1; min-height:0` 因祖先全链 `min-height:auto`
+//     拿不到确定高度 ⇒ 内部 `overflow:auto` 永远 clientHeight == scrollHeight ⇒ 没有滚动条。
+//   · 滚轮：前端 `wheelCapturedByFocusedElement(e) = e.target.closest('[data-capture-wheel="true"]')
+//     且 document.activeElement 在该元素内` —— 不满足就把滚轮forward给画布（= 缩放画布）。
+//
+// 修法（两条都不依赖 JS 反推节点高度，避免「只能变大不能变小」的自锁）：
+//   ① 高度：把容器 max-height 绑到前端自带的 CSS 变量 `--node-height`（= 节点高度 + 固定余量），
+//      减去一次性标定出的 chrome（标题栏 + 原生输入行 + 内边距）。纯 CSS 跟随节点尺寸，
+//      拖动缩小时上限同步变小 ⇒ 可以自由拉伸，且内部滚动条稳定存在。
+//   ② 滚轮：给滚动容器打 `data-capture-wheel="true"` + `tabindex="-1"`，并在指针进入/按下时
+//      聚焦它 ⇒ 前端不再把滚轮转给画布，浏览器原生滚动生效（与官方 Textarea 同一套机制）。
+const JZL_WHEEL_PROBE = 3000;   // 标定 chrome 时把容器临时撑到这个高度
+
+function bindDomWidgetMaxHeight(node, el, opts = {}) {
+    if (!node || !el) return () => {};
+    const minH = Number(opts.minHeight) || 0;
+    const cache = { K: 0 };
+    const rootEl = () => (el.closest ? el.closest(".lg-node") : null);
+
+    // chrome = 节点根部高度 − 容器高度（与容器内容无关）。用固定 3000px 撑开容器测，
+    // 任何内容状态下都成立（早期版本用「空内容 / 4000px 两点拟合」，空内容时量不出来 → 静默失败）。
+    const calibrate = () => {
+        const root = rootEl();
+        if (!root) return null;                                // 经典渲染器没有 .lg-node → 不接管
+        const keep = { max: el.style.maxHeight, min: el.style.minHeight, flex: el.style.flex, h: el.style.height };
+        try {
+            el.style.maxHeight = "";
+            el.style.minHeight = "0px";
+            el.style.flex = "0 0 auto";
+            el.style.height = JZL_WHEEL_PROBE + "px";
+            const rh = root.clientHeight, eh = el.clientHeight;
+            if (!eh || rh <= eh) return false;                 // 量不到 → 稍后重试
+            cache.K = Math.max(40, Math.round(rh - eh));
+            return true;
+        } finally {
+            el.style.maxHeight = keep.max;
+            el.style.minHeight = keep.min;
+            el.style.flex = keep.flex;
+            el.style.height = keep.h;
+        }
+    };
+
+    let tries = 0;
+    const apply = () => {
+        try {
+            if (!cache.K) {
+                const ok = calibrate();
+                if (ok === null) return;                        // 经典模式：保持原生布局
+                if (!ok) {
+                    if (++tries <= 40) setTimeout(apply, 150);  // DOM 挂载/工作流加载时序
+                    return;
+                }
+            }
+            const h = `calc(var(--node-height, ${Math.round(JZL_WHEEL_PROBE)}px) - ${cache.K}px)`;
+            if (el.style.maxHeight !== h) el.style.maxHeight = h;
+            // definite：同时给 height。不加这一条时容器高度由内容决定（max-height 只是裁剪），
+            // 面板内部 flex:1 的提示词框会按「内容高度」分配剩余空间 → 把资产窗/重拍条挤出可视区，
+            // 表现为面板右侧冒出滚动条（用户报障）。给了确定高度后 flex 才会真正压缩提示词框。
+            if (opts.definite && el.style.height !== h) el.style.height = h;
+            if (minH > 0 && el.style.minHeight !== minH + "px") el.style.minHeight = minH + "px";
+        } catch (_) {}
+    };
+    try { requestAnimationFrame(() => { apply(); setTimeout(apply, 300); setTimeout(apply, 1200); }); } catch (_) { apply(); }
+    return apply;
+}
+
+// 让某个滚动容器接管滚轮（Nodes 2.0 下否则会缩放整个画布）
+function enableWheelScroll(box) {
+    if (!box || box.__jzlWheel) return box;
+    box.__jzlWheel = true;
+    try {
+        box.setAttribute("data-capture-wheel", "true");
+        if (!box.hasAttribute("tabindex")) box.setAttribute("tabindex", "-1");
+        box.style.outline = "none";
+        const focus = () => {
+            if (!box.closest || !box.closest(".lg-node")) return;   // 经典渲染器：不抢焦点
+            const ae = document.activeElement;
+            // 只抢「没有人正在用」的情况：焦点在 body / 本容器，避免打断提示词输入
+            if (ae && ae !== document.body && ae !== box && box.contains(ae)) return;
+            if (ae && ae !== document.body && !box.contains(ae) && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) return;
+            try { box.focus({ preventScroll: true }); } catch (_) { try { box.focus(); } catch (__) {} }
+        };
+        box.addEventListener("pointerenter", focus, true);
+        box.addEventListener("pointerdown", focus, true);
+    } catch (_) {}
+    return box;
+}
 // 返回段数：0 = 剧情决定/自动；n = 固定 n 段。两套写法（数字 / 「生成N段」）都能解析。
 function readVideoCount(w) {
     const raw = String(readWidgetValue(w) ?? "").trim();
@@ -994,8 +1086,13 @@ function renderAssetWindow(windowBox, textarea, node, onInsert, insertFn) {
     }
     windowBox.appendChild(grid);
     // 高度自适应内容（多行换行时增高），并通知节点调整整体高度；
-    // 用 scrollHeight 取完整内容高度（含 overflow:hidden 可能遮挡的多行），保证素材不被吞
-    const h = Math.max(grid.scrollHeight || grid.offsetHeight, 30);
+    // 用 scrollHeight 取完整内容高度（含可能被裁剪的多行），保证素材不被吞。
+    // 若该窗自身设了 max-height（节点表面那块 180px）→ 到顶就不再增高，改为本窗内部滚动。
+    let h = Math.max(grid.scrollHeight || grid.offsetHeight, 30);
+    try {
+        const cap = parseFloat(getComputedStyle(windowBox).maxHeight);
+        if (Number.isFinite(cap) && cap > 0) h = Math.min(h, cap);
+    } catch (_) {}
     windowBox.style.height = h + "px";
     windowBox.__onResize?.();
 }
@@ -5064,8 +5161,10 @@ app.registerExtension({
             [0, 150, 500, 1200].forEach((d) => setTimeout(killGhost, d));
 
             // 资产显示窗（缩略图墙，点击插入 @引用；自动换行，多行时节点同步增高）
+            // 高度上限 180px：超出后**本窗自己滚动**（避免素材一多就把整个节点顶高、也不给节点加滚动条）
             const windowTitle = el("div", "flex:0 0 auto;font-size:12px;color:#bbb;margin-top:2px;", "📁 资产显示窗（点击插入）");
-            const windowBox = el("div", "min-height:30px;overflow:hidden;flex:0 0 auto;");
+            const windowBox = el("div", "min-height:30px;max-height:180px;overflow-y:auto;overflow-x:hidden;flex:0 0 auto;scrollbar-width:thin;");
+            enableWheelScroll(windowBox);   // Nodes 2.0：滚轮归本窗
             const resizeNodeForContent = () => {
                 requestAnimationFrame(() => {
                     try {
@@ -5124,19 +5223,24 @@ app.registerExtension({
             };
             // 上限实际取消：原来是 900，用户把节点拉得比 900 还高时输入框就不再跟着长（报障 ①）。
             // 下拉时的高度同时被指针位移约束，不存在跑飞风险，这里给一个名义上限即可。
-            const PROMPT_H2_MIN = 280, PROMPT_H2_MAX = 100000, PROMPT_H2_DEFAULT = 280;
-            const origH2 = { wrap: null, box: null };      // 首次改写前的原样（切回经典模式要原样还原）
+            const PROMPT_H2_MIN = 160, PROMPT_H2_MAX = 100000, PROMPT_H2_DEFAULT = 280;
+            const origH2 = { wrap: null, box: null };      // 首次改写前的原样（切回经典模式要原样还原）            // Nodes 2.0：面板已有界定高度（见 bindDomWidgetMaxHeight）→ 提示词框改成 **flex 填满剩余空间**。
+            //   这样「🔄 重拍模式」与资产窗被顶到节点下边缘，节点拉高时只有输入框变大，不再是下方留白。
+            //   （旧写法给固定 px，节点拉高后多出来的空间全留在面板底部 → 用户报「下面空白变大」。）
             const applyPromptH2 = (h) => {
                 if (!origH2.wrap) {
                     origH2.wrap = { height: promptWrap.style.height, minHeight: promptWrap.style.minHeight, flex: promptWrap.style.flex };
-                    origH2.box = { height: promptBox.style.height, maxHeight: promptBox.style.maxHeight, flex: promptBox.style.flex };
+                    origH2.box = { height: promptBox.style.height, maxHeight: promptBox.style.maxHeight, minHeight: promptBox.style.minHeight, flex: promptBox.style.flex };
                 }
-                promptWrap.style.flex = "0 0 auto";
-                promptWrap.style.height = h + "px";
-                promptWrap.style.minHeight = h + "px";
-                promptBox.style.flex = "0 0 auto";
-                promptBox.style.height = h + "px";
-                promptBox.style.maxHeight = h + "px";
+                promptWrap.style.flex = "1 1 auto";
+                promptWrap.style.height = "";
+                // 下限压到 0：面板高度已确定，提示词框是唯一可压缩的项 ⇒ 节点再矮也不会
+                // 让资产窗/重拍条被挤出去而在面板右侧冒出滚动条（节点极矮时框会很扁，拉高即恢复）
+                promptWrap.style.minHeight = "0px";
+                promptBox.style.flex = "1 1 auto";
+                promptBox.style.height = "";
+                promptBox.style.maxHeight = "";
+                promptBox.style.minHeight = "0px";
             };
             // 切回经典（canvas）模式：把行内样式还原成面板原本的值，交回原有的 flex 满高布局
             const restorePromptH2 = () => {
@@ -5147,6 +5251,7 @@ app.registerExtension({
                     promptWrap.style.flex = origH2.wrap.flex;
                     promptBox.style.height = origH2.box.height;
                     promptBox.style.maxHeight = origH2.box.maxHeight;
+                    promptBox.style.minHeight = origH2.box.minHeight;
                     promptBox.style.flex = origH2.box.flex;
                 } catch (_) {}
             };
@@ -5275,7 +5380,13 @@ app.registerExtension({
             self.__jzlRelayout2 = relayoutForNodes2;
             {
                 // 两种模式都装调度：经典模式下 relayoutForNodes2 会直接返回（零开销）
-                if (IS_NODES2_LAYOUT) self.setSize?.([self.size?.[0] || 600, Math.max(Number(self.size?.[1]) || 0, 480)]);
+                // Nodes 2.0：面板高度 = 节点高度（见 bindDomWidgetMaxHeight），默认高度要够放
+                // 「按钮区 + 提示词 + 资产窗 + 重拍模式」，否则一见面就是面板滚动条。
+                // 实测不滚所需高度：短剧导演台 620；Pro/Max/无限时长 831（原生输入行更多）；Mini 891。
+                if (IS_NODES2_LAYOUT) {
+                    const _dfltH = isShortDrama ? 620 : (isMini ? 900 : 860);
+                    self.setSize?.([self.size?.[0] || 600, Math.max(Number(self.size?.[1]) || 0, _dfltH)]);
+                }
                 [0, 50, 150, 400, 900, 1600].forEach((d) => setTimeout(relayoutForNodes2, d));
                 // ⚠️ 重排绝不能在 ResizeObserver 回调里同步执行："写高度 → 布局变 → observer 又触发"
                 // 会刷出 "ResizeObserver loop completed with undelivered notifications"（实测节点拖拽时 6 条）。
@@ -5547,8 +5658,15 @@ app.registerExtension({
                     const fullW = Number.isFinite(self.size?.[0]) ? self.size[0] : 0;
                     if (widget && fullW && widget.width !== fullW) widget.width = fullW;
                 } catch (_) {}
+                // Nodes 2.0：节点尺寸变化后同步「面板可用高度」上限（见 bindDomWidgetMaxHeight）
+                try { self._jzlApplyMaxH?.(); } catch (_) {}
             };
             syncDomWidth();
+            // Nodes 2.0：面板高度界定到「节点高度 − chrome」，这样提示词框才能 flex 填满剩余空间、
+            // 「🔄 重拍模式」始终吸附节点下边缘（否则 2.0 行高 auto ⇒ 面板被内容撑开、按钮飘在中间）。
+            // 经典模式该绑定自动空转（closest('.lg-node') 为空）。
+            const applyPanelMaxH = bindDomWidgetMaxHeight(self, container, { minHeight: 260, definite: true });
+            self._jzlApplyMaxH = applyPanelMaxH;
             self._jzlSyncWidth = syncDomWidth;
             self._jzlDomWidget = widget;
 
@@ -5927,6 +6045,7 @@ function setupVideoViewerNode(self) {
 
     // 视频宫格（2 列，右侧留滚动条位，随节点拉大卡片自适应放大）
     const scroll = el("div", "flex:1 1 auto;overflow-y:auto;min-height:0;scrollbar-gutter:stable;border:1px solid #333;border-radius:5px;background:#1a1a1a;padding:6px;box-sizing:border-box;");
+    enableWheelScroll(scroll);   // Nodes 2.0：滚轮归本窗（否则会缩放画布）
     const grid = el("div", "display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;align-content:start;");
     scroll.appendChild(grid);
     container.appendChild(scroll);
@@ -6011,11 +6130,14 @@ function setupVideoViewerNode(self) {
         widget.options.onDraw = () => { try { syncW(); } catch (_) {} };
         widget.options.afterResize = () => { try { syncW(); } catch (_) {} };
     }
+    // Nodes 2.0：视频宫格会把节点撑到内容高度（详见 bindDomWidgetMaxHeight 注释）→ 限高后内部滚动
+    const applyMaxH = bindDomWidgetMaxHeight(self, container, { minHeight: 200 });
     const syncW = () => {
         try {
             const fw = Number.isFinite(self.size?.[0]) ? self.size[0] : 0;
             if (widget && fw && widget.width !== fw) widget.width = fw;
         } catch (_) {}
+        try { applyMaxH(); } catch (_) {}
     };
     syncW();
     self._jzlViewerWidget = widget;
@@ -6231,6 +6353,7 @@ function setupScriptViewerNode(self) {
 
     // 显示窗：只读全文（等宽、可滚动、随节点拉大）
     const scroll = el("div", "flex:1 1 auto;min-height:0;overflow:auto;border:1px solid #333;border-radius:6px;background:#141414;padding:8px;box-sizing:border-box;");
+    enableWheelScroll(scroll);   // Nodes 2.0：滚轮归本窗（否则会缩放画布）
     const pre = el("pre", "margin:0;white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.65;color:#ddd;font-family:Consolas,Menlo,monospace;");
     scroll.appendChild(pre);
     container.appendChild(scroll);
@@ -6368,11 +6491,14 @@ function setupScriptViewerNode(self) {
         widget.options.onDraw = () => { try { syncW(); } catch (_) {} };
         widget.options.afterResize = () => { try { syncW(); } catch (_) {} };
     }
+    // Nodes 2.0：长剧本会把节点撑到内容高度（详见 bindDomWidgetMaxHeight 注释）→ 限高后内部滚动
+    const applyMaxH = bindDomWidgetMaxHeight(self, container, { minHeight: 200 });
     const syncW = () => {
         try {
             const fw = Number.isFinite(self.size?.[0]) ? self.size[0] : 0;
             if (widget && fw && widget.width !== fw) widget.width = fw;
         } catch (_) {}
+        try { applyMaxH(); } catch (_) {}
     };
     syncW();
     self._jzlScriptWidget = widget;
