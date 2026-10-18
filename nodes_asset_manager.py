@@ -227,23 +227,49 @@ _RM_ALIASES = {
 
 
 def _normalize_run_mode(run_mode):
-    """run_mode 归一化：剥离表情前缀/后缀 + 旧别名 → 纯模式名（故事拆解/故事扩写/穿透生成/仅提示词输出）。"""
-    if not run_mode:
-        return "故事拆解模式"
-    rm = str(run_mode).strip()
-    # 表情前缀剥离（🛠️ 📚 📝 🪄 及其后的空格）
-    for emoji in ("🛠️", "📚", "📝", "🪄"):
-        if rm.startswith(emoji):
-            rm = rm[len(emoji):].lstrip()
-            break
-    # 旧别名
-    rm = _RM_ALIASES.get(rm, rm)
-    # 若剥后仍带表情（如「故事拆解模式🛠️」后置），再次 map
-    rm = _RM_EMOJI_TO_PLAIN.get(rm, rm)
-    if rm not in RUN_MODE_PLAIN:
-        # 最后兜底：去所有空格后再查一次（防「🛠️ 故事拆解模式」没剥干净）
-        rm = _RM_EMOJI_TO_PLAIN.get(str(rm).replace(" ", ""), rm)
-    return rm if rm in RUN_MODE_PLAIN else "故事拆解模式"
+    """run_mode 归一化：剥离表情/变体选择符 + 旧别名 → 纯模式名。
+
+    注意：不同输入法/工作流里同一表情可能带 U+FE0F（VS16）或零宽连接符，
+    直接 startswith("🪄") 会残留 U+FE0F 导致识别失败并回退成「故事拆解模式」。
+    这里先做字符清洗，再按关键字归一，最后才走精确映射兜底。
+    """
+    raw = "" if run_mode is None else str(run_mode).strip()
+    rm = raw
+    # 去掉变体选择符（VS15/VS16）与零宽连接符，避免表情比较不相等
+    for ch in ("\ufe0e", "\ufe0f", "\u200d"):
+        rm = rm.replace(ch, "")
+    rm = rm.strip()
+
+    result = None
+    # 关键字归一（最稳：兼容表情前后缀、旧名、本地化差异）
+    if "穿透" in rm or "直通" in rm:
+        result = "穿透生成模式"
+    elif "仅提示词" in rm or "纯提示词" in rm:
+        result = "仅提示词输出"
+    elif "扩写" in rm or "扩展" in rm:
+        result = "故事扩写模式"
+    elif "拆解" in rm:
+        result = "故事拆解模式"
+
+    if result is None:
+        # 表情前缀剥离（🛠️ 📚 📝 🪄 及其后的空格）
+        for emoji in ("🛠️", "📚", "📝", "🪄"):
+            if rm.startswith(emoji):
+                rm = rm[len(emoji):].lstrip()
+                break
+        rm = _RM_ALIASES.get(rm, rm)              # 旧别名
+        rm = _RM_EMOJI_TO_PLAIN.get(rm, rm)       # 后置表情
+        if rm not in RUN_MODE_PLAIN:
+            rm = _RM_EMOJI_TO_PLAIN.get(str(rm).replace(" ", ""), rm)
+        result = rm if rm in RUN_MODE_PLAIN else "故事拆解模式"
+
+    # 非标准输入留一条诊断（正常含表情的值不会刷屏）
+    _known = set(RUN_MODE_EMOJI) | set(RUN_MODE_PLAIN) | set(_RM_ALIASES)
+    if not raw:
+        print("[JZL] ⚠️ 运行模式为空 → 已按「故事拆解模式」处理")
+    elif raw not in _known:
+        print(f"[JZL] ℹ️ 运行模式原始值={run_mode!r} → 归一化为「{result}」")
+    return result
 
 
 def _asset_settings_file():
@@ -5721,17 +5747,14 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
 
 
 class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
-    """JZL - 🤖 MiniMax-H3无限时长 — 段间 latent 引导衔接的逐段生成长视频链路。
+    """JZL - 🤖 MiniMax-H3短剧导演台 — 固定段数的逐段生成长视频链路。
 
     与「短剧导演台Max」唯一差异在分段循环（LLM 拆解 / 资产 / 参数 / 逐段落盘 / 读盘拼接 / 显存释
     放全部沿用同一套）：
-    · 每段仍按剧情拆解出的「新提示词」独立生成 → 剧情持续往前推进（不再是同一段提示词重复）；
-    · 第 2 段起，把上一段**一采 latent 的尾部窗口**（默认 22 帧 = 官方 Motion Context 基线）作为
-      keyframe 钉进本段时间轴起点（cond 行永不降噪、每步重注入）→ 画面 / 动作 / 色调跨段连续；
-    · 段首被钉住的窗口帧解码后裁掉；音频同步裁掉 round(窗口×5/3) 步（否则音画错位 W/24 秒）；
-    · 1 段时无上段 → 自动跳过衔接，行为与 Max 完全一致（单段 / 多段同一套逻辑）。
-    数学保证：段长恒为 17k+5、窗口恒为 17m+5 ⇒ 段长−窗口 = 17(k−m) 必为 17 的倍数 ⇒ 尾窗起点必落
-    在 latent token 边界（token 索引 5(k−m)）⇒ **相位自动对齐**，无需任何手工对齐参数。
+    · 每段按剧情拆解出的「新提示词」独立生成 → 剧情持续往前推进；
+    · 段与段之间是**大切镜/换场**：不做跨段 latent 引导、不裁段首衔接帧（无限时长衔接只保留给
+      「JZL - 🤖 MiniMax-H3无限时长」节点）；
+    · 逐段即时落盘 + 读盘拼接，跑 1 段与跑 N 段逻辑同一套、硬件占用不叠加。
     """
 
     @classmethod
@@ -5741,15 +5764,14 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
             node_id="JZL_MiniMaxAssetManagerShortDrama",
             display_name="JZL - 🤖 MiniMax-H3短剧导演台",
             category="JZL/MiniMax",
-            description=("MiniMax-H3 短剧导演台：逐段「新剧情提示词」独立生成，并把上一段一采 latent 的尾部窗口"
-                         "钉成本段首帧引导（永不降噪、每步重注入）→ 画面连续 + 剧情推进；段首被钉住的窗口帧"
-                         "自动裁掉（音频同步裁剪）。逐段即时落盘 + 读盘 concat，跑 1 段与跑 N 段逻辑同一套、"
+            description=("MiniMax-H3 短剧导演台：逐段「新剧情提示词」独立生成（段间大切镜/换场，不做跨段 "
+                         "latent 引导）。逐段即时落盘 + 读盘 concat，跑 1 段与跑 N 段逻辑同一套、"
                          "硬件占用不叠加。"),
             inputs=[
                 io.Combo.Input("run_mode", options=RUN_MODE_EMOJI,
                     default=RUN_MODE_EMOJI[0], display_name="运行模式",
-                    tooltip="与「短剧导演台Max」一致：故事拆解模式=按情节拆解为N段（每段一个独立新提示词，无限时长按此逐段推进剧情）；故事扩写模式=只扩写正文（纯文本输出）；穿透生成模式=跳过 LLM 直接用提示词生成；仅提示词输出=只输出拆解+增强后的分段剧本，不生成视频"),
-                io.String.Input("display_info", display_name="生成详情", default="分辨率：864x480丨每段帧数：124丨段数：剧情决定丨无限时长：开启丨成片总长：124~6944 帧 ≈ 5.17~289.33 秒",
+                    tooltip="与「短剧导演台Max」一致：故事拆解模式=按情节拆解为N段（每段一个独立新提示词，多段按此逐段推进剧情）；故事扩写模式=只扩写正文（纯文本输出）；穿透生成模式=跳过 LLM 直接用提示词生成；仅提示词输出=只输出拆解+增强后的分段剧本，不生成视频"),
+                io.String.Input("display_info", display_name="生成详情", default="分辨率：864x480丨每段帧数：124丨段数：剧情决定丨成片总长：124~6944 帧 ≈ 5.17~289.33 秒",
                     multiline=False, socketless=True,
                     tooltip="只读显示：当前画幅/MP/时长/段数计算出的分辨率、每段帧数、段数、总帧数、总时长（对齐倍数固定 32）"),
                 io.Combo.Input("aspect_ratio", options=ASPECT_RATIO_OPTIONS, default="16:9 (Widescreen)",
@@ -5757,11 +5779,11 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
                 io.Float.Input("megapixels", display_name="百万像素（MP）", default=0.4, min=0.1, max=3.6, step=0.1,
                     tooltip="总像素数（MP），画幅×MP 决定分辨率"),
                 io.Combo.Input("duration", options=list(SEGMENT_DURATION_CHOICES), default=SEGMENT_DURATION_DEFAULT,
-                    display_name="每段视频时长", tooltip="每段视频时长（秒）：固定 4~20 秒 或 区间。等同「剧本与镜头处理器」的每段视频时长。无限时长下每段会往后损失「衔接窗口」帧长（默认 22 帧≈0.92 秒，被下一段复用），总时长 = Σ段长 − 窗口×(段数−1)"),
+                    display_name="每段视频时长", tooltip="每段视频时长（秒）：固定 4~20 秒 或 区间。等同「剧本与镜头处理器」的每段视频时长"),
                 io.Float.Input("scale_factor", display_name="参考数值放大", default=1.0, min=1.0, max=5.0, step=0.1,
                     tooltip="参考图放大系数"),
                 io.Float.Input("upscale_scale", display_name="二采latent放大", default=1.0, min=1.0, max=4.0, step=0.1,
-                    tooltip="二采（Ref2va）放大倍数。开启二采不影响段间衔接：衔接恒用「一采 latent」，二采结果只用于解码落盘"),
+                    tooltip="二采（Ref2va）放大倍数。二采结果只用于解码落盘"),
                 io.Int.Input("video_count", default=0, min=0, max=SEGMENT_COUNT_MAX, step=1,
                     display_name="生成视频数量",
                     tooltip="参数：0 = LLM 按剧情时间线长度，自动计算需要生成多少段视频。\n"
@@ -5780,7 +5802,7 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
                     tooltip="节点内编辑的提示词（提示词来源，随工作流保存）"),
                 io.String.Input("manager_settings", display_name="节点配置", multiline=True,
                     socketless=True, default="",
-                    tooltip="本节点独立保存的完整配置 JSON（资产/增强/采样解码/无限时长衔接/保存），随工作流保存，节点间互不影响"),
+                    tooltip="本节点独立保存的完整配置 JSON（资产/增强/采样解码/保存），随工作流保存，节点间互不影响"),
             ],
             outputs=[
                 io.String.Output("script", display_name="已处理剧本",
@@ -5815,8 +5837,9 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
                 clip=None, vae=None, audio_vae=None, model=None) -> io.NodeOutput:
         _vc_auto = _parse_video_count(video_count)[0] == "auto"   # 「剧情决定」标记（manager 建后写入）
         video_count = _vc_count(video_count)     # 「剧情决定」→ 占位 6（拆解后按实际分段数覆盖）
-        """无限时长：LLM 拆解（每段新剧情）→ 逐段【上段衔接引导 + 编码 + 一采 + 二采 + 解码】→
-        每段即时落盘 → 裁掉段首被钉住的窗口帧 → 释放该段显存 → 下一段。跑 N 段与跑 1 段占用不叠加。"""
+        """短剧导演台：LLM 拆解（每段新剧情）→ 逐段【编码 + 一采 + 二采 + 解码】→
+        每段即时落盘 → 释放该段显存 → 下一段（段间大切镜，不做跨段 latent 引导）。
+        跑 N 段与跑 1 段占用不叠加。"""
         run_mode = _normalize_run_mode(run_mode)
         pure_prompt = run_mode == "仅提示词输出"
         expand_mode = run_mode == "故事扩写模式"
@@ -5835,52 +5858,10 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
         enhance = manager.get("enhance") or {}
         assets_cfg = manager.get("assets") or {}
         sample_decode = manager.get("sample_decode") or {}
-        # ♾️ 衔接设置（面板「🎭 采样解码设置 → 无限时长衔接⚠实验性功能」；缺省即官方 Motion Context 基线）
-        _inf = sample_decode.get("infinite") or {}
-        # 「无限时长衔接⚠实验性功能」总开关：关闭后每段独立生成（等价 Max 语义）
-        _seam_on = _inf.get("enabled", True) is not False
-        seam_window_cfg = _seam_resolve_window(_inf.get("window", SEAM_DEFAULT_WINDOW))
-        seam_audio_link = _seam_flag(_inf.get("audio_link"), True)
-        # 「音频同步裁剪」：默认**开启**（画面丢了衔接帧，音频必须同量裁掉，否则音画错位）。
-        # 存储语义：`audio_no_trim: true` 才表示关闭（仅供对比实验）；历史上的 `audio_trim: false`
-        # 视为误存（那时关掉会直接造成段尾画面冻结/音画错位）→ 一律按开启处理。
-        seam_trim_audio = not _seam_flag(_inf.get("audio_no_trim"), False)
-        # 裁切方式：pixel（默认）= latent 不裁 + 解码后丢帧（保 VAE 解码分组相位）；
-        # latent = 旧行为（已证会闪烁，仅作 A/B 对照）；none = 不裁（诊断用，成片会多出衔接帧）
-        _tm = str(_inf.get("trim_mode") or "")
-        seam_trim_mode = "latent" if "latent" in _tm else ("none" if "不裁" in _tm else "pixel")
-        # 过渡丢弃帧数（settling burn-in）：钉住窗口之外再多丢几帧，吸掉“模仿引导→启动新动作”的卡顿（hold→pop，官方默认 12）
-        seam_settle_cfg_raw = _seam_settle_cfg(_inf.get("settle"))
-        # ⭐ 「设定时长 = 落盘时长」的硬前提：丢弃量（窗口 + 过渡）必须是 **17 的倍数**。
-        #    生成帧数恒为 17K+5、落盘目标恒为 17k+5 ⇒ 丢弃 ≡ 0 (mod 17) ⇒ 过渡 ≡ 12 (mod 17) ⇒ 12/29/46。
-        #    这组值同时满足「latent 域裁切要求丢弃 token 是 5 的倍数」→ 两套约束天然一致，不会互相打架。
-        seam_settle = _seam_snap_settle(seam_window_cfg, seam_settle_cfg_raw)
-        if seam_settle != seam_settle_cfg_raw:
-            print(f"[JZL-短剧导演台] 过渡丢弃 {seam_settle_cfg_raw} 帧 → 自动对齐为 {seam_settle} 帧"
-                  f"（只有「窗口 {seam_window_cfg} + 过渡」是 17 的倍数时，落盘帧数才能精确 = 设定帧数）")
-        # 引导来源：latent（默认）= 上段一采 latent 尾部切片直传；pixel = 官方 AddGuide 同款（尾帧→VAE重编码）
-        seam_guide_source = "pixel" if "重编码" in str(_inf.get("guide_source") or "") else "latent"
-        # 二采引导源：first（默认）= 上段一采 latent 尾部（插值对齐二采画布）；
-        #   second = 上段**二采** latent 尾部（与二采画布天然同画布、同 refined 版本，更准；
-        #   代价：CPU 常驻一份尾部切片，只留“配置窗口”所需 token，通常几~几十 MB）
-        _sg2 = str(_inf.get("second_guide") or "")
-        seam_second_guide = "second" if ("二采" in _sg2 or _sg2.strip().lower() == "second") else "first"
-        # ⭐ 段首衔接跑道（秒）= (窗口 + 过渡) / 24：段 2+ 的**生成时长 = 设定时长 + 跑道**。
-        #    段首这一段是「承接上一段末帧」的锁定画面 + 模型启动过渡，成片会整段裁掉 ⇒ 落盘时长精确 = 用户设定。
-        #    单段（count=1）或诊断档「不裁切」时跑道 = 0（没有衔接就没有额外生成内容）。
-        # 提示词来源必须先解析：下方 _seg_count_probe 在穿透模式下要用它统计分段数
+        # 提示词来源：接线提示词优先于节点内提示词
         if not isinstance(internal_prompt, str):
             internal_prompt = ""
         prompt_input = (internal_prompt or "").strip()
-        _seg_count_probe = (_pt_seg_count(prompt_input) if passthrough else 0) or _vc_count(video_count)
-        seam_runway_sec = _seam_runway_seconds(seam_window_cfg, seam_settle,
-                                               enabled=(_seam_on and _seg_count_probe > 1 and seam_trim_mode != "none"))
-        if seam_runway_sec > 0:
-            print(f"[JZL-短剧导演台] 段首衔接跑道 {seam_runway_sec:.3f} 秒（窗口 {seam_window_cfg} + 过渡 {seam_settle} "
-                  f"= {seam_window_cfg + seam_settle} 帧/24fps）→ 第 2 段起生成时长 = 设定时长 + 跑道，成片裁掉 ⇒ 落盘 = 设定时长")
-        # ♾️ 接缝亮度匹配（只做亮度）：把每段开头若干帧的亮度朝上段末帧平滑过渡（加性、限幅）
-        # 缺省 = 开（与官方 Director 一致：该做法是他们试错后**保留**的那一种，只动亮度不动 RGB）
-        seam_luma_on = _seam_flag(_inf.get("luma_match"), True)
         _save_cfg = manager.get("save") or {}
         save_mode = (_save_cfg.get("mode") or "分段保存").strip() or "分段保存"
         auto_merge_delete = bool(_save_cfg.get("auto_merge_delete"))
@@ -5892,22 +5873,7 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
             llm_seed = int(torch.randint(0, 0x7fffffffffffffff, (1,)).item())
         else:
             llm_seed = current_seed
-        _trim_label = {"pixel": "像素域裁切（保解码相位）", "latent": "latent域裁切（旧·诊断）",
-                       "none": "不裁切（诊断）"}.get(seam_trim_mode, seam_trim_mode)
-        # 只在「非默认配置」时追加提示，默认档（像素域裁切 / 亮度匹配开 / 一采 latent 引导）不再逐项刷屏
         _banner_extra = ""
-        if seam_trim_mode != "pixel":
-            _banner_extra += f" | 裁切={_trim_label}"
-        if seam_runway_sec > 0 and not seam_luma_on:
-            _banner_extra += " | 亮度匹配=关"
-        if not seam_audio_link:
-            _banner_extra += " | 音频衔接=关"
-        if not seam_trim_audio:
-            _banner_extra += " | 音频同步裁剪=关"
-        if seam_guide_source == "pixel":
-            _banner_extra += " | 引导=上段尾帧→VAE重编码"
-        if seam_second_guide == "second":
-            _banner_extra += " | 二采引导=上段二采latent尾部"
         if expand_mode:
             _banner_extra += f" | 扩写≈{int(enhance.get('expand_words') or 500)}字"
         # 穿透生成：段数按提示词实际分段数定（横幅与实际生成段数保持一致）
@@ -5989,13 +5955,7 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
                 return io.NodeOutput(prompt_input or "", block_execution=f"❌ {_nl_err}",
                                      ui={"manager_error": [_nl_err]})
         has_shots = bool(re.search(r'\[SHOT_START\]', prompt_input or ""))
-        # ⭐ 衔接跑道：段 2+ 的「生成时长 = 设定时长 + 跑道」（段首跑道会被裁掉 ⇒ 落盘时长 = 设定时长）。
-        #    `gen_duration_lo` = 生成时长下限（块内缺 **时长** 字段时的兜底，也按生成时长算）。
-        gen_duration_lo = duration_lo + seam_runway_sec
-        if seam_runway_sec > 0 and has_shots:
-            print(f"[JZL-短剧导演台] ⚠️ 你自带了 [SHOT_START] 剧本块：本节点会再裁掉段首 "
-                  f"{seam_window_cfg + seam_settle} 帧跑道 → 落盘 = 生成 − 跑道；"
-                  f"若要落盘 = 设定时长，请把每段 **时长** 写成「设定时长 + {seam_runway_sec:.2f} 秒」")
+        gen_duration_lo = duration_lo
         gen_dir = None
         if not passthrough and enhance.get("story_decompose", True) and not has_shots and prompt_input:
             from .nodes_llama import _next_generation_dir
@@ -6004,8 +5964,7 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
                 prompt_input, manager, count, story_style, story_name, duration, prompt_lang, llm_seed,
                 ref_image_intro=ref_image_intro, ref_video_intro=ref_video_intro, ref_audio_intro=ref_audio_intro,
                 enable_scene=enable_scene, enable_props=enable_props,
-                enable_video=enable_video, enable_audio=enable_audio, mode=story_mode, gen_dir=gen_dir,
-                seam_runway=seam_runway_sec)
+                enable_video=enable_video, enable_audio=enable_audio, mode=story_mode, gen_dir=gen_dir)
             if err:
                 print(f"[JZL-短剧导演台] LLM/API 出错，终止生成：{err}")
                 return io.NodeOutput(prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
@@ -6014,8 +5973,7 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
             if gen_dir is None:
                 from .nodes_llama import _next_generation_dir
                 gen_dir = _next_generation_dir(story_name)
-            prompt_input, err = _run_prompt_enhancer(prompt_input, manager, duration, story_style, prompt_lang, llm_seed, story_name, gen_dir,
-                                                     seam_runway=seam_runway_sec)
+            prompt_input, err = _run_prompt_enhancer(prompt_input, manager, duration, story_style, prompt_lang, llm_seed, story_name, gen_dir)
             if err:
                 print(f"[JZL-短剧导演台] LLM/API 出错，终止生成：{err}")
                 return io.NodeOutput(prompt_input or "", block_execution=f"⚠️ LLM/API 出错，已终止：{err}")
@@ -6063,12 +6021,6 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
         first_seed = None
         # ♾️ 拼接保同时收集各段无損 WAV → 合并时「音频统一编码一次」（消除段边界 AAC 误差）
         _merge_wavs = [] if save_mode == "拼接保存" else None
-        # ♾️ 衔接状态：只保留「上一段一采 latent」一份（CPU，千万级元素≈20MB，恒定不叠加）
-        prev_latent = None
-        # ♾️ 二采引导状态（仅 second 模式保留）：上段二采 latent 的**尾部切片**（CPU，只留配置窗口所需 token）
-        prev_latent2 = None
-        # ♾️ 接缝亮度匹配参考：上一段**落盘后**末帧的平均亮度（只存一个标量，不占内存）
-        prev_luma = None
         total_frames = 0
         for i in range(count):
             try:
@@ -6106,9 +6058,7 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
             # ⭐ 段 2+ 的 **时长** 字段 = 生成时长（设定 + 跑道）；缺字段时兜底也用生成时长。
             #    落盘帧数 = 生成帧数 − 段首丢弃(窗口+过渡) ⇒ 逐段都会核对是否 ≈ 设定时长（见下方裁切日志）。
             seg_len = _seg_len_for(raw, gen_duration_lo)
-            _saved_target = _seg_len_for(None, duration_lo)   # 本段落盘目标帧数（完整独立生成 = 设定时长）
             print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 生成中（{mode}，{seg_len} 帧"
-                  f"{f'，含段首衔接 {seam_window_cfg + seam_settle} 帧' if (i > 0 and seam_runway_sec > 0) else ''}"
                   f"，种子 {seed}，参考 {len(ref_images)}图/{len(ref_videos)}视频/{len(ref_audios)}音频）")
             try:
                 # ① 编码（ref2va，与官方 ReferenceToVideo 一致；**每段都重新注入原始参考**→ 抗长链漂移）
@@ -6116,137 +6066,28 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
                     "短剧导演台", f"分段 {i + 1}/{count} ",
                     clip, vae, audio_vae, h3, width, height, seg_len,
                     ref_images, ref_videos, ref_audios, ref_names, ref_scale=scale_factor, model=model)
-                positive_base = positive   # 未注入引导的“干净” positive（二采可能要用另一份引导重建）
-
-                # ② ♾️ 衔接：第 2 段起把上一段一采 latent 的尾部窗口钉成本段首帧引导
-                seam_plan = None
-                if i > 0 and _seam_on and prev_latent is not None:
-                    # 本段至少要装得下「窗口 + 过渡」，否则整段会被裁空（成片变 0 帧 / 只剩 1 帧）
-                    _drop_need = seam_window_cfg + seam_settle
-                    if seg_len <= _drop_need:
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 本段 {seg_len} 帧装不下"
-                              f"「衔接窗口 {seam_window_cfg} + 过渡 {seam_settle} = {_drop_need} 帧」"
-                              f"→ 本段跳过衔接（该段落盘 {seg_len} 帧 = 设定时长，无跑道可裁；"
-                              f"若落盘明显偏短，请检查剧本该段 **时长** 是否按「设定 + 跑道」写）")
-                    else:
-                        seam_plan = _seam_plan(prev_latent, seam_window_cfg)
-                        if seam_plan is None:
-                            print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 上段 latent 不满足衔接条件"
-                                  f"（{seam_window_cfg} 帧窗口放不下或段长非 17k+5），本段按独立生成处理")
-                if seam_plan is not None:
-                    positive, _kf = _seam_apply_guide(positive, prev_latent, seam_plan,
-                                                     audio_link=seam_audio_link,
-                                                     vae=vae, guide_source=seam_guide_source)
-                    # 画布一致性兜底：引导 latent 必须与本次采样目标同画布（PackedLayout 按目标画布算行数）
-                    positive = _seam_fit_guides_to_canvas(positive, latent["samples"], tag="短剧导演台")
-                    if _kf is not None and int(_kf["latent"].shape[2]) != int(seam_plan["trim_tokens"]):
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 引导 latent token 数 "
-                              f"{int(_kf['latent'].shape[2])} ≠ 期望 {seam_plan['trim_tokens']}（衔接窗口可能不准）")
-                    _a_txt = (f"＋音频尾部 {seam_plan['trim_audio']} 步"
-                              if (_kf and "audio_latent" in _kf) else "（音频不衔接）")
-                    if seam_plan["adjusted"]:
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：窗口按上段段长自动调整为 "
-                              f"{seam_plan['window']} 帧（配置 {seam_window_cfg} 帧）")
-                    print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 衔接：上段尾部 {seam_plan['window']} 帧"
-                          f"（token {seam_plan['trim_tokens']}）{_a_txt}，解码后裁掉开头 {seam_plan['window']} 帧")
-
                 positive = _apply_semantic_bridge(positive, manager, tag="短剧导演台")
-                # ③ 第一次采样（衔接引导源 = 本段一采 latent，与下段目标 latent 同画布同空间）
+                # ③ 第一次采样
                 first_samples = _sample_first_pass(model, positive, latent, sample_decode, seed, vae, tag="短剧导演台")
                 samples = first_samples
 
                 # ④ latent 放大 + 第二次采样（可选）：二采结果只用于解码落盘
-                #    二采引导源（面板「二采引导来源」）：
-                #      first（默认）= 复用本段一采引导（上段一采 latent）→ 内部按二采画布插值对齐
-                #      second        = 用上一段**二采** latent 尾部重建引导（与二采画布同画布、同 refined 版本）
                 _second = (sample_decode or {}).get("second") or {}
                 if _second.get("enabled") and not _selflift_mode(sample_decode):
                     print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 二次采样：latent 放大 {upscale_scale}x"
                           f"（{_second.get('sampler', 'euler')}/{_second.get('scheduler', 'simple')}，"
                           f"{_second.get('steps', 3)}步，denoise {_second.get('denoise', 0.3)}）…")
-                    _pos2 = positive
-                    if seam_second_guide == "second" and seam_plan is not None and prev_latent2 is not None:
-                        _pos2 = _seam_apply_guide(positive_base, prev_latent2, seam_plan,
-                                                 audio_link=seam_audio_link, vae=None,
-                                                 guide_source="latent")[0]
-                    samples = _run_second_sampling(model, _pos2, first_samples, sample_decode, _second, upscale_scale, seed, tag="短剧导演台")
+                    samples = _run_second_sampling(model, positive, first_samples, sample_decode, _second, upscale_scale, seed, tag="短剧导演台")
                     _t1 = int(first_samples.tensors[0].shape[2]) if getattr(first_samples, "is_nested", False) else int(first_samples.shape[2])
                     _t2 = int(samples.tensors[0].shape[2]) if getattr(samples, "is_nested", False) else int(samples.shape[2])
                     if _t2 != _t1:
                         raise RuntimeError(
                             f"二次采样改变了时间轴长度（一采 {_t1} token → 二采 {_t2} token），"
-                            f"无法保证段间衔接裁切正确；请关闭二次采样后重试")
-                    # ♾️ second 模式：把本段二采 latent 的尾部切片（配置窗口所需 token）留给下一段做同画布引导
-                    if seam_second_guide == "second":
-                        prev_latent2 = _seam_keep_tail(samples, seam_window_cfg)
-                else:
-                    prev_latent2 = None
-
-                # ⑤ ♾️ 裁掉段首被 keyframe 钉住的窗口帧
-                #    默认「像素域」：latent 完全不裁（VAE 解码器必须看到完整 5k+2 序列 → 分组相位 0），解码后再丢帧
-                #    「latent 域」：先裁 latent 再解码（解码量更少、保留帧不含被裁内容），但**丢弃 token 数必须是 5 的倍数**
-                #    （= 丢弃帧数是 17 的倍数 ⇒ 过渡=12/29/46）；不满足时按方案 A 自动回退像素域（永不闪烁）
-                seam_trim_in_latent = (seam_plan is not None and seam_trim_mode == "latent")
-                seam_latent_drop = None
-                if seam_trim_in_latent:
-                    seam_latent_drop = _seam_latent_drop(seam_plan["window"], seam_settle)
-                    if seam_latent_drop is None:
-                        seam_trim_in_latent = False
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：latent 域裁切要求「窗口 "
-                              f"{seam_plan['window']} + 过渡 {seam_settle}」是 17 的倍数（过渡需为 12/29/46）"
-                              f"→ 自动回退像素域裁切（保证不闪烁）")
-                    else:
-                        samples = _seam_trim_head(samples, seam_plan, trim_audio=False,
-                                                  drop_tokens=seam_latent_drop["tokens"])
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} latent 域裁切：丢开头 "
-                              f"{seam_latent_drop['tokens']} token = {seam_latent_drop['frames']} 帧"
-                              f"（窗口 {seam_plan['window']} + 过渡 {seam_settle}）")
+                            f"请关闭二次采样后重试")
 
                 image, audio = _decode_av(vae, audio_vae, samples, sample_decode, tag="短剧导演台")
-                _raw_frames = int(image.shape[0]) if image is not None else 0
-                if seam_plan is not None and seam_latent_drop is not None:
-                    # latent 域：视频已在 token 域裁好 → 音频在波形域按「同一丢弃帧数」裁（与像素域同一套音画规则）
-                    if seam_trim_audio:
-                        audio = _seam_trim_audio_frames(audio, seam_latent_drop["frames"], _raw_frames)
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} latent 域裁切完成：解码 {_raw_frames} 帧"
-                              f"（少解码 {seam_latent_drop['frames']} 帧），音频同步裁剪")
-                    else:
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 「音频同步裁剪」已关闭：画面已丢 "
-                              f"{seam_latent_drop['frames']} 帧而音频不裁 → 音画错位 "
-                              f"{seam_latent_drop['frames'] / 24.0:.3f}s（仅作对比实验）")
-                elif seam_plan is not None:
-                    if seam_trim_mode == "none":
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count}：⚠️ 诊断模式「不裁切」→ 成片开头会保留 "
-                              f"{seam_plan['window']} 帧衔接帧（重复上段尾部），仅用于定位问题")
-                    else:
-                        image, audio = _seam_trim_decoded(image, audio, seam_plan,
-                                                          settle_frames=seam_settle,
-                                                          trim_audio=seam_trim_audio, tag="短剧导演台")
-                        _kept = int(image.shape[0]) if image is not None else 0
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 像素域裁切：解码 {_raw_frames} 帧"
-                              f" − 衔接 {seam_plan['window']} − 过渡 {seam_settle} = 保留 {_kept} 帧"
-                              f"（{_kept / 24.0:.2f}s）"
-                              f"{'，音频同步裁剪' if seam_trim_audio else '，⚠️ 音频未裁剪（仅对比实验）'}")
                 _frames = int(image.shape[0]) if image is not None else 0
-                # ⭐ 帧账核对：落盘帧数应 ≈ 设定时长对应的帧数（生成 = 设定 + 跑道，裁掉跑道后回到设定）
-                if i > 0 and seam_runway_sec > 0 and seam_plan is not None and seam_trim_mode != "none":
-                    _delta = _frames - _saved_target
-                    if abs(_delta) <= 2:
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 落盘 {_frames} 帧"
-                              f"（生成 {seg_len} − 裁切 {seg_len - _frames}）= {_frames / 24.0:.2f} 秒 ✓")
-                    else:
-                        print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 落盘 {_frames} 帧 = {_frames / 24.0:.2f} 秒；"
-                              f"⚠️ 比设定时长差 {_delta:+d} 帧（{_delta / 24.0:+.2f}s）：该段 **时长** 可能没按"
-                              f"「设定 + 跑道」写，或「设定时长 + 跑道」超出单段上限 20 秒")
                 total_frames += _frames
-
-                # ★ ♾️ 接缝亮度匹配（**只做亮度**）：把本段开头若干帧的平均亮度朝上一段末帧平滑过渡。
-                #   只做加性（R=G=B）、单帧限幅 ±0.10、前 12 帧渐入、三项差都 < 0.008 时零改动。
-                #   官方 Director 实测结论：乘法增益 / 长 RGB 混合 / 开口亮度渐变都出问题，只有这一种安全。
-                #   必须在落盘**之前**做（拼接是 -c copy，不会重编码）；诊断档「不裁切」时不动像素。
-                if (seam_luma_on and prev_luma is not None and seam_plan is not None
-                        and seam_trim_mode != "none" and image is not None):
-                    image = _seam_luma_ramp(image, prev_luma)[0]
 
                 # ★ 每段解码完立即 ffmpeg 落盘（拼接保存时额外保留一份无損 WAV，供最后音频统一编码）
                 _wav_keep = None
@@ -6259,15 +6100,6 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
                                         keep_wav=_wav_keep)
                 saved_files.append(_sp)
                 print(f"[JZL-短剧导演台] 分段 {i + 1}/{count} 已落盘：{_sp}（{_frames} 帧）")
-
-                # ★ 衔接源：本段一采 latent 转 CPU 留一份给下一段（二采不影响它）
-                prev_latent = first_samples.to("cpu") if hasattr(first_samples, "to") else first_samples
-                # ★ 接缝亮度匹配参考：只记「本段**落盘后**末帧的平均亮度」一个标量（零内存开销）
-                if image is not None and hasattr(image, "shape") and int(image.shape[0]) > 0:
-                    try:
-                        prev_luma = _seam_frame_luma(image[-1])
-                    except Exception:
-                        prev_luma = None
 
                 # ★ 释放该段全部显存/内存（跑 N 段与跑 1 段占用不叠加）
                 try:
@@ -6353,15 +6185,10 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
         _dur = (total_frames / float(VIDEO_FPS)) if total_frames else 0.0
         print(f"[JZL-短剧导演台] 本次落盘：{out_video_dir}（视频 {len(saved_files)} 个）")
         print(f"[JZL-短剧导演台] 本次成片合计 {total_frames} 帧 = {_dur:.2f} 秒 @24fps（{count} 段）")
-        if seam_runway_sec > 0 and saved_files:
-            _set_frames = _seg_len_for(None, duration_lo)
-            print(f"[JZL-短剧导演台] ⏱️ 时长对照：设定 {_set_frames} 帧/段 = {_set_frames / float(VIDEO_FPS):.2f} 秒/段"
-                  f" × {len(saved_files)} 段 = {_set_frames * len(saved_files) / float(VIDEO_FPS):.2f} 秒"
-                  f"（每段生成时多出段首衔接跑道 {seam_window_cfg + seam_settle} 帧 = {seam_runway_sec:.2f} 秒，已在成片中裁掉）")
         if not saved_files:
             print("[JZL-短剧导演台] ⚠️ 本段未落盘任何视频（未连接模型/CLIP/VAE 或全部分段失败）")
             _report_save_failure(
-                "无限时长", _out_root, out_video_dir, saved_files, errors,
+                "短剧导演台", _out_root, out_video_dir, saved_files, errors,
                 [f"已连接：model={model is not None} CLIP={clip is not None} VAE={vae is not None} "
                  f"audio_vae={audio_vae is not None}",
                  f"计划段数={count} 实际分段块={len(shots)} 运行模式={run_mode}",

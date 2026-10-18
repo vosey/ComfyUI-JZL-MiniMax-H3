@@ -33,7 +33,12 @@ const JZL_MODE_MUTE = 2;     // 静音
 // run_mode 下拉显示带表情前缀（🛠️拆解 / 📚扩写 / 📝仅提示词 / 🪄穿透）；比较前剥表情归一化。
 const JZL_RUN_MODE_EMOJIS = ["🛠️", "📚", "📝", "🪄"];
 function jzlNormalizeRunMode(v) {
-    let s = String(v || "").trim();
+    // 先去掉 VS15/VS16 与零宽连接符：同一表情在不同来源里可能带这些不可见字符
+    let s = String(v || "").replace(/[\uFE0E\uFE0F\u200D]/g, "").trim();
+    if (s.includes("穿透") || s.includes("直通")) return "穿透生成模式";
+    if (s.includes("仅提示词") || s.includes("纯提示词")) return "仅提示词输出";
+    if (s.includes("扩写") || s.includes("扩展")) return "故事扩写模式";
+    if (s.includes("拆解")) return "故事拆解模式";
     for (const e of JZL_RUN_MODE_EMOJIS) { if (s.startsWith(e)) { s = s.slice(e.length).trim(); break; } }
     return s;
 }
@@ -1700,10 +1705,14 @@ function migrateLegacyVoice(s) {
 }
 
 async function saveManager(node, value) {
+    // 短剧导演台已移除「无限时长衔接」：保存时顺手清掉历史配置里的 sample_decode.infinite
+    if (value && value.sample_decode && node?.type === SHORTDRAMA_NODE_TYPE) {
+        delete value.sample_decode.infinite;
+    }
     const w = node?.widgets?.find((x) => x.name === "manager_settings");
     if (w) setWidgetValue(w, JSON.stringify(value));
     try { node?.__jzlUpdateInfo?.(); } catch (_) {}  // 保存后实时同步节点「实时显示」
-    try { node?.__jzlUpdateDisplay?.(); } catch (_) {}  // 生成详情（含「无限时长：开/关」）同步刷新
+    try { node?.__jzlUpdateDisplay?.(); } catch (_) {}  // 生成详情（无限时长节点含「无限时长：开/关」）同步刷新
     return value;
 }
 
@@ -3761,16 +3770,22 @@ function renderGenSettingsPanel(c, s, node, d) {
     c.append(makeSectionTitle("运行模式"));
     const modes = comboOptions("run_mode", Object.keys(RUN_MODE_TIPS));
     const curMode = String(cur("run_mode", ""));
+    const sameMode = (a, b) => jzlNormalizeRunMode(a) === jzlNormalizeRunMode(b);
+    const tipFor = (m) => RUN_MODE_TIPS[m]
+        || RUN_MODE_TIPS[Object.keys(RUN_MODE_TIPS).find((k) => sameMode(k, m))]
+        || "（无说明）";
     const modeBoxes = [];
     for (const m of modes) {
-        const cb = checkboxControl(curMode === m, RUN_MODE_TIPS[m] || "（无说明）", (on) => {
+        const cb = checkboxControl(sameMode(curMode, m), tipFor(m), (on) => {
             const i = cb.querySelector("input");
             if (!on) { if (i) i.checked = true; return; }   // 单选语义：至少保留一项
             for (const [v2, b2] of modeBoxes) {
                 const i2 = b2.querySelector("input");
-                if (i2) i2.checked = (v2 === m);
+                if (i2) i2.checked = sameMode(v2, m);
             }
-            set("run_mode", m);
+            // 优先写回下拉里真实存在的选项字符串（表情/变体符不一致时也能命中）
+            const actual = modes.find((o) => sameMode(o, m)) || m;
+            set("run_mode", actual);
         });
         modeBoxes.push([m, cb]);
         c.append(field(m, cb));
@@ -4125,9 +4140,9 @@ function renderPrefPanel(c, s, d, node) {
     c.append(field("解码前清理", selectControl(OPTIONS.decodeCleanup, p.decode_cleanup || OPTIONS.decodeCleanup[0], v => { p.decode_cleanup = v; })));
     c.append(field("音频解码", el("div", "font-size:13px;color:var(--fg-color,#ddd);padding:6px 10px;background:var(--comfy-input-bg,#2a2a2a);border:1px solid var(--border-color,#444);border-radius:4px;", "VAE解码（音频）")));
 
-    // ── ♾️ 无限时长衔接⚠实验性功能（「JZL - 🤖 MiniMax-H3无限时长」与「🎬 短剧导演台」显示）──
+    // ── ♾️ 无限时长衔接⚠实验性功能（仅「JZL - 🤖 MiniMax-H3无限时长」显示；短剧导演台已移除该功能）──
     // 后端读取 sample_decode.infinite = { enabled, window, audio_no_trim, settle, trim_mode, guide_source, second_guide }
-    const isInfNode = !!node && (node.type === INF_NODE_TYPE || node.type === SHORTDRAMA_NODE_TYPE);
+    const isInfNode = !!node && node.type === INF_NODE_TYPE;
     if (isInfNode) {
         const inf = p.infinite || (p.infinite = { enabled: true, window: 22, audio_link: true, audio_no_trim: false, luma_match: true });
         c.append(makeSectionTitle("无限时长衔接⚠实验性功能"));
@@ -4974,7 +4989,7 @@ app.registerExtension({
                 self.__jzlGenRow = genRow;
 
                 const detailRow = el("div", "flex:0 0 auto;font-size:11px;color:#c9a86a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:14px;", "");
-                detailRow.title = "生成详情（分辨率 / 每段帧数 / 段数 / 无限时长 / 成片总长），只读显示";
+                detailRow.title = "生成详情（分辨率 / 每段帧数 / 段数 / 成片总长），只读显示";
                 detailRow.addEventListener("mousedown", (e) => e.stopPropagation());
                 container.appendChild(detailRow);
                 self.__jzlDetailRow = detailRow;
@@ -5570,22 +5585,13 @@ app.registerExtension({
                         out = `分辨率：${W}x${H}丨每段帧数：${fs}（落盘）丨段数：${cntTxt}丨${cutDesc}${genNote}丨成片总长：${tt}`;
                     } catch (_) { /* 解析失败则退回默认文案 */ }
                 }
-                // 🎬 短剧导演台：精简格式（分辨率 / 每段帧数 / 段数 / 无限时长 / 成片总长）
+                // 🎬 短剧导演台：精简格式（分辨率 / 每段帧数 / 段数 / 成片总长）
                 if (self.type === SHORTDRAMA_NODE_TYPE) {
-                    let infOn = true;
-                    try {
-                        const _ms = gv("manager_settings");
-                        if (_ms) {
-                            const _cfg = JSON.parse(_ms);
-                            const _inf = (_cfg && _cfg.sample_decode && _cfg.sample_decode.infinite) || {};
-                            infOn = _inf.enabled !== false;
-                        }
-                    } catch (_) {}
                     const t1 = flo * cntLo, t2 = fhi * cntHi;
                     const s1 = (t1 / 24).toFixed(2), s2 = (t2 / 24).toFixed(2);
                     const tt = (flo === fhi && cntLo === cntHi)
                         ? `${t1} 帧 ≈ ${s1} 秒` : `${t1}~${t2} 帧 ≈ ${s1}~${s2} 秒`;
-                    out = `分辨率：${W}x${H}丨每段帧数：${fs}丨段数：${cntTxt}丨无限时长：${infOn ? "开启" : "关闭"}丨成片总长：${tt}`;
+                    out = `分辨率：${W}x${H}丨每段帧数：${fs}丨段数：${cntTxt}丨成片总长：${tt}`;
                 }
                 setWidgetValue(disp, out);
                 // DOM 里的「生成详情」紧跟状态行上方（节点表面 display_info 已隐藏）

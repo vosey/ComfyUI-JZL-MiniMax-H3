@@ -18,7 +18,7 @@ H3_SHOT_RULES_ZH = '''
 ### 4.1 分段信息格式
 - 分段标题命名（CRITICAL）：每个分段块的第一行写 `### Video_XXX`（Video 编号从 001 三位补零递增：Video_001、Video_002...），这是分段标题，与 detailed_description 内的切镜标签 [Shot N] 完全无关，严禁写成 `### Shot_XXX`。
 **标题**: [2-10字中文标题，根据本段内容自动生成]
-**时长**: [写本段**实际生成**秒数：第 1 段 = 设定时长（全局固定就写那个值、区间就按弧线取值）；第 2 段起 = 设定时长 + 段首衔接 {Seam_Runway}（即上方时长设定给出的那个值，允许 1 位小数）]
+**时长**: [{Seam_Duration_Note}]
 **景别**: [远景/全景/中景/近景/特写]
 **运镜**: [固定/推/拉/摇/移/跟/升/降]
 **角色**: [本段出场角色名，顿号分隔；无人写"无"。只写「参考素材说明」里声明的角色，严禁自造未声明的角色]
@@ -103,7 +103,7 @@ non_diegetic_music: {...}
 - 物理矢量描述（CRITICAL，彻底禁用文学修辞）：每一句必须对应物理世界中可见/可听的事实。禁用一切主观情感抒情与抽象文学形容词（禁止写"绝望的氛围""如诗如画"）。情感必须转化为物理动作："他感到悲伤"必须写成"他低下头，肩膀垮塌，半张脸隐没在阴影中"；环境必须物化："风吹过"必须写成"树叶向右侧剧烈摇晃，掀起角色的斗篷下摆"。具体可见的颜色与光线（如"冷白月光透过竹叶洒下"）属于物理事实，保留；只禁抽象情绪词与主观抒情。
 - 禁止情绪性收尾套话（CRITICAL）：禁止用抽象抒情句给镜头/分段收尾——严禁"阳光正好""画面定格在这份惬意中""时光仿佛静止""岁月静好""一切尽在不言中""气氛温馨而美好""仿佛在诉说…""世界都安静了"等无物理载体的情绪总结句；禁止"话音刚落""说完这句话""话声未落"这类叙述性衔接词占据镜头内容。若镜头有可见收束（角色合眼/光影移动/道具落定/动作结束），用具体的物理末态描写，并写明"谁、在什么位置、保持什么姿态/视线/道具状态"（供下一镜头复位）；不写情绪结论。
 
-- - 段首承接 + 剧情状态连续（CRITICAL — 本次任务一次输出 {Segment_Count} 个 Video_XXX 分段时适用；单独生成单个分段忽略）：整片是**分段连续生成再拼接**的，段与段之间有物理画面衔接（下一段的开头会被钉住上一段的末帧，因此段首必须写成衔接画面）。①非首段：本段 [Shot 1] 就是「承接上一段末帧画面的延续段」——与上段末帧**同机位/同景别/同光线/同角色身体姿态与动作进行方向**，动作只做轻微延续（不要重新站位、不要重新起势），持续 {Seam_Runway}；这一段在成片里会被**整段裁掉**，所以本段新内容从 {Seam_Runway} 之后开始（第一次切镜 ≈ 在 {Seam_Runway} 处，可换景别/机位/空间）。②首段没有延续段，按正常开场写。③剧情状态必须跨段连续：上段结束时的剧情状态（谁在哪/姿态/已发现什么/刚发生什么）就是延续段的画面内容；禁止重演上段已演的事件、禁止状态回退（上段已站起/已发现/已下台阶，本段不得又蹲回/装作没发现/再踏上同一级台阶）。④非末段：本段最后一个 [Shot N] 用 1-2 句写清本段结束时的物理末态（谁/在哪/姿态/正进行动作），作剧情状态交接；禁止用对视/一笑/定格/转身等封闭收尾给中段画句号。⑤只有首段可完整开场、只有末段可真正收束。⑥切去别的空间再切回某场景时，保持该场景此前的机位/景别/光线语言一致。⑦时间戳：延续段也占时间（[Shot 1] 无时间戳，其后切镜时间戳从 {Seam_Runway} 起算），全部落在本段 **时长** 内。
+{Seam_Handoff_Rule}
 
 - 切镜/运镜/景别的具体导演语法（切镜时机、连续状态链、事件密度、动作语法等）由「## 1. 故事风格」中的「镜头语言库」按本风格逐条提供，此处不再重复。
 
@@ -296,7 +296,7 @@ Each segment is strictly wrapped in [SHOT_START]...[SHOT_END]. Inside each block
 ### 4.1 Shot Info Format
 - Segment-title naming (CRITICAL): the first line of every segment block is `### Video_XXX` (Video numbers zero-padded to three digits, incrementing: Video_001, Video_002...). This is the segment title and is completely unrelated to the cut label [Shot N] inside detailed_description — never write `### Shot_XXX`.
 **Title**: [2-10 word English title, auto-derived from the segment]
-**Duration**: [write this segment's ACTUAL GENERATED seconds: the 1st segment = the configured duration (the fixed value, or a value picked by story arc when a range is set); from the 2nd segment on = configured duration + the head hand-off {Seam_Runway} (the value given by the duration setting above, 1 decimal allowed)]
+**Duration**: [{Seam_Duration_Note}]
 **Shot Size**: [Extreme Long/Long/Medium/Close-up/Extreme Close-up]
 **Camera Movement**: [Static/Push/Pull/Pan/Tilt/Truck/Tracking/Pedestal/Crane]
 **Characters**: [comma-separated names; "none" if no one. ONLY characters declared in the material intro; never invent undeclared characters]
@@ -381,7 +381,7 @@ Keep <d> content in the original language with basic punctuation (, . ? !), remo
 - Physical-vector description (CRITICAL, kill literary fluff): every sentence must correspond to something physically visible or audible. Forbid all subjective emotion and abstract literary adjectives ("a desperate atmosphere", "picturesque"). Turn emotions into physical action: "he feels sad" becomes "he lowers his head, his shoulders slump, and half his face sinks into shadow". Physicalize the environment: "the wind blows" becomes "leaves shake violently to the right, lifting the hem of the character's cloak". Concrete visible color and light (e.g. "cold white moonlight filters through the bamboo leaves") are physical facts and stay; only abstract emotion words and subjective lyricism are banned.
 - No emotional closing clichés (CRITICAL): never close a shot/segment with abstract lyrical summary — ban "the sunlight is just right", "the scene freezes in this cozy moment", "time seems to stand still", "all is well", "words are unnecessary", "the atmosphere is warm and lovely", "as if telling…", "the whole world falls silent", and similar emotion-summary sentences with no physical carrier; also ban narrative filler like "the moment the words ended" taking up shot content. If the shot has a visible settlement (character closing eyes / light shifting / prop settling / action finishing), describe the concrete physical end-state and state who, at what position, keeps what pose/gaze/prop state (for the next shot to reset); do NOT write an emotional conclusion.
 
-- - Head hand-off + story-state continuity (CRITICAL — applies when this task outputs {Segment_Count} Video_XXX segments in one pass; ignore for single-segment generation): the whole film is generated segment-by-segment and then concatenated, and adjacent segments are physically stitched (each segment's opening is pinned to the previous segment's last frame), so the opening MUST be written as a hand-off shot. 1) If not the first: this segment's [Shot 1] IS the continuation of the previous segment's last frame — SAME camera position / shot size / lighting / character body pose and direction of motion, with the action only slightly carried forward (no re-staging, no re-winding up), lasting {Seam_Runway}; this head section is DISCARDED entirely in the final cut, so this segment's NEW content starts after {Seam_Runway} (the first cut happens at ≈ {Seam_Runway}, where you may change shot size / camera / space). 2) The first segment has no hand-off section — write a normal opening. 3) Story state MUST be continuous across segments: the previous segment's end state (who was where / in what pose / what had just been discovered or happened) IS the content of the hand-off shot; never replay an event already shown, never regress state (already stood up / discovered / stepped down -> do not squat back / act unaware / step onto the same stair again). 4) If not the last: close the final [Shot N] by stating the physical end-state in 1-2 sentences (who / where / pose / action in progress) as the story-state hand-off; never close a middle segment with a tableau (lock eyes / smile / freeze / turn away). 5) Only the first segment may fully open the story, only the last may truly close it. 6) When cutting back to a scene visited earlier, keep that scene's camera/shot-size/lighting language consistent. 7) Timestamps: the hand-off section occupies time too ([Shot 1] has no timestamp; later cuts start counting from {Seam_Runway}) and all of them must fall within this segment's **Duration**.
+{Seam_Handoff_Rule}
 
 - Specific cut/camera/shot-size directing grammar (cut timing, continuous state chain, event density, action grammar) is provided per style by the "镜头语言库" in "## 1. Story Style"; not repeated here.
 
