@@ -5216,6 +5216,12 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         # ⭐ 段首衔接跑道（秒）= (窗口 + 过渡) / 24：段 2+ 的**生成时长 = 设定时长 + 跑道**。
         #    段首这一段是「承接上一段末帧」的锁定画面 + 模型启动过渡，成片会整段裁掉 ⇒ 落盘时长精确 = 用户设定。
         #    单段（count=1）或诊断档「不裁切」时跑道 = 0（没有衔接就没有额外生成内容）。
+        # 提示词来源必须先解析：下方 _seg_count_probe 在穿透模式下要用它统计分段数
+        if not isinstance(internal_prompt, str):
+            internal_prompt = ""
+        prompt_input = (internal_prompt or "").strip()
+        if isinstance(external_prompt, str) and external_prompt.strip():
+            prompt_input = external_prompt.strip()  # 接线提示词优先
         _seg_count_probe = (_pt_seg_count(prompt_input) if passthrough else 0) or _vc_count(video_count)
         seam_runway_sec = _seam_runway_seconds(seam_window_cfg, seam_settle,
                                                enabled=(_seam_on and _seg_count_probe > 1 and seam_trim_mode != "none"))
@@ -5229,12 +5235,6 @@ class JZL_MiniMaxAssetManagerInfinite(io.ComfyNode):
         save_mode = (_save_cfg.get("mode") or "分段保存").strip() or "分段保存"
         auto_merge_delete = bool(_save_cfg.get("auto_merge_delete"))
         prompt_lang = (enhance.get("prompt_lang") or "中文 [ZH]").strip() or "中文 [ZH]"
-
-        if not isinstance(internal_prompt, str):
-            internal_prompt = ""
-        prompt_input = (internal_prompt or "").strip()
-        if isinstance(external_prompt, str) and external_prompt.strip():
-            prompt_input = external_prompt.strip()  # 接线提示词优先
 
         seed_control = (enhance.get("seed_control") or "randomize").strip() or "randomize"
         current_seed = int(enhance.get("seed", 0) or 0)
@@ -5868,6 +5868,10 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
         # ⭐ 段首衔接跑道（秒）= (窗口 + 过渡) / 24：段 2+ 的**生成时长 = 设定时长 + 跑道**。
         #    段首这一段是「承接上一段末帧」的锁定画面 + 模型启动过渡，成片会整段裁掉 ⇒ 落盘时长精确 = 用户设定。
         #    单段（count=1）或诊断档「不裁切」时跑道 = 0（没有衔接就没有额外生成内容）。
+        # 提示词来源必须先解析：下方 _seg_count_probe 在穿透模式下要用它统计分段数
+        if not isinstance(internal_prompt, str):
+            internal_prompt = ""
+        prompt_input = (internal_prompt or "").strip()
         _seg_count_probe = (_pt_seg_count(prompt_input) if passthrough else 0) or _vc_count(video_count)
         seam_runway_sec = _seam_runway_seconds(seam_window_cfg, seam_settle,
                                                enabled=(_seam_on and _seg_count_probe > 1 and seam_trim_mode != "none"))
@@ -5881,10 +5885,6 @@ class JZL_MiniMaxAssetManagerShortDrama(io.ComfyNode):
         save_mode = (_save_cfg.get("mode") or "分段保存").strip() or "分段保存"
         auto_merge_delete = bool(_save_cfg.get("auto_merge_delete"))
         prompt_lang = (enhance.get("prompt_lang") or "中文 [ZH]").strip() or "中文 [ZH]"
-
-        if not isinstance(internal_prompt, str):
-            internal_prompt = ""
-        prompt_input = (internal_prompt or "").strip()
 
         seed_control = (enhance.get("seed_control") or "randomize").strip() or "randomize"
         current_seed = int(enhance.get("seed", 0) or 0)
