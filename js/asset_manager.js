@@ -319,11 +319,46 @@ function countShotBlocks(text) {
 //      聚焦它 ⇒ 前端不再把滚轮转给画布，浏览器原生滚动生效（与官方 Textarea 同一套机制）。
 const JZL_WHEEL_PROBE = 3000;   // 标定 chrome 时把容器临时撑到这个高度
 
+// 所有绑定者的 apply 回调（供 MutationObserver 同步触发）。
+// ⚠️ 为什么需要它：用户切换「Nodes 2.0」时前端会**整块卸载/重建** `.lg-node`。
+//   · 切到 2.0：max-height 还没写上 → 内容（长剧本 / 视频宫格）把卡片撑到内容高度 → 下一拍才被压回
+//   · 切回经典：calc 里的 `--node-height` 消失 → 回落到兜底值 → 卡片先变长再还原
+//   两者都表现为「节点像弹簧一样变长一下再缩回去」。MutationObserver 的回调在**绘制前**执行，
+//   在它里面同步重算 ⇒ 用户一帧都看不到中间态。
+const JZL_DOM_FIT_APPLIERS = new Set();
+let JZL_DOM_FIT_OBSERVER = null;
+function watchDomFit(apply) {
+    JZL_DOM_FIT_APPLIERS.add(apply);
+    if (JZL_DOM_FIT_OBSERVER) return;
+    try {
+        JZL_DOM_FIT_OBSERVER = new MutationObserver(() => {
+            for (const fn of JZL_DOM_FIT_APPLIERS) { try { fn(); } catch (_) {} }
+        });
+        // 只盯结构变化（节点 DOM 的增删）；属性变化太吵，用 500ms 轮询兜住内容尺寸变化
+        JZL_DOM_FIT_OBSERVER.observe(document.body, { childList: true, subtree: true });
+    } catch (_) { JZL_DOM_FIT_OBSERVER = null; }
+}
+
 function bindDomWidgetMaxHeight(node, el, opts = {}) {
     if (!node || !el) return () => {};
     const minH = Number(opts.minHeight) || 0;
     const cache = { K: 0 };
     const rootEl = () => (el.closest ? el.closest(".lg-node") : null);
+    // 首次绑定时的行内原样（切回经典模式必须原样还原）：
+    //   ⚠️ 不还原的话，`calc(var(--node-height, 3000px) - K)` 在经典模式下取 fallback 3000px
+    //   （经典渲染器不写 --node-height）→ 面板被撑到 ~2850px → 用户看到「关掉 Nodes 2.0 节点被拉很长」。
+    const orig = { max: el.style.maxHeight, min: el.style.minHeight, flex: el.style.flex, h: el.style.height };
+    let applied = false;
+    const restore = () => {
+        if (!applied) return;
+        applied = false;
+        try {
+            if (el.style.maxHeight !== orig.max) el.style.maxHeight = orig.max;
+            if (el.style.minHeight !== orig.min) el.style.minHeight = orig.min;
+            if (el.style.flex !== orig.flex) el.style.flex = orig.flex;
+            if (el.style.height !== orig.h) el.style.height = orig.h;
+        } catch (_) {}
+    };
 
     // chrome = 节点根部高度 − 容器高度（与容器内容无关）。用固定 3000px 撑开容器测，
     // 任何内容状态下都成立（早期版本用「空内容 / 4000px 两点拟合」，空内容时量不出来 → 静默失败）。
@@ -351,15 +386,23 @@ function bindDomWidgetMaxHeight(node, el, opts = {}) {
     let tries = 0;
     const apply = () => {
         try {
+            const root = rootEl();
+            if (!root) { restore(); return; }              // 经典模式：还原原生布局（含撤销已写入的 calc）
+            // `--node-height` 是前端在 2.0 下写在 .lg-node 上的（= 节点高度 + 30）。
+            // 拿不到它就别写 calc：否则 calc 会落到兜底值（3000px），出现「先变长再缩回」的弹簧效果。
+            let vh = "";
+            try { vh = getComputedStyle(root).getPropertyValue("--node-height").trim(); } catch (_) {}
+            if (!vh) return;
             if (!cache.K) {
                 const ok = calibrate();
-                if (ok === null) return;                        // 经典模式：保持原生布局
+                if (ok === null) { restore(); return; }
                 if (!ok) {
                     if (++tries <= 40) setTimeout(apply, 150);  // DOM 挂载/工作流加载时序
                     return;
                 }
             }
-            const h = `calc(var(--node-height, ${Math.round(JZL_WHEEL_PROBE)}px) - ${cache.K}px)`;
+            const h = `calc(var(--node-height) - ${cache.K}px)`;
+            applied = true;
             if (el.style.maxHeight !== h) el.style.maxHeight = h;
             // definite：同时给 height。不加这一条时容器高度由内容决定（max-height 只是裁剪），
             // 面板内部 flex:1 的提示词框会按「内容高度」分配剩余空间 → 把资产窗/重拍条挤出可视区，
@@ -369,6 +412,18 @@ function bindDomWidgetMaxHeight(node, el, opts = {}) {
         } catch (_) {}
     };
     try { requestAnimationFrame(() => { apply(); setTimeout(apply, 300); setTimeout(apply, 1200); }); } catch (_) { apply(); }
+    // ① 结构变化（切 2.0 时 .lg-node 重建）→ MutationObserver 在绘制前同步重算，消除弹簧闪动
+    watchDomFit(apply);
+    // ② 内容/尺寸变化 → 500ms 兜底轮询；节点被删掉后自动停表，避免残留计时器
+    let watch = null;
+    try {
+        watch = setInterval(() => {
+            try {
+                if (!el.isConnected && !node.graph) { clearInterval(watch); watch = null; JZL_DOM_FIT_APPLIERS.delete(apply); return; }
+            } catch (_) { /* ignore */ }
+            apply();
+        }, 500);
+    } catch (_) {}
     return apply;
 }
 
