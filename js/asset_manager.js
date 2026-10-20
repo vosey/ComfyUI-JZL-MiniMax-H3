@@ -3831,17 +3831,50 @@ function renderGenSettingsPanel(c, s, node, d) {
 }
 
 // ── 📐 视频参数（🎬 短剧导演台）：画幅比例 / 百万像素 / 每段时长 / 段数 / 参考与放大 ──
+// 画幅比例表：与后端 nodes_asset_manager.ASPECT_RATIOS 保持一致
+const JZL_ASPECT_RATIOS = {
+    "1:1 (Square)": [1, 1], "2:3 (Portrait Photo)": [2, 3], "3:2 (Photo)": [3, 2],
+    "3:4 (Portrait Standard)": [3, 4], "4:5 (Portrait Tall)": [4, 5], "4:3 (Standard)": [4, 3],
+    "5:4 (Landscape Tall)": [5, 4], "9:16 (Portrait Widescreen)": [9, 16],
+    "16:9 (Widescreen)": [16, 9], "21:9 (Ultrawide)": [21, 9],
+};
+
+// 画幅比例 + 百万像素 → 生成分辨率（与后端 _resolve_gen_size 同一公式：sqrt(MP×1024²/比例) 后按 32 对齐）
+function jzlCalcResolution(aspectRatio, megapixels) {
+    const [wr, hr] = JZL_ASPECT_RATIOS[String(aspectRatio || "")] || [16, 9];
+    const mp = Number(megapixels);
+    const total = (Number.isFinite(mp) && mp > 0 ? mp : 1) * 1024 * 1024;
+    const scale = Math.sqrt(total / (wr * hr));
+    const align = (v) => Math.max(32, Math.round((v * scale) / 32) * 32);
+    return [align(wr), align(hr)];
+}
+
 function renderVideoParamsPanel(c, s, node) {
     const { cur, set, comboOptions } = panelWidgetIO(node);
     renderAutoSave(c, s);
 
+    // 分辨率预览跟随「画幅比例 / 百万像素」实时刷新（两个控件的回调里调用）
+    let refreshRes = () => {};
+
     c.append(makeSectionTitle("画幅比例"));
     c.append(bigBoxGrid(comboOptions("aspect_ratio", OPTIONS.aspectRatio),
-        String(cur("aspect_ratio", "16:9 (Widescreen)")), v => set("aspect_ratio", v), 5, 26));
+        String(cur("aspect_ratio", "16:9 (Widescreen)")), v => { set("aspect_ratio", v); refreshRes(); }, 5, 26));
 
     c.append(makeSectionTitle("分辨率与时长"));
     c.append(field("百万像素（MP）", stepperControl(parseFloat(cur("megapixels", 0.4)) || 0.4,
-        { min: 0.1, max: 3.6, step: 0.1 }, v => set("megapixels", v))));
+        { min: 0.1, max: 3.6, step: 0.1 }, v => { set("megapixels", v); refreshRes(); })));
+
+    const resBox = el("div", "font-size:13px;color:#c9a86a;padding:6px 10px;text-align:center;"
+        + "background:var(--comfy-input-bg,#2a2a2a);border:1px solid var(--border-color,#444);"
+        + "border-radius:4px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;");
+    resBox.title = "根据上面的「画幅比例」与「百万像素（MP）」计算出的生成分辨率（宽 × 高，32 对齐）";
+    c.append(field("分辨率", resBox));
+    refreshRes = () => {
+        const [W, H] = jzlCalcResolution(cur("aspect_ratio", "16:9 (Widescreen)"), parseFloat(cur("megapixels", 0.4)) || 0.4);
+        resBox.textContent = `${W} × ${H}`;
+    };
+    refreshRes();
+
     c.append(field("每段视频时长", selectControl(comboOptions("duration", ["固定5秒"]),
         String(cur("duration", "固定5秒")), v => set("duration", v))));
 
@@ -5490,12 +5523,6 @@ app.registerExtension({
             };
 
             // 生成详情只读显示：监听原生参数 widget（画幅/MP/时长/段数）变化后联动刷新
-            const AR_MAP = {
-                "1:1 (Square)": [1, 1], "2:3 (Portrait Photo)": [2, 3], "3:2 (Photo)": [3, 2],
-                "3:4 (Portrait Standard)": [3, 4], "4:5 (Portrait Tall)": [4, 5], "4:3 (Standard)": [4, 3],
-                "5:4 (Landscape Tall)": [5, 4], "9:16 (Portrait Widescreen)": [9, 16],
-                "16:9 (Widescreen)": [16, 9], "21:9 (Ultrawide)": [21, 9],
-            };
             const updateDisplay = () => {
                 const gv = (nm) => {
                     const w = (self.widgets || []).find((x) => x.name === nm);
@@ -5532,11 +5559,7 @@ app.registerExtension({
                 // 动态参数用范围简写（如 1~60）
                 const cntLo = vcAuto ? 1 : count, cntHi = vcAuto ? 60 : count;
                 const cntTxt = vcAuto ? `${cntLo}~${cntHi}` : `${count}`;
-                const [wr, hr] = AR_MAP[ar] || [16, 9];
-                const total = mp * 1024 * 1024;
-                const scale = Math.sqrt(total / (wr * hr));
-                const W = Math.max(32, Math.round((wr * scale) / 32) * 32);
-                const H = Math.max(32, Math.round((hr * scale) / 32) * 32);
+                const [W, H] = jzlCalcResolution(ar, mp);
                 const calcF = (d) => { const b = Math.max(5, Math.round(d * 24)); return b + (5 - (b % 17)) % 17; };
                 const flo = calcF(dlo), fhi = calcF(dhi);
                 const ds = dlo === dhi ? `${dlo}` : `${dlo}~${dhi}`;
