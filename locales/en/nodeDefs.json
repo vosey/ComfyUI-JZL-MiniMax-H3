@@ -687,6 +687,15 @@
       "0": { "name": "Video Files" }
     }
   },
+  "JZL_MiniMaxScriptViewer": {
+    "display_name": "JZL - 📝 Generated Script Viewer",
+    "inputs": {
+      "story_name": { "name": "Current Story" }
+    },
+    "outputs": {
+      "0": { "name": "Script Files" }
+    }
+  },
   "JZL_MiniMaxAssetManagerMini": {
     "display_name": "JZL - 🤖 MiniMax-H3 Short Drama Director Mini",
     "inputs": {

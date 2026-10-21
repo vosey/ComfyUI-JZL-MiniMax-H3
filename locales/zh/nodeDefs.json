@@ -284,6 +284,30 @@
       "0": { "name": "已处理剧本" }
     }
   },
+  "JZL_MiniMaxAssetManagerShortDrama": {
+    "display_name": "JZL - 🤖 MiniMax-H3短剧导演台",
+    "inputs": {
+      "run_mode": { "name": "运行模式" },
+      "display_info": { "name": "生成详情" },
+      "aspect_ratio": { "name": "画幅比例" },
+      "megapixels": { "name": "百万像素（MP）" },
+      "duration": { "name": "每段视频时长" },
+      "scale_factor": { "name": "参考数值放大" },
+      "upscale_scale": { "name": "二采latent放大" },
+      "video_count": { "name": "生成视频数量（0=剧情决定）" },
+      "story_style": { "name": "故事风格" },
+      "story_name": { "name": "故事名称" },
+      "internal_prompt": { "name": "节点内提示词" },
+      "manager_settings": { "name": "节点配置" },
+      "model": { "name": "主模型" },
+      "clip": { "name": "CLIP" },
+      "vae": { "name": "视觉VAE" },
+      "audio_vae": { "name": "音频VAE" }
+    },
+    "outputs": {
+      "0": { "name": "已处理剧本" }
+    }
+  },
   "JZL_MiniMaxVideoViewer": {
     "display_name": "JZL - 🎬 生成视频查看器",
     "inputs": {
@@ -291,6 +315,15 @@
     },
     "outputs": {
       "0": { "name": "视频文件" }
+    }
+  },
+  "JZL_MiniMaxScriptViewer": {
+    "display_name": "JZL - 📝 生成剧本查看器",
+    "inputs": {
+      "story_name": { "name": "当前故事" }
+    },
+    "outputs": {
+      "0": { "name": "剧本文件" }
     }
   },
   "JZL_MiniMaxAssetManagerMini": {
@@ -498,7 +531,7 @@
   "JZL_MiniMaxMusicCaption": {
     "display_name": "JZL - 🎵 MiniMax Music3 提示词预设",
     "inputs": {
-      "高级参数": { "name": "高级参数" },
+      "配方": { "name": "✨配方（切换即套用预设）" },
       "音乐风格": { "name": "音乐风格" },
       "风格融合": { "name": "风格融合" },
       "速度": { "name": "速度(BPM)" },
@@ -512,12 +545,14 @@
       "主奏乐器": { "name": "主奏乐器" },
       "辅助乐器": { "name": "辅助乐器" },
       "人声配置": { "name": "人声配置" },
+      "合唱团": { "name": "合唱团" },
       "声部音区": { "name": "声部音区" },
       "人声音色": { "name": "人声音色" },
       "人声唱法": { "name": "人声唱法" },
       "和声伴唱": { "name": "和声伴唱" },
       "人声效果": { "name": "人声效果" },
-      "制作质感": { "name": "制作质感" }
+      "制作质感": { "name": "制作质感" },
+      "自定义补充": { "name": "自定义补充" }
     },
     "outputs": {
       "0": { "name": "🎵 caption" }
@@ -526,7 +561,8 @@
   "JZL_MiniMaxMusicCaptionDuet": {
     "display_name": "JZL - 🎵 MiniMax Music3 提示词预设（双人）",
     "inputs": {
-      "高级参数": { "name": "高级参数" },
+
+      "配方": { "name": "✨配方（切换即套用预设）" },
       "音乐风格": { "name": "音乐风格" },
       "风格融合": { "name": "风格融合" },
       "速度": { "name": "速度(BPM)" },
@@ -541,6 +577,7 @@
       "辅助乐器": { "name": "辅助乐器" },
       "制作质感": { "name": "制作质感" },
       "纯人声无伴奏": { "name": "纯人声无伴奏" },
+      "合唱团": { "name": "合唱团" },
       "角色分工": { "name": "角色分工" },
       "角色A配置": { "name": "角色A配置" },
       "角色A音区": { "name": "角色A音区" },
@@ -551,7 +588,8 @@
       "角色B音色": { "name": "角色B音色" },
       "角色B唱法": { "name": "角色B唱法" },
       "和声伴唱": { "name": "和声伴唱" },
-      "人声效果": { "name": "人声效果" }
+      "人声效果": { "name": "人声效果" },
+      "自定义补充": { "name": "自定义补充" }
     },
     "outputs": {
       "0": { "name": "🎵 caption" }
@@ -560,7 +598,7 @@
   "JZL_MiniMaxMusicLyricsEditor": {
     "display_name": "JZL - 🎵 MiniMax Music3 歌词编辑",
     "inputs": {
-      "lyrics_text": { "name": "歌词" }
+      "lyrics_text": { "name": "歌词（含段落标签/角色标注）" }
     },
     "outputs": {
       "0": { "name": "🎤 lyrics" }

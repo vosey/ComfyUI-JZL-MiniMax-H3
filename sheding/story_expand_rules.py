@@ -15,6 +15,7 @@ _MATERIAL_ZH = '''## 参考素材约束（CRITICAL — 本模式必须按素材�
 - **严禁杜撰**：严禁编造素材里没有的角色/场景/道具；如果用户故事提到了素材里没有的人/地方/物件，要么改用最接近的素材元素替代，要么删去该元素，不得凭空新增。
 - 扩写只能围绕素材元素展开画面/动作/环境/氛围细节，不得引入素材外的元素（如素材没有"医院"场景就不得写医院）。
 - 素材的「名称（描述）」括号内的外观/特征原样采信用于描写。
+- **外观术语逐字沿用（CRITICAL）**：素材描述里的服装/道具名称、配色、材质、造型等术语必须**原样沿用**，严禁同义改写或自由发挥（例：描述写「淡蓝色牛仔连衣裤」→ 不得写成「天蓝色背带裤」；写「米色围脖」→ 不得写成「米色围巾」）。描述与参考图一致时**就照描述写、不做额外发挥**；若开启识图且图与描述**明显不符**，以参考图为准校准。
 
 ## 可用素材清单
 {MATERIAL_INTRO}'''
@@ -28,6 +29,7 @@ The materials below are ALL you may use (characters / scenes / props from the en
 - NEVER invent: do NOT fabricate characters/scenes/props absent from the list. If the user story mentions someone/place/object NOT in the materials, either substitute the closest listed element or drop it — never add new ones.
 - Expansion may only enrich visuals/actions/environment/atmosphere AROUND the listed elements; do not introduce out-of-list elements (e.g. no hospital if no "hospital" scene is listed).
 - The material "name (description)" parentheticals are authoritative for appearance/features.
+- EXACT APPEARANCE TERMS (CRITICAL): reuse the material description's terms for clothing / props / colors / materials / shapes VERBATIM — never reword them (e.g. "light-blue denim overalls" must NOT become "sky-blue suspender pants"; "beige neck warmer" must NOT become "beige scarf"). If the reference image and the description agree, simply follow the description and do NOT improvise. If image input is enabled and the image clearly contradicts the description, correct toward the image.
 
 ## Available materials
 {MATERIAL_INTRO}'''

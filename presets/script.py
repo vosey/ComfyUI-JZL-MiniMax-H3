@@ -73,7 +73,7 @@ def _parse_duration_spec(duration):
             n = float(s); lo = n; hi = n
         except Exception:
             lo = 8.0; hi = 8.0
-    lo = max(4.0, min(15.0, lo)); hi = max(lo, min(15.0, hi))
+    lo = max(4.0, min(60.0, lo)); hi = max(lo, min(60.0, hi))
     if lo > hi:
         lo, hi = hi, lo
     if lo == hi:
@@ -81,7 +81,7 @@ def _parse_duration_spec(duration):
     return (lo, hi, f"{int(lo)}~{int(hi)} 秒区间（每段由你按剧情弧线给实际秒数，写进该段 **时长** 字段）")
 
 
-MODEL_MAX_SEGMENT_SEC = 15.0   # 单段生成上限（秒）——超过它「设定时长 + 段首衔接」无法完整生成
+MODEL_MAX_SEGMENT_SEC = 60.0   # 单段生成上限（秒）——超过它「设定时长 + 段首衔接」无法完整生成
 
 
 def _duration_spec_with_runway(duration, seam_runway=0.0):
@@ -103,7 +103,7 @@ def _duration_spec_with_runway(duration, seam_runway=0.0):
     runway_txt = f"{runway:.2f}".rstrip("0").rstrip(".")
     gen_lo, gen_hi = lo + runway, hi + runway
     capped = gen_hi > MODEL_MAX_SEGMENT_SEC
-    if capped:                       # 单段上限：生成不能超过 15 秒 → 落盘会略短于设定
+    if capped:                       # 单段上限：生成不能超过 60 秒 → 落盘会略短于设定
         gen_hi = MODEL_MAX_SEGMENT_SEC
         gen_lo = min(gen_lo, gen_hi)
     gen_lo_txt = f"{gen_lo:.2f}".rstrip("0").rstrip(".")
@@ -179,7 +179,7 @@ SCRIPT_SKELETON_V2 = '''# Role: 顶级短视频编剧 & MiniMax H3 分段提示�
 第 2 步 · 规划：按 B 的统筹与偏好，给每段定实际秒数与 [Shot N] 数（按弧线分配，开场少/中段推进/高潮多/收束回落）。
 第 3 步 · 执行：逐段输出 [SHOT_START]...[SHOT_END]，每段含（一）分段信息 +（二）六段 Ref2VA + 调度指令（格式见 D）。执行时遵守：
 {Decompose_Rules}
-   - 段边界 = 大切镜 + **段首衔接**（见上方时长设定）：第 2 段起的 [Shot 1] 是「承接上一段末帧画面的延续段」，持续 {Seam_Runway}（同机位/同景别/同光线/同角色姿态与动作方向）——这段在成片里会被整段裁掉，所以本段新内容从 {Seam_Runway} 之后开始（第一次切镜时间戳约在 {Seam_Runway} 处，可换景别/机位/空间）；人物/物理状态跨段连续（禁回退/重演上段已演事件）；段尾（非末段）用 1-2 句写清物理末态作剧情交接。
+   - {Seam_Edge_Rule}
 第 4 步 · 审查（写完全部后自检一遍，不满足即改）：
    - 六段字段齐全、字段间各空一行、无 markdown 代码块；
    - <Subject N>/<Picture N>/<Video N>/<Audio N> 与 subject_definitions 一致，且与 SCENE/VIDEO/AUDIO_INSTRUCTION.slots 编号严格同源（slots[0]=<Picture 1>…）；
@@ -195,9 +195,9 @@ SCRIPT_SKELETON_V2 = '''# Role: 顶级短视频编剧 & MiniMax H3 分段提示�
    - **风格逐句渗透**：风格声明只用一句（句式「本段为 <媒介/渲染> 的 <风格> 风格」），且每个环境/特效/道具名词都带本风格定语；
    - **镜内分拍 + 句间因果**：一镜多拍已用空行分拍（每拍「触发→动作→结果」），每句新动作都由上一句因果引发；
    - **副运动 + 可见事实密度**：每次主体动作带至少 1 处附属物副运动（行囊/衣摆/发丝/道具/烟雾/尘土）；每个 [Shot N] 平均每秒 ≥ 2 个可拍到的事实；
-   - **首帧锚定句式**：有首帧锚点图时 subject_definitions 有 `<Picture N> is the first frame of [Shot 1], showing …` 行、[Shot 1] 起手句「本镜以 <Picture N> 作为第一帧开始」、summary 标签含 `keyframe completion`、retention 首帧图单独一行；
+   - **固定 ref2va（无首帧/尾帧锚定）**：subject_definitions 里参考图只写「普通参考」，严禁 `<Picture N> is the first frame of [Shot 1]` / `is the last frame of`；summary 严禁 `keyframe completion`；retention 严禁 `([Shot 1] first frame)`；
    - **声音两字段**：overall_soundscape 按事件时间顺序写（主导事件声→环境底噪，带「材质+动作+强度」）；non_diegetic_music 默认 N/A，指定音乐时写「体裁/速度 + 三件乐器（含演奏法）+ matching 画面事件」；
-   - 第 2 段起 [Shot 1] 是承接上段末帧的延续画面（时长 = 段首衔接秒数）、其后才有本段新内容；无状态回退/重演上段已演事件。
+   - {Seam_Check_Rule}
 
 ## D. 输出格式权威（六段 Ref2VA + 调度指令，严格遵循）
 {H3_Shot_Rules}'''
@@ -267,8 +267,9 @@ def _extract_detail_length(preference_text):
 def _build_material_table(ref_image_intro, ref_video_intro, ref_audio_intro):
     """解析用户素材描述，生成「标签对照表」，供 LLM 严格按槽位名写 slots。
 
-    用户描述每行格式：「类型+字母 = 素材名（描述）」，如「角色A = 孙悟空（橙色武道服）」。
-    返回对照表文本；无素材时返回空串。
+    用户描述每行格式：「类型+字母 = 素材名（描述）」，如「角色A = 孙悟空（橙色武道服）」
+    「音色A = 小兔子音色」。音频子分类（角色音色/背景配乐/念白）各有独立前缀，
+    不在白名单里会被整行丢弃 → 对照表缺音频槽位 → LLM 只能把 AUDIO_INSTRUCTION 写空。
     """
     blocks = []
     for kind, intro in (("图片", ref_image_intro), ("视频", ref_video_intro), ("音频", ref_audio_intro)):
@@ -279,7 +280,7 @@ def _build_material_table(ref_image_intro, ref_video_intro, ref_audio_intro):
             line = line.strip()
             if not line:
                 continue
-            m = re.match(r'^(角色|场景|道具|视频|音频|分镜|音效|音乐|其他)\s*([A-Za-z])\s*[=＝:：]\s*(.+)', line)
+            m = re.match(r'^(角色|场景|道具|视频|音频|音色|配乐|念白|分镜|音效|音乐|其他)\s*([A-Za-z])\s*[=＝:：]\s*(.+)', line)
             if not m:
                 continue
             typ, slot, rest = m.group(1), m.group(2).upper(), m.group(3).strip()
@@ -295,9 +296,9 @@ def _build_material_table(ref_image_intro, ref_video_intro, ref_audio_intro):
             + "\n\n## 3.6 素材白名单（CRITICAL — 顶部字段与调度严禁引用对照表之外的素材）\n"
             "- 每段顶部元数据（**角色**/**场景**/**道具**/**视频**/**音频**/**音效**/**音乐**/**其他**）里列出的名称，必须全部来自上方对照表中的「素材名」或「类型:槽位名」（如 场景:场景B、角色:角色A），严禁自造或新增。\n"
             "- 剧情需要但对照表中没有的素材（如某道具/场景/角色），一律不得写入顶部字段或调度 slots：该字段写「无」，只允许在 detailed_description 剧情正文中作环境描写。\n"
-            "- 调度指令 slots 写「类型:槽位名」，如 场景:场景A、角色:角色A、道具:道具A、视频:视频A、音频:音频A，严禁写素材名（孙悟空）或自造槽位。\n"
+            "- 调度指令 slots 写「类型:槽位名」，如 场景:场景A、角色:角色A、道具:道具A、视频:视频A、音频:音色A（音频类类型前缀固定「音频」，槽位名按子分类可能是 音色A/配乐A/念白A/音频A），严禁写素材名（孙悟空）或自造槽位。\n"
             "- subject_definitions 写素材名（<Subject N> 是 <Picture N> 中的孙悟空），括号里的外貌描述原样复述。\n"
-            "- 音频槽位对应说话人音色：本段谁开口说话，AUDIO_INSTRUCTION.slots 就写对应角色的「音频:音频X」，无对话分段音频 slots 写空。")
+            "- 音频槽位对应说话人音色：本段谁开口说话，AUDIO_INSTRUCTION.slots 就写对应槽位（角色音色→「音频:音色X」、其它音频→「音频:配乐X/念白X/音频X」，一律照抄对照表里的槽位名），无对话分段音频 slots 写空。")
 
 def build_shot_prompt(
     user_story: str,
@@ -341,7 +342,7 @@ def build_shot_prompt(
             "  - 段数 = 剧情总时长 ÷ 每段时长（四舍五入取整）；**区间时长时优先用足每段时长（取区间上限）**，宁少段、勿多段；\n"
             "  - 硬约束：段数 ≥ 1 且 ≤ 56；且每段实际时长不得低于区间下限（或固定时长）——**剧情很短时宁可用 1 段长镜，"
             "绝不允许切成很多短段**（防止短剧情生成超多视频）；\n"
-            "  - 示例：剧情约 60 秒 + 时长区间 4~15 秒 ⇒ 4 段 × 15 秒（**不是** 15 段 × 4 秒）；剧情约 8 秒 ⇒ 1 段；\n"
+            "  - 示例：剧情约 120 秒 + 时长区间 4~60 秒 ⇒ 2 段 × 60 秒（**不是** 60 段 × 4 秒）；剧情约 8 秒 ⇒ 1 段；\n"
             "  - 切分点必须落在剧情时间线的自然节点（事件/场景/情绪转折）上，不得为凑段数硬切；\n"
             "  - 每段是一段独立视频片段；**每段的实际生成秒数见下方「时长设定」**，必须写进该段 **时长** 字段。"
         )
@@ -358,10 +359,170 @@ def build_shot_prompt(
     seam_runway_txt = ((f"{seam_runway:.2f}".rstrip("0").rstrip(".") + " 秒"
                         f"（≈{int(round(seam_runway * 24))} 帧）") if seam_runway > 0 else "0 秒")
 
+    # ── BUG① 修复：seam=0 时不得注入「延续段 / 从 0 秒起算」等无效指令 ──
+    #   衔接关闭 / 单段 / 不裁切诊断档：统一改用「大切镜/换场」文案。
+    _seam_on = seam_runway > 0
+
+    # 骨架（SCRIPT_SKELETON_V2）与 DECOMPOSE_RULES 始终为中文，故这两套变体与 lang 无关
+    if _seam_on:
+        seam_edge_rule = (
+            "段边界 = 大切镜 + **段首衔接**（见上方时长设定）：第 2 段起的 [Shot 1] 是「承接上一段末帧画面的延续段」，"
+            f"持续 {seam_runway_txt}（同机位/同景别/同光线/同角色姿态与动作方向）——这段在成片里会被整段裁掉，所以本段"
+            f"新内容从 {seam_runway_txt} 之后开始（第一次切镜时间戳约在 {seam_runway_txt} 处，可换景别/机位/空间）；"
+            "人物/物理状态跨段连续（禁回退/重演上段已演事件）；段尾（非末段）用 1-2 句写清物理末态作剧情交接。")
+        seam_check_rule = (
+            "第 2 段起 [Shot 1] 是承接上段末帧的延续画面（时长 = 段首衔接秒数）、其后才有本段新内容；"
+            "无状态回退/重演上段已演事件。")
+        seam_decompose_bullet = (
+            "段首承接 + 大切镜：整片是分段生成再拼接（相邻段之间有物理衔接）。第 2 段起，段首要写一个「承接上一段"
+            f"末帧画面的延续段」（同机位/同景别/同光线/同角色姿态与动作方向，持续 {seam_runway_txt}）；这段在成片里"
+            f"会被整段裁掉 → 本段新内容从 {seam_runway_txt} 之后开始。同时保证人物物理状态跨段连续（上段末的姿态/"
+            "位置/已发现事实必须延续），禁止状态回退与重演上段已演事件；段尾（非末段）交代清楚物理末态作剧情交接。")
+        seam_principle_2 = (
+            "段首承接 + 剧情状态连续: 段与段之间在成片里是连续的（下段开头钉住了上段末帧）。关键在于“剧情/物理状态"
+            "必须连续”：上段结束时谁在什么位置、什么姿态、是否受伤、发现了什么、做了什么，下段的**段首延续段**必须"
+            "与之完全一致（同机位/同景别/同光线/同姿态），本段新内容则必须基于该状态继续（可换机位、可从不同景别"
+            "呈现同一状态），严禁状态回退（上段已站起/已发现/已下台阶，下段不得又蹲回起点/装作没发现/再踏上同一级"
+            "台阶）、严禁重演上段已演过的事件（同一动作只演一次）。若中途切去别的空间、之后再切回某场景，回到该场景"
+            "时的机位/景别/光线语言要与该场景此前的镜头一致（保持原有镜头语言）。")
+        seam_self_contained = (
+            f"**段首衔接**：第 2 段起的开头 {seam_runway_txt} 是「承接上一段末帧的延续段」（同机位/同景别/同光线/"
+            "同角色姿态与动作方向，只轻微延续）——这段成片会裁掉，所以要写具体（不能写“承接上段末帧/上段…继续”这类"
+            "抽象伪引用），本段新内容写在它之后；第 1 段正常开场。")
+        seam_scheme_a = (
+            f"段首承接(方案 A, 成片裁掉): 第 2 段起, [Shot 1] 必须写成\"上一段末帧画面的延续\"——同机位/同景别/"
+            f"同光线/同角色身体姿态与动作进行方向, 动作只轻微延续, 持续 {seam_runway_txt}, 并把上段末态的具体画面"
+            f"写出来(可仅微动); 这段在成片里会被整段裁掉, 其后才切镜进入本段新内容(第一次切镜时间戳 ≈ {seam_runway_txt})。")
+        seam_no_pseudo_ref = (
+            "禁抽象伪引用: 不要写\"承接上段末帧/接住上段结尾/上段继续\"这类抽象词——延续段要写具体画面内容(谁在哪/"
+            "什么姿态/什么动作进行到哪一步/光线环境如何), 因为下段开头真的会被钉住上段末帧。")
+        seam_ban_pseudo_ref = (
+            "禁止抽象跨段画面词(不得写“承接上段末帧/上段…继续/接着刚才”这类抽象伪画面词): 段首延续段要**写具体画面**"
+            "(谁在哪/什么姿态/什么动作进行到哪一步/光线环境如何), 因为下段开头真的被钉住上段末帧; 新内容则本段自足建立。")
+    else:
+        seam_edge_rule = (
+            "段边界 = 大切镜/换场：第 2 段起的 [Shot 1] 是紧接上段剧情时间线的下一镜（可换景别/机位/空间），画面自足，"
+            "禁止写“承接上段末帧/上段…继续”这类伪画面引用；人物/物理状态跨段连续（禁回退/重演上段已演事件）；"
+            "段尾（非末段）用 1-2 句写清物理末态作剧情交接。")
+        seam_check_rule = (
+            "第 2 段起 [Shot 1] 是紧接上段剧情时间线的下一镜（大切镜/换场，画面自足，禁止伪画面引用）、"
+            "其后正常推进本段新内容；无状态回退/重演上段已演事件。")
+        seam_decompose_bullet = (
+            "段首承接 + 大切镜：整片是分段生成再拼接（相邻段之间是一次大切镜/换场）。第 2 段起，段首 [Shot 1] 直接写"
+            "紧接上段剧情时间线的下一镜（可换景别/机位/空间），画面自足，禁止写“承接上段末帧/上段…继续”等伪画面"
+            "引用；同时保证人物物理状态跨段连续（上段末的姿态/位置/已发现事实必须延续），禁止状态回退与重演上段已演"
+            "事件；段尾（非末段）交代清楚物理末态作剧情交接。")
+        seam_principle_2 = (
+            "段际承接 + 剧情状态连续: 段与段之间按大切镜/换场处理。关键在于“剧情/物理状态必须连续”：上段结束时谁在"
+            "什么位置、什么姿态、是否受伤、发现了什么、做了什么，下段的开场画面必须基于该状态继续（可换机位、可从"
+            "不同景别呈现同一状态），严禁状态回退（上段已站起/已发现/已下台阶，下段不得又蹲回起点/装作没发现/再踏上"
+            "同一级台阶）、严禁重演上段已演过的事件（同一动作只演一次）。若中途切去别的空间、之后再切回某场景，回到"
+            "该场景时的机位/景别/光线语言要与该场景此前的镜头一致（保持原有镜头语言）。")
+        seam_self_contained = (
+            "**段际衔接**：段与段之间按大切镜/换场处理，第 2 段起直接写紧接上段剧情时间线的下一镜（可换景别/机位/"
+            "空间），画面自足，禁止写“承接上段末帧/上段…继续”这类伪画面引用；第 1 段按正常开场。")
+        seam_scheme_a = (
+            "段间大切镜: 第 2 段起, [Shot 1] 直接写紧接上段剧情时间线的下一镜（可换景别/机位/空间），画面自足, "
+            "禁止写“承接上段末帧/上段…继续”这类伪画面词。")
+        seam_no_pseudo_ref = (
+            "禁抽象伪引用: 不要写\"承接上段末帧/接住上段结尾/上段继续\"这类抽象词——每段开场直接写具体画面内容"
+            "(谁在哪/什么姿态/什么动作进行到哪一步/光线环境如何)。")
+        seam_ban_pseudo_ref = (
+            "禁止抽象跨段画面词(不得写“承接上段末帧/上段…继续/接着刚才”这类抽象伪画面词): 每段开场要**写具体画面**"
+            "(谁在哪/什么姿态/什么动作进行到哪一步/光线环境如何), 新内容本段自足建立。")
+
+    if lang == "zh":
+        if _seam_on:
+            seam_duration_note = (
+                "写本段**实际生成**秒数：第 1 段 = 设定时长（全局固定就写那个值、区间就按弧线取值）；"
+                f"第 2 段起 = 设定时长 + 段首衔接 {seam_runway_txt}（即上方时长设定给出的那个值，允许 1 位小数）")
+            seam_handoff_rule = (
+                f"- - 段首承接 + 剧情状态连续（CRITICAL — 本次任务一次输出 {seg_count_txt} 个 Video_XXX 分段时适用；"
+                "单独生成单个分段忽略）：整片是**分段连续生成再拼接**的，段与段之间有物理画面衔接（下一段的开头会被"
+                "钉住上一段的末帧，因此段首必须写成衔接画面）。①非首段：本段 [Shot 1] 就是「承接上一段末帧画面的"
+                "延续段」——与上段末帧**同机位/同景别/同光线/同角色身体姿态与动作进行方向**，动作只做轻微延续"
+                f"（不要重新站位、不要重新起势），持续 {seam_runway_txt}；这一段在成片里会被**整段裁掉**，所以本段"
+                f"新内容从 {seam_runway_txt} 之后开始（第一次切镜 ≈ 在 {seam_runway_txt} 处，可换景别/机位/空间）。"
+                "②首段没有延续段，按正常开场写。③剧情状态必须跨段连续：上段结束时的剧情状态（谁在哪/姿态/已发现"
+                "什么/刚发生什么）就是延续段的画面内容；禁止重演上段已演的事件、禁止状态回退（上段已站起/已发现/"
+                "已下台阶，本段不得又蹲回/装作没发现/再踏上同一级台阶）。④非末段：本段最后一个 [Shot N] 用 1-2 句"
+                "写清本段结束时的物理末态（谁/在哪/姿态/正进行动作），作剧情状态交接；禁止用对视/一笑/定格/转身等"
+                "封闭收尾给中段画句号。⑤只有首段可完整开场、只有末段可真正收束。⑥切去别的空间再切回某场景时，"
+                "保持该场景此前的机位/景别/光线语言一致。⑦时间戳：延续段也占时间（[Shot 1] 无时间戳，其后切镜"
+                f"时间戳从 {seam_runway_txt} 起算），全部落在本段 **时长** 内。")
+        else:
+            seam_duration_note = (
+                "写本段**实际生成**秒数：= 设定时长（全局固定就写那个值、区间就按弧线取值，允许 1 位小数）")
+            seam_handoff_rule = (
+                f"- - 段际承接 + 剧情状态连续（CRITICAL — 本次任务一次输出 {seg_count_txt} 个 Video_XXX 分段时适用；"
+                "单独生成单个分段忽略）：整片是分段生成再拼接的，段与段之间按**大切镜/换场**处理。①非首段：本段 "
+                "[Shot 1] 是紧接上段剧情时间线的下一镜（可换景别/机位/空间），画面自足；**禁止**写“承接上段末帧/"
+                "上段…继续”等伪画面引用。②首段按正常开场写。③剧情状态必须跨段连续：上段结束时的剧情状态（谁在哪/"
+                "姿态/已发现什么/刚发生什么）就是本段开场的基础；禁止重演上段已演的事件、禁止状态回退（上段已站起/"
+                "已发现/已下台阶，本段不得又蹲回/装作没发现/再踏上同一级台阶）。④非末段：本段最后一个 [Shot N] 用 "
+                "1-2 句写清本段结束时的物理末态（谁/在哪/姿态/正进行动作），作剧情状态交接；禁止用对视/一笑/定格/"
+                "转身等封闭收尾给中段画句号。⑤只有首段可完整开场、只有末段可真正收束。⑥切去别的空间再切回某场景"
+                "时，保持该场景此前的机位/景别/光线语言一致。⑦时间戳：本段没有延续段，[Shot 1] 无时间戳；其后切镜"
+                "时间戳从本段开头起算，全部落在本段 **时长** 内。")
+    else:
+        if _seam_on:
+            seam_duration_note = (
+                "write this segment's ACTUAL GENERATED seconds: the 1st segment = the configured duration (the fixed "
+                "value, or a value picked by story arc when a range is set); from the 2nd segment on = configured "
+                f"duration + the head hand-off {seam_runway_txt} (the value given by the duration setting above, "
+                "1 decimal allowed)")
+            seam_handoff_rule = (
+                f"- - Head hand-off + story-state continuity (CRITICAL — applies when this task outputs {seg_count_txt} "
+                "Video_XXX segments in one pass; ignore for single-segment generation): the whole film is generated "
+                "segment-by-segment and then concatenated, and adjacent segments are physically stitched (each "
+                "segment's opening is pinned to the previous segment's last frame), so the opening MUST be written as a "
+                "hand-off shot. 1) If not the first: this segment's [Shot 1] IS the continuation of the previous "
+                "segment's last frame — SAME camera position / shot size / lighting / character body pose and direction "
+                f"of motion, with the action only slightly carried forward (no re-staging, no re-winding up), lasting "
+                f"{seam_runway_txt}; this head section is DISCARDED entirely in the final cut, so this segment's NEW "
+                f"content starts after {seam_runway_txt} (the first cut happens at ≈ {seam_runway_txt}, where you may "
+                "change shot size / camera / space). 2) The first segment has no hand-off section — write a normal "
+                "opening. 3) Story state MUST be continuous across segments: the previous segment's end state (who was "
+                "where / in what pose / what had just been discovered or happened) IS the content of the hand-off "
+                "shot; never replay an event already shown, never regress state (already stood up / discovered / stepped "
+                "down -> do not squat back / act unaware / step onto the same stair again). 4) If not the last: close "
+                "the final [Shot N] by stating the physical end-state in 1-2 sentences (who / where / pose / action in "
+                "progress) as the story-state hand-off; never close a middle segment with a tableau (lock eyes / smile "
+                "/ freeze / turn away). 5) Only the first segment may fully open the story, only the last may truly "
+                "close it. 6) When cutting back to a scene visited earlier, keep that scene's camera/shot-size/lighting "
+                "language consistent. 7) Timestamps: the hand-off section occupies time too ([Shot 1] has no timestamp; "
+                f"later cuts start counting from {seam_runway_txt}) and all of them must fall within this segment's "
+                "**Duration**.")
+        else:
+            seam_duration_note = (
+                "write this segment's ACTUAL GENERATED seconds: = the configured duration (the fixed value, or a value "
+                "picked by story arc when a range is set; 1 decimal allowed)")
+            seam_handoff_rule = (
+                f"- - Segment hand-off + story-state continuity (CRITICAL — applies when this task outputs {seg_count_txt} "
+                "Video_XXX segments in one pass; ignore for single-segment generation): the segments are generated "
+                "independently and then concatenated, so each segment boundary is a HARD CUT / scene change. 1) If not "
+                "the first: this segment's [Shot 1] is the next shot that directly follows the previous segment's story "
+                "timeline (you may change shot size / camera / space); the segment must stand on its own, and you MUST "
+                "NOT write pseudo-references such as \"continuing from the previous segment's last frame\" / "
+                "\"the previous segment continues\". 2) Write a normal opening for the first segment. 3) Story "
+                "state MUST be continuous across segments: the previous segment's end state (who was where / in what "
+                "pose / what had just been discovered or happened) is the basis of this segment's opening; never replay "
+                "an event already shown, never regress state (already stood up / discovered / stepped down -> do not "
+                "squat back / act unaware / step onto the same stair again). 4) If not the last: close the final "
+                "[Shot N] by stating the physical end-state in 1-2 sentences (who / where / pose / action in progress) "
+                "as the story-state hand-off; never close a middle segment with a tableau (lock eyes / smile / freeze / "
+                "turn away). 5) Only the first segment may fully open the story, only the last may truly close it. "
+                "6) When cutting back to a scene visited earlier, keep that scene's camera/shot-size/lighting language "
+                "consistent. 7) Timestamps: this segment has no hand-off section ([Shot 1] has no timestamp); later "
+                "cuts are timed from the start of this segment and all of them must fall within this segment's **Duration**.")
+
+
     schedule_rules = _build_schedule_rules(lang, enable_scene, enable_props, enable_video, enable_audio)
 
     # 用 replace 而非 format：rules 文本内含 {视觉描述} 等示意大括号，不能走 format
     rules = (H3_SHOT_RULES_ZH if lang == "zh" else H3_SHOT_RULES_EN)
+    rules = rules.replace("{Seam_Duration_Note}", seam_duration_note)
+    rules = rules.replace("{Seam_Handoff_Rule}", seam_handoff_rule)
     rules = rules.replace("{Segment_Count}", seg_count_txt)
     rules = rules.replace("{Segment_Duration}", duration_desc)
     rules = rules.replace("{Seam_Runway}", seam_runway_txt)
@@ -425,7 +586,13 @@ def build_shot_prompt(
         Segment_Count=seg_count_txt,
         Segment_Count_Spec=seg_count_spec,
         Segment_Duration=duration_desc,
-        Decompose_Rules=_dr.replace("{Seam_Runway}", seam_runway_txt),
+        Decompose_Rules=(_dr.replace("{Seam_Principle_2}", seam_principle_2)
+                             .replace("{Seam_Decompose_Bullet}", seam_decompose_bullet)
+                             .replace("{Seam_SelfContained}", seam_self_contained)
+                             .replace("{Seam_Scheme_A}", seam_scheme_a)
+                             .replace("{Seam_No_Pseudo_Ref}", seam_no_pseudo_ref)
+                             .replace("{Seam_Ban_Pseudo_Ref}", seam_ban_pseudo_ref)
+                             .replace("{Seam_Runway}", seam_runway_txt)),
         Reference_Intro=reference_intro,
         H3_Shot_Rules=rules,
         Preference_Block=pref_block,
@@ -434,4 +601,6 @@ def build_shot_prompt(
         User_Story=user_story,
         User_Tags=user_tags,
         Seam_Runway=seam_runway_txt,
+        Seam_Edge_Rule=seam_edge_rule,
+        Seam_Check_Rule=seam_check_rule,
     )

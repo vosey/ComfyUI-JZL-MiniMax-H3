@@ -79,8 +79,13 @@ def _parse_four_in_one(content):
     return h3, scene, video, audio
 
 
+# 资产名里的通用词（图片2 / 角色 / 场景…）：两边同时出现是常态，不能当作「同一个素材」的依据。
+# 否则「图片3 角色 土拨鼠」会错配到池里任意一条「图片N 角色 XXX」，用户拿到无关参考图。
+_GENERIC_TOKENS = {"图片", "视频", "音频", "角色", "场景", "道具", "音色", "主体", "其他", "分镜", "资产"}
+
+
 def _match_name(slot_name, node_name):
-    """模糊匹配：slot 素材名与上游节点名互相包含，或分词后有交集。"""
+    """模糊匹配：slot 素材名与上游节点名互相包含，或分词后有交集（交集须含至少一个非通用词）。"""
     s = (slot_name or "").strip().lower()
     n = (node_name or "").strip().lower()
     if not s or not n:
@@ -89,7 +94,8 @@ def _match_name(slot_name, node_name):
         return True
     s_tokens = {t for t in re.split(r'[-\s_（(）):：,，、/]+', s) if t}
     n_tokens = {t for t in re.split(r'[-\s_（(）):：,，、/]+', n) if t}
-    return bool(s_tokens & n_tokens)
+    common = s_tokens & n_tokens
+    return any(t not in _GENERIC_TOKENS for t in common)
 
 
 def _parse_slots(raw):

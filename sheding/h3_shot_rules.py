@@ -18,7 +18,7 @@ H3_SHOT_RULES_ZH = '''
 ### 4.1 分段信息格式
 - 分段标题命名（CRITICAL）：每个分段块的第一行写 `### Video_XXX`（Video 编号从 001 三位补零递增：Video_001、Video_002...），这是分段标题，与 detailed_description 内的切镜标签 [Shot N] 完全无关，严禁写成 `### Shot_XXX`。
 **标题**: [2-10字中文标题，根据本段内容自动生成]
-**时长**: [写本段**实际生成**秒数：第 1 段 = 设定时长（全局固定就写那个值、区间就按弧线取值）；第 2 段起 = 设定时长 + 段首衔接 {Seam_Runway}（即上方时长设定给出的那个值，允许 1 位小数）]
+**时长**: [{Seam_Duration_Note}]
 **景别**: [远景/全景/中景/近景/特写]
 **运镜**: [固定/推/拉/摇/移/跟/升/降]
 **角色**: [本段出场角色名，顿号分隔；无人写"无"。只写「参考素材说明」里声明的角色，严禁自造未声明的角色]
@@ -47,8 +47,8 @@ non_diegetic_music: {...}
   - ① 特征清单必须写到「**可被画出来**」的粒度：颜色 + 材质 + 层次 + 位置 + 承载物。正例（参考官方）：浅蓝色皮肤带黄色斑纹、高耸弯曲的蓝色帽子、缀金铆钉的黑色面罩、棕色厚毛领压在青色和服式上衣外、上衣缀橙红补丁、腰间深蓝护甲板 + 红紫腰带、腰带插两把深色刀鞘金柄武士刀、背着粗棕绳捆扎的巨大行囊（蓝绿铺盖卷 + 木桶 + 黄色葫芦）。
   - ② 用户给了括号外貌描述时**在此基础上具象化**（把「橙色武道服」扩成「橙色龟仙流武道服，肩部深色滚边、黑色腰带」），但**严禁改换颜色/服装品类/物种/身份/数量**——具象化只能补充「能在 <Picture N> 里看到的可见细节」，不能创作不存在的设定。
   - ③ 用户只给名字（无描述）时：写「<Subject N> is the <身份> in <Picture N>, featuring <该图中可稳定描述的可见特征>」；**严禁编造身份/物种/背景故事**，但允许描述图内可见的颜色/材质/裁剪/配饰（这些是 <Picture N> 的既成事实）。
-  - ④ **风格锚定**：当本段有首帧锚点图、且该图承担整体风格时，必须把「风格 + 该图环境」合并成一条 Subject：`<Subject 2> is <环境描述> and <风格名/质感> in <Picture N>, characterized by <风格要素清单（星空/烟雾/叶丛/色调/着色方式…）>`；正文与 retention 里用该标签引用它来维持风格一致（正例：`The background of <Subject 2> features …`、`The curling cyan smoke of <Subject 2> swirls violently…`）。
-  - ⑤ **<Picture N> 本体行（必须有）**：每张参考图要有一条说明它在本段扮演什么角色——首帧写 `<Picture N> is the first frame of [Shot 1], showing <Subject 1> … within <Subject 2>.`；尾帧写 `… is the last frame of [Shot M] …`；普通参考图写 `… is the reference for <Subject K> …`；构图参考写 `… is the composition reference …`。
+  - ④ **风格锚定**：当某张参考图承担本段整体风格时，必须把「风格 + 该图环境」合并成一条 Subject：`<Subject 2> is <环境描述> and <风格名/质感> in <Picture N>, characterized by <风格要素清单（星空/烟雾/叶丛/色调/着色方式…）>`；正文与 retention 里用该标签引用它来维持风格一致（正例：`The background of <Subject 2> features …`、`The curling cyan smoke of <Subject 2> swirls violently…`）。
+  - ⑤ **<Picture N> 本体行（必须有）**：每张参考图要有一条说明它在本段扮演什么角色——普通参考图写 `<Picture N> is the reference for <Subject K> …`；构图参考写 `<Picture N> is the composition reference …`。**本工作流固定 ref2va，严禁写 `is the first frame of [Shot 1]` / `is the last frame of [Shot M]` 这类首帧/尾帧锚定句**。
   - ⑥ **<Subject N> vs <Picture N> 用法区分（CRITICAL）**：`<Subject N>` 用于「描述主体/环境/风格的**内容与特征**」（描述画面时用）；`<Picture N>` 用于「指**某一帧/某张图本身**」（首帧/尾帧/构图来源）。禁止用 <Picture N> 代替 <Subject N> 描述内容（「<Picture 1> 的浅蓝色皮肤」✗ → 「<Subject 1> 的浅蓝色皮肤」✓），也禁止用 <Subject N> 指参考图本身（「从 <Subject 1> 开始」✗ → 「从 <Picture 1> 开始」✓）。
 - 三段复述一致性律（CRITICAL）：同一主体/风格/环境必须按「**定义 → 应用 → 校验**」三段闭环书写，三处的颜色/材质/数量**严禁互相矛盾**：① 定义段（subject_definitions）= 完整特征清单；② 应用段（detailed_description）= <Subject N> 首次出现时**复述该清单**（句式可简写，但特征词必须一致，如「浅蓝皮肤、缀金铆钉面罩、补丁和服、巨大行囊、双刀」）；③ 校验段（retention_analysis）= 再次列举同样特征做保留校验。内容/retention 里**严禁出现 subject_definitions 未定义的新外貌/新道具/新配色**。
 - <Video N>：参考视频（运镜/动作/剪辑参考），编号 = VIDEO_INSTRUCTION.slots 下标 + 1。
@@ -58,12 +58,12 @@ non_diegetic_music: {...}
 
 #### summary（摘要）
 1-3 句，**结构固定为三拍**：① 起点（本段从哪一帧 / 上段末态开始，引用 <Picture N>）；② 触发事件（什么打破了初始状态）；③ 主体行动与可见结果（<Subject N> 做了什么、可见地造成什么）。
-- 开头方括号任务类型前缀（用 " + " 组合），词表：`reference generation` / `video editing` / `video continuation` / `keyframe completion`（**首帧/关键帧补全**）/ `audio reuse` / `audio reference`。**存在首帧锚点图（<Picture N> 作 [Shot 1] 首帧）时，标签必须含 `keyframe completion`**。
+- 开头方括号任务类型前缀（用 " + " 组合），词表：`reference generation` / `video editing` / `video continuation` / `audio reuse` / `audio reference`。**禁止使用 `keyframe completion`**——本工作流固定 ref2va，没有首帧/尾帧锚定路径。
 
 #### retention_analysis（保留分析）
 每个引用标签一行，标记保留程度：fully_preserved / partially_preserved / attribute_transfer / weak_reference；音频用 fully_copy / partially_copy / reference / weak_reference。
 - 格式："<Subject 1> (出现在 [Shot 1], [Shot 2]): fully_preserved - 特征列表。"
-- **首帧锚点图单独一行**："<Picture 1> ([Shot 1] first frame): fully_preserved - 本段视频从这一帧开始，保留参考图的初始构图、主体朝向与背景元素。"（普通参考图写 "<Picture N> (出现在 [Shot M]): fully_preserved - …"）。
+- 参考图一律按普通参考写："<Picture N> (出现在 [Shot M]): fully_preserved - …"。**严禁写 `([Shot 1] first frame)` 之类的首帧锚定行**。
 - 破折号后直接列举该主体在 subject_definitions 里已定义的特征（如"橙色龟仙流武道服与黑色刺猬发型"），顿号分隔、句号结尾，程度与特征呼应。严禁写「保留」二字（保留程度已由 fully_preserved 等标记表达，写「保留」属于翻译腔、画蛇添足）、严禁机械写"按 <Picture N> 原样保留"、严禁自编 subject_definitions 里没有的外貌/道具细节。
 - 音频写"reference - <Subject N> 的对话遵循 <Audio N>"。严禁自编音色描述（如"年轻""低沉""清脆"），除非用户音频说明里明确写了该音色特征；严禁写"不复制原信号"尾缀。
 
@@ -99,11 +99,11 @@ non_diegetic_music: {...}
 - 对白时长匹配铁律（CRITICAL）：台词必须与镜头时长匹配——按正常语速估算（中文约 4~5 字/秒、英文约 2~3 词/秒，含自然停顿），**该镜头的持续时长必须容纳镜内全部台词**。放不下时：① 拉长该 [Shot N] 的时间戳（其后镜头时间戳相应后移）；② 或把台词拆到相邻镜头并用 <scenetrans> 标记跨镜连续。严禁在过短的镜头里塞长台词（会导致口型/节奏崩坏）。
 - 段首静默铁律（CRITICAL）：**每一段的开头 1 秒内严禁出现任何 <d> 台词**（含对白/画外音/内心独白）——[Shot 1] 起 1 秒只能用画面/环境声/动作铺陈，第一句台词的最早时间必须 ≥ 1 秒；若本段是「无限时长」的段首延续段（会在成片里被裁掉），台词必须从延续段结束之后才开始，且仍需满足本段保留内容开头 1 秒内无台词。
 - 可视文本双引号原则（CRITICAL）：画面中任何实际可见的横幅、标志、信件文字、霓虹灯招牌，必须用英文双引号 "" 包裹其原文并保留原语言不得翻译。例如：门上方亮起写着 "营业中" 的红色霓虹灯招牌。
-- 首帧锚定（条件规则，CRITICAL）：当本分段 slots 里的参考图被声明为 [Shot 1] 首帧（<Picture N> 作为 [Shot 1] 的第一帧锚点）时：① **subject_definitions 必须有一条 `<Picture N> is the first frame of [Shot 1], showing <Subject 1> … within <Subject 2>.`**；② [Shot 1] 的起手句固定写「本镜以 <Picture N> 作为第一帧开始」（英文写 `The shot begins with <Picture N> as the first frame.`），随后先建立参考图中的构图、主体初始姿态、服装/道具和场景锚点，再推进动作；③ 本段的整体风格/渲染质地/色调光线一律从该参考图推导（官方协议：有首帧参考图时风格从图推导，禁止另起炉灶套无关风格）。禁止在 [Shot 1] 第一句话就让角色飞出去，必须有"从静止（首帧状态）到启动"的过程。
+- 参考图风格推导（固定规则）：本段整体风格/渲染质地/色调光线**一律从参考图推导**（官方协议：ref2va 下风格由参考图决定），禁止另起炉灶套无关风格；禁止在 [Shot 1] 第一句话就让角色飞出去，必须有"从静止（起手姿态）到启动"的过程。
 - 物理矢量描述（CRITICAL，彻底禁用文学修辞）：每一句必须对应物理世界中可见/可听的事实。禁用一切主观情感抒情与抽象文学形容词（禁止写"绝望的氛围""如诗如画"）。情感必须转化为物理动作："他感到悲伤"必须写成"他低下头，肩膀垮塌，半张脸隐没在阴影中"；环境必须物化："风吹过"必须写成"树叶向右侧剧烈摇晃，掀起角色的斗篷下摆"。具体可见的颜色与光线（如"冷白月光透过竹叶洒下"）属于物理事实，保留；只禁抽象情绪词与主观抒情。
 - 禁止情绪性收尾套话（CRITICAL）：禁止用抽象抒情句给镜头/分段收尾——严禁"阳光正好""画面定格在这份惬意中""时光仿佛静止""岁月静好""一切尽在不言中""气氛温馨而美好""仿佛在诉说…""世界都安静了"等无物理载体的情绪总结句；禁止"话音刚落""说完这句话""话声未落"这类叙述性衔接词占据镜头内容。若镜头有可见收束（角色合眼/光影移动/道具落定/动作结束），用具体的物理末态描写，并写明"谁、在什么位置、保持什么姿态/视线/道具状态"（供下一镜头复位）；不写情绪结论。
 
-- - 段首承接 + 剧情状态连续（CRITICAL — 本次任务一次输出 {Segment_Count} 个 Video_XXX 分段时适用；单独生成单个分段忽略）：整片是**分段连续生成再拼接**的，段与段之间有物理画面衔接（下一段的开头会被钉住上一段的末帧，因此段首必须写成衔接画面）。①非首段：本段 [Shot 1] 就是「承接上一段末帧画面的延续段」——与上段末帧**同机位/同景别/同光线/同角色身体姿态与动作进行方向**，动作只做轻微延续（不要重新站位、不要重新起势），持续 {Seam_Runway}；这一段在成片里会被**整段裁掉**，所以本段新内容从 {Seam_Runway} 之后开始（第一次切镜 ≈ 在 {Seam_Runway} 处，可换景别/机位/空间）。②首段没有延续段，按正常开场写。③剧情状态必须跨段连续：上段结束时的剧情状态（谁在哪/姿态/已发现什么/刚发生什么）就是延续段的画面内容；禁止重演上段已演的事件、禁止状态回退（上段已站起/已发现/已下台阶，本段不得又蹲回/装作没发现/再踏上同一级台阶）。④非末段：本段最后一个 [Shot N] 用 1-2 句写清本段结束时的物理末态（谁/在哪/姿态/正进行动作），作剧情状态交接；禁止用对视/一笑/定格/转身等封闭收尾给中段画句号。⑤只有首段可完整开场、只有末段可真正收束。⑥切去别的空间再切回某场景时，保持该场景此前的机位/景别/光线语言一致。⑦时间戳：延续段也占时间（[Shot 1] 无时间戳，其后切镜时间戳从 {Seam_Runway} 起算），全部落在本段 **时长** 内。
+{Seam_Handoff_Rule}
 
 - 切镜/运镜/景别的具体导演语法（切镜时机、连续状态链、事件密度、动作语法等）由「## 1. 故事风格」中的「镜头语言库」按本风格逐条提供，此处不再重复。
 
@@ -132,8 +132,9 @@ non_diegetic_music: {...}
 - SCENE slots 排序铁律：场景最前 → 角色按出场顺序 → 道具最后；本分段没用到的类型不写进 slots。
 - VIDEO_INSTRUCTION.slots 第 1 项 = <Video 1>，编号从 1 开始（只含视频）。
 - AUDIO_INSTRUCTION.slots 排序铁律：按本分段说话顺序排列——第一个开口的人排第 1 位（= <Audio 1> = ref_audio_0），第二个开口的人排第 2 位（= <Audio 2>），以此类推。严禁按槽位名 A/B/C 固定排。
-每个元素 = 「类型:槽位名」（如「场景:场景A」「角色:角色A」「音频:音频A」），原样照抄用户素材说明里的槽位名，不加任何前后缀。
+每个元素 = 「类型:槽位名」（如「场景:场景A」「角色:角色A」「音频:音色A」），原样照抄用户素材说明里的槽位名，不加任何前后缀。
 - 【槽位名】必须原样照抄用户素材说明里声明的槽位名（如「角色A」），与素材节点一一对应。
+- ⚠️ 音频槽位名按子分类带不同前缀：角色音色 → 音色A/音色B…；背景配乐 → 配乐A/配乐B…；念白 → 念白A…；其它音频 → 音频A…。**类型前缀一律写「音频」**（如「音频:音色A」「音频:配乐A」），槽位名部分照抄。
 - 严禁拆分/缩写槽位名、严禁用素材名当槽位名（把「角色A」写成「孙悟空」）、严禁自造槽位名。
 
 ===SCENE_INSTRUCTION===
@@ -143,12 +144,12 @@ non_diegetic_music: {...}
 {"slots":["视频:视频A"]}
 
 ===AUDIO_INSTRUCTION===
-{"slots":["音频:音频A","音频:音频B"]}
+{"slots":["音频:音色A","音频:音色B"]}
 
 {Schedule_Rules}
 
 ## 5. 完整示例（1 镜，格式参考，禁止照抄内容）
-假设用户素材说明声明了：场景A月夜竹林、角色A张伟、角色B小雨、道具A青铜剑、视频A张伟拔剑动作、音频A张伟男声、音频B小雨女声。
+假设用户素材说明声明了：场景A月夜竹林、角色A张伟、角色B小雨、道具A青铜剑、视频A张伟拔剑动作、音色A张伟男声、音色B小雨女声。
 
 [SHOT_START]
 ### Video_001
@@ -198,7 +199,7 @@ non_diegetic_music: N/A
 {"slots":["视频:视频A"]}
 
 ===AUDIO_INSTRUCTION===
-{"slots":["音频:音频A","音频:音频B"]}
+{"slots":["音频:音色A","音频:音色B"]}
 [SHOT_END]
 
 [SHOT_START]
@@ -246,11 +247,11 @@ non_diegetic_music: N/A
 {"slots":[]}
 
 ===AUDIO_INSTRUCTION===
-{"slots":["音频:音频A","音频:音频B"]}
+{"slots":["音频:音色A","音频:音色B"]}
 [SHOT_END]
 
 ⚠️ 注意：Video_002 没用到背景和道具，slots 只写两个角色，所以 <Picture 1>=角色A、<Picture 2>=角色B——每段从 1 重新编号，不是沿用 Video_001 的 <Picture 2>/<Picture 3>。
-⚠️ 音频顺序：本段张伟先开口、小雨后开口，所以 AUDIO_INSTRUCTION.slots = ["音频:音频A","音频:音频B"]（音频A=张伟排第 1）。若某段小雨先开口，则要写 ["音频:音频B","音频:音频A"]——先说话的排第 1 位。
+⚠️ 音频顺序：本段张伟先开口、小雨后开口，所以 AUDIO_INSTRUCTION.slots = ["音频:音色A","音频:音色B"]（音色A=张伟排第 1）。若某段小雨先开口，则要写 ["音频:音色B","音频:音色A"]——先说话的排第 1 位。
 
 其余分段照此格式依次输出，Video 编号从 001 三位补零递增。
 
@@ -277,7 +278,7 @@ non_diegetic_music: N/A
 20. 主体每次明显动作必须带**至少 1 处附属物副运动**（行囊/铺盖/衣摆/毛领/发丝/手中道具/烟雾/尘土），写清摆动方向与幅度；静止镜头也保留 1 处微副运动。
 21. **可见事实密度**：每个 [Shot N] 平均每秒 ≥ 2 个可被相机拍到的事实（肢体质心/接触点/受理形变/位移/道具变化/表情/环境反应/副运动/镜头运动/同步声音）；禁止用形容词与心理描写顶替可见事实。
 22. **三段复述一致**：subject_definitions（定义）→ detailed_description（首次出现复述）→ retention_analysis（再列举）三处特征词（颜色/材质/数量）必须一致；正文/retention 严禁出现未定义的新外貌/新道具/新配色。
-23. 有首帧锚点图时：subject_definitions 必须有 `<Picture N> is the first frame of [Shot 1], showing …` 行；[Shot 1] 起手句写 `The shot begins with <Picture N> as the first frame.`；summary 标签必须含 `keyframe completion`；retention 首帧图单独一行。
+23. 固定 ref2va：**严禁**写 `<Picture N> is the first frame of [Shot 1]` / `is the last frame of`、严禁在 summary 写 `keyframe completion`、严禁在 retention 写 `([Shot 1] first frame)`——本工作流没有首帧/尾帧锚定路径，参考图一律按普通参考写。
 24. **段首静默**：每段开头 **1 秒**内严禁出现任何 <d> 台词（含对白/画外音/内心独白），第一句台词最早时间必须 ≥ 1 秒。'''
 
 
@@ -295,7 +296,7 @@ Each segment is strictly wrapped in [SHOT_START]...[SHOT_END]. Inside each block
 ### 4.1 Shot Info Format
 - Segment-title naming (CRITICAL): the first line of every segment block is `### Video_XXX` (Video numbers zero-padded to three digits, incrementing: Video_001, Video_002...). This is the segment title and is completely unrelated to the cut label [Shot N] inside detailed_description — never write `### Shot_XXX`.
 **Title**: [2-10 word English title, auto-derived from the segment]
-**Duration**: [write this segment's ACTUAL GENERATED seconds: the 1st segment = the configured duration (the fixed value, or a value picked by story arc when a range is set); from the 2nd segment on = configured duration + the head hand-off {Seam_Runway} (the value given by the duration setting above, 1 decimal allowed)]
+**Duration**: [{Seam_Duration_Note}]
 **Shot Size**: [Extreme Long/Long/Medium/Close-up/Extreme Close-up]
 **Camera Movement**: [Static/Push/Pull/Pan/Tilt/Truck/Tracking/Pedestal/Crane]
 **Characters**: [comma-separated names; "none" if no one. ONLY characters declared in the material intro; never invent undeclared characters]
@@ -325,8 +326,8 @@ The user's material intro declares each item as "slotName = materialName (descri
   - (1) The feature list MUST be detailed enough to be DRAWN: color + material + layering + position + carried items. Positive reference: "light blue skin with yellow markings, a tall curved blue hat, a black face mask with gold studs, a thick brown fur collar over a teal kimono-style top with orange and red patches, dark blue armor panels at the waist with red and purple sashes, two katana with dark scabbards and gold hilts tucked in the belt, and a massive backpack bound with thick brown ropes, loaded with blue and green bedrolls, a wooden container, and yellow gourds."
   - (2) When the user supplies a bracketed appearance note, EXPAND it into visible specifics ("orange martial-arts gi" -> "an orange Turtle-school gi with dark piping on the shoulders and a black belt"), but NEVER change color / garment type / species / identity / count — expansion may only add details visibly present in <Picture N>.
   - (3) When only a name is given: write "<Subject N> is the <identity> in <Picture N>, featuring <visibly stable features in that image>"; do NOT invent identity/species/backstory, but DO describe the visible colors/materials/cut/accessories (facts of <Picture N>).
-  - (4) STYLE ANCHORING: when this segment has a first-frame anchor image that carries the overall style, merge "the style + that image's environment" into one Subject: `<Subject 2> is <environment description> and <style name/texture> in <Picture N>, characterized by <style elements (sky/smoke/foliage/color grading/shading...)>`; reference that label in the body and retention to keep the style consistent.
-  - (5) <Picture N> ROLE LINE (mandatory): every reference image needs one line stating the role it plays here — first frame: `<Picture N> is the first frame of [Shot 1], showing <Subject 1> ... within <Subject 2>.`; last frame: `... is the last frame of [Shot M] ...`; plain reference: `... is the reference for <Subject K> ...`; composition reference: `... is the composition reference ...`.
+  - (4) STYLE ANCHORING: when a reference image carries this segment's overall style, merge "the style + that image's environment" into one Subject: `<Subject 2> is <environment description> and <style name/texture> in <Picture N>, characterized by <style elements (sky/smoke/foliage/color grading/shading...)>`; reference that label in the body and retention to keep the style consistent.
+  - (5) <Picture N> ROLE LINE (mandatory): every reference image needs one line stating the role it plays here — plain reference: `... is the reference for <Subject K> ...`; composition reference: `... is the composition reference ...`. This workflow is FIXED to ref2va: NEVER write `is the first frame of [Shot 1]` / `is the last frame of [Shot M]` style anchors.
   - (6) <Subject N> vs <Picture N> USAGE (CRITICAL): `<Subject N>` describes the CONTENT/features of a subject/environment/style (use it when describing the picture); `<Picture N>` refers to the frame/image ITSELF (first frame / last frame / composition source). Never use <Picture N> for content ("<Picture 1>'s light blue skin" is WRONG -> "<Subject 1>'s light blue skin"), and never use <Subject N> for the image itself ("starting from <Subject 1>" is WRONG -> "starting from <Picture 1>").
 - Three-pass restatement consistency (CRITICAL): the same subject/style/environment MUST form a define -> apply -> verify loop with identical color/material/count: (1) define (subject_definitions) = full feature list; (2) apply (detailed_description) = RESTATE that list when <Subject N> first appears (sentence form may be shortened, but feature words must match, e.g. "light blue skin, studded mask, patched gi, massive pack, twin katana"); (3) verify (retention_analysis) = list the same features again. NEVER introduce new looks/props/colors in the body or retention that subject_definitions did not define.
 - <Video N>: reference video, numbered by VIDEO_INSTRUCTION.slots index + 1. <Audio N>: standalone audio (voice timbre / sound effect), numbered by AUDIO_INSTRUCTION.slots index + 1 = speaking order (first speaker = <Audio 1> = (S1)). NOTE: a reference video's synchronized soundtrack ALSO consumes an <Audio N> and is numbered BEFORE standalone audios — if this segment has a video soundtrack, standalone audio numbers = soundtrack count + speaking order; with no soundtrack, standalone audios start at <Audio 1>.
@@ -335,12 +336,12 @@ The user's material intro declares each item as "slotName = materialName (descri
 
 #### summary
 1-3 sentences with a FIXED three-beat structure: (1) starting point (which frame / the previous segment's end state this segment begins from, citing <Picture N>); (2) the triggering event (what breaks the initial state); (3) the subject's action and its visible result (what <Subject N> does and what visibly results).
-- Open with a bracketed task-type prefix (combined with " + "), vocabulary: `reference generation` / `video editing` / `video continuation` / `keyframe completion` / `audio reuse` / `audio reference`. When a first-frame anchor image exists (<Picture N> as [Shot 1]'s first frame), the prefix MUST include `keyframe completion`.
+- Open with a bracketed task-type prefix (combined with " + "), vocabulary: `reference generation` / `video editing` / `video continuation` / `audio reuse` / `audio reference`. NEVER use `keyframe completion` — this workflow has no first/last-frame anchor path.
 
 #### retention_analysis
 One line per label with markers: fully_preserved / partially_preserved / attribute_transfer / weak_reference; audio: fully_copy / partially_copy / reference / weak_reference.
 - Format: "<Subject 1> (appears in [Shot 1], [Shot 2]): fully_preserved - feature list."
-- First-frame anchor image gets its own line: "<Picture 1> ([Shot 1] first frame): fully_preserved - the target video starts exactly from this image, preserving the initial composition, the subject's orientation, and the background elements." (plain reference images: "<Picture N> (appears in [Shot M]): fully_preserved - ...").
+- Reference images are ALWAYS plain references: "<Picture N> (appears in [Shot M]): fully_preserved - ...". NEVER write a first-frame anchor line such as "([Shot 1] first frame)".
 - After the dash, list the concrete features already defined in subject_definitions (e.g. "the orange martial-arts gi and spiky black hair"), separated by commas, ending with a period, with the degree matching the features. Do NOT write "retained"/"are retained" (the degree is already expressed by fully_preserved etc.), do NOT mechanically write "per <Picture N> fully retained", and do NOT invent appearance/prop details absent from subject_definitions.
 - Audio: "reference - <Subject N>'s dialogue follows <Audio N>". Do NOT invent a timbre description (e.g. "low"/"clear"/"young") unless the user's audio intro explicitly states it; do NOT write "the original signal is not copied".
 
@@ -376,11 +377,11 @@ Keep <d> content in the original language with basic punctuation (, . ? !), remo
 - Dialogue-timing rule (CRITICAL): dialogue must fit the shot's duration — estimate at natural pace (Chinese ≈4-5 chars/sec, English ≈2-3 words/sec, including pauses) and make sure the shot lasts long enough to contain ALL of its dialogue. If it does not fit: ① extend that [Shot N]'s timestamp (shift later cuts accordingly); or ② split the line across adjacent shots and mark continuity with <scenetrans>. NEVER cram a long line into a too-short shot (it breaks lip-sync and rhythm).
 - Head-silence rule (CRITICAL): the FIRST 1 second of EVERY segment MUST contain NO <d> dialogue of any kind (spoken line / voiceover / inner monologue) — only visuals/ambience/action may occupy the first 1s, and the earliest dialogue timestamp must be ≥ 1s; if this segment starts with an infinite-length head hand-off section (which is discarded in the final cut), dialogue must begin only after that section ends, and the retained content must still keep its own first second dialogue-free.
 - On-screen text (CRITICAL): place any banner, sign, label, subtitle, or neon text that is actually visible on screen in English double quotation marks, preserving the original text verbatim without translation: `A red neon sign reading "营业中" glows above the doorway.`
-- First-frame anchoring (conditional, CRITICAL): when a reference image in this segment's slots is declared as the first frame of [Shot 1] (<Picture N> as [Shot 1]'s frame anchor): (1) subject_definitions MUST include the line `<Picture N> is the first frame of [Shot 1], showing <Subject 1> ... within <Subject 2>.`; (2) [Shot 1] MUST open with the fixed sentence `The shot begins with <Picture N> as the first frame.`, then establish the composition, the subject's initial pose, costume/props and scene anchors of that image BEFORE advancing the action; (3) derive this segment's overall style, render texture, color and lighting FROM that reference image (official protocol: with a first-frame reference the style comes from the image; never impose an unrelated style). Forbid the character flying out in the very first sentence; there must be a "from rest (first-frame state) to motion" process.
+- Style from reference images (fixed rule): this segment's overall style/render texture/color and lighting MUST be derived FROM the reference images (official protocol: under ref2va the style is determined by the references); never impose an unrelated style. Forbid the character flying out in the very first sentence; there must be a "from rest (starting pose) to motion" process.
 - Physical-vector description (CRITICAL, kill literary fluff): every sentence must correspond to something physically visible or audible. Forbid all subjective emotion and abstract literary adjectives ("a desperate atmosphere", "picturesque"). Turn emotions into physical action: "he feels sad" becomes "he lowers his head, his shoulders slump, and half his face sinks into shadow". Physicalize the environment: "the wind blows" becomes "leaves shake violently to the right, lifting the hem of the character's cloak". Concrete visible color and light (e.g. "cold white moonlight filters through the bamboo leaves") are physical facts and stay; only abstract emotion words and subjective lyricism are banned.
 - No emotional closing clichés (CRITICAL): never close a shot/segment with abstract lyrical summary — ban "the sunlight is just right", "the scene freezes in this cozy moment", "time seems to stand still", "all is well", "words are unnecessary", "the atmosphere is warm and lovely", "as if telling…", "the whole world falls silent", and similar emotion-summary sentences with no physical carrier; also ban narrative filler like "the moment the words ended" taking up shot content. If the shot has a visible settlement (character closing eyes / light shifting / prop settling / action finishing), describe the concrete physical end-state and state who, at what position, keeps what pose/gaze/prop state (for the next shot to reset); do NOT write an emotional conclusion.
 
-- - Head hand-off + story-state continuity (CRITICAL — applies when this task outputs {Segment_Count} Video_XXX segments in one pass; ignore for single-segment generation): the whole film is generated segment-by-segment and then concatenated, and adjacent segments are physically stitched (each segment's opening is pinned to the previous segment's last frame), so the opening MUST be written as a hand-off shot. 1) If not the first: this segment's [Shot 1] IS the continuation of the previous segment's last frame — SAME camera position / shot size / lighting / character body pose and direction of motion, with the action only slightly carried forward (no re-staging, no re-winding up), lasting {Seam_Runway}; this head section is DISCARDED entirely in the final cut, so this segment's NEW content starts after {Seam_Runway} (the first cut happens at ≈ {Seam_Runway}, where you may change shot size / camera / space). 2) The first segment has no hand-off section — write a normal opening. 3) Story state MUST be continuous across segments: the previous segment's end state (who was where / in what pose / what had just been discovered or happened) IS the content of the hand-off shot; never replay an event already shown, never regress state (already stood up / discovered / stepped down -> do not squat back / act unaware / step onto the same stair again). 4) If not the last: close the final [Shot N] by stating the physical end-state in 1-2 sentences (who / where / pose / action in progress) as the story-state hand-off; never close a middle segment with a tableau (lock eyes / smile / freeze / turn away). 5) Only the first segment may fully open the story, only the last may truly close it. 6) When cutting back to a scene visited earlier, keep that scene's camera/shot-size/lighting language consistent. 7) Timestamps: the hand-off section occupies time too ([Shot 1] has no timestamp; later cuts start counting from {Seam_Runway}) and all of them must fall within this segment's **Duration**.
+{Seam_Handoff_Rule}
 
 - Specific cut/camera/shot-size directing grammar (cut timing, continuous state chain, event density, action grammar) is provided per style by the "镜头语言库" in "## 1. Story Style"; not repeated here.
 
@@ -409,7 +410,7 @@ The slots array is the ONLY basis for dispatcher nodes to assign material, stric
 - SCENE slots order rule: scene first → characters in order of appearance → props last; omit types not used in this segment.
 - VIDEO_INSTRUCTION.slots item 1 = <Video 1>; numbering restarts from 1 (videos only).
 - AUDIO_INSTRUCTION.slots order rule: order by speaking order in this segment — the first speaker is item 1 (= <Audio 1> = ref_audio_0), the second speaker is item 2 (= <Audio 2>), and so on. NEVER order them by slot name A/B/C.
-Each element is "type:slotName" (e.g. "场景:场景A", "角色:角色A", "音频:音频A"), copied exactly from the user's material intro with no prefix/suffix added.
+Each element is "type:slotName" (e.g. "场景:场景A", "角色:角色A", "音频:音色A"), copied exactly from the user's material intro with no prefix/suffix added.
 - The [slotName] MUST be copied exactly from the user's material intro (e.g. "角色A") — matching the material nodes exactly.
 - NEVER split/abbreviate a slotName, NEVER use a material name as the slotName (writing "孙悟空" instead of "角色A"), NEVER invent slot names.
 
@@ -420,12 +421,12 @@ Each element is "type:slotName" (e.g. "场景:场景A", "角色:角色A", "音�
 {"slots":["视频:视频A"]}
 
 ===AUDIO_INSTRUCTION===
-{"slots":["音频:音频A","音频:音频B"]}
+{"slots":["音频:音色A","音频:音色B"]}
 
 {Schedule_Rules}
 
 ## 5. Full Example (1 shot, format reference only — never copy its content)
-Assume the user's material intro declares: 场景A Moonlit bamboo grove, 角色A Zhang Wei, 角色B Xiao Yu, 道具A Bronze sword, 视频A Zhang Wei sword-draw action, 音频A Zhang Wei male voice, 音频B Xiao Yu female voice.
+Assume the user's material intro declares: 场景A Moonlit bamboo grove, 角色A Zhang Wei, 角色B Xiao Yu, 道具A Bronze sword, 视频A Zhang Wei sword-draw action, 音色A Zhang Wei male voice, 音色B Xiao Yu female voice.
 
 [SHOT_START]
 ### Video_001
@@ -475,7 +476,7 @@ non_diegetic_music: N/A
 {"slots":["视频:视频A"]}
 
 ===AUDIO_INSTRUCTION===
-{"slots":["音频:音频A","音频:音频B"]}
+{"slots":["音频:音色A","音频:音色B"]}
 [SHOT_END]
 
 [SHOT_START]
@@ -523,11 +524,11 @@ non_diegetic_music: N/A
 {"slots":[]}
 
 ===AUDIO_INSTRUCTION===
-{"slots":["音频:音频A","音频:音频B"]}
+{"slots":["音频:音色A","音频:音色B"]}
 [SHOT_END]
 
 ⚠️ Note: Video_002 uses no background and no props, so slots list only the two characters, giving <Picture 1>=角色A and <Picture 2>=角色B — numbering restarts from 1 in every segment, it does NOT continue Video_001's <Picture 2>/<Picture 3>.
-⚠️ Audio order: in this segment Zhang Wei speaks first and Xiao Yu second, so AUDIO_INSTRUCTION.slots = ["音频:音频A","音频:音频B"] (音频A = Zhang Wei, first). If Xiao Yu spoke first in some segment, write ["音频:音频B","音频:音频A"] — the first speaker goes first.
+⚠️ Audio order: in this segment Zhang Wei speaks first and Xiao Yu second, so AUDIO_INSTRUCTION.slots = ["音频:音色A","音频:音色B"] (音色A = Zhang Wei, first). If Xiao Yu spoke first in some segment, write ["音频:音色B","音频:音色A"] — the first speaker goes first.
 
 Output the remaining segments in the same format, Video numbers zero-padded to three digits (001, 002, ...).
 
@@ -554,5 +555,5 @@ Output the remaining segments in the same format, Video numbers zero-padded to t
 20. Every noticeable subject action MUST drag at least ONE attached object into secondary motion (pack/bedrolls/hem/fur collar/hair/handheld prop/smoke/dust), with direction and amplitude stated; even a static shot keeps one micro secondary motion.
 21. VISIBLE-FACT DENSITY: every [Shot N] needs at least 2 camera-capturable facts per second on average (limb centroid / contact point / deformation / displacement / prop change / expression / environment reaction / secondary motion / camera move / synchronized sound); never substitute adjectives or psychology for visible facts.
 22. THREE-PASS RESTATEMENT CONSISTENCY: subject_definitions (define) -> detailed_description (restate at first appearance) -> retention_analysis (list again) must use identical feature words (color/material/count); NEVER introduce looks/props/colors in the body or retention that were not defined.
-23. With a first-frame anchor image: subject_definitions MUST carry the line `<Picture N> is the first frame of [Shot 1], showing ...`; [Shot 1] MUST open with `The shot begins with <Picture N> as the first frame.`; the summary tag MUST include `keyframe completion`; the retention gets a dedicated first-frame line.
+23. Fixed ref2va: NEVER write `<Picture N> is the first frame of [Shot 1]` / `is the last frame of`; NEVER put `keyframe completion` in the summary; NEVER write `([Shot 1] first frame)` in retention — this workflow has no first/last-frame anchor path; reference images are always plain references.
 24. HEAD SILENCE: the first 1 second of every segment MUST contain NO <d> dialogue at all (spoken line / voiceover / inner monologue); the earliest dialogue timestamp must be ≥ 1 second.'''

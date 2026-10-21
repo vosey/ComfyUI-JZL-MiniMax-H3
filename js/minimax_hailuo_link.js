@@ -43,7 +43,7 @@ function dispatch(w, val) {
 }
 
 function clampDur(v) {
-    return Math.max(4, Math.min(15, Math.round(Number(v)) || 8));
+    return Math.max(4, Math.min(60, Math.round(Number(v)) || 8));
 }
 
 function allNodes(graph, pred) {

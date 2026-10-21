@@ -64,7 +64,7 @@ app.registerExtension({
                 const calcH = Math.round((hr * sc) / mul) * mul;
 
                 // ── 帧数：时长(秒) × 24fps，吸附 17k+5 网格 ──
-                const dur = Math.max(4, Math.min(15, Math.round(Number(wDur.value)) || 8));
+                const dur = Math.max(4, Math.min(60, Math.round(Number(wDur.value)) || 8));
                 const base = Math.max(5, Math.round(dur * 24));
                 const frames = base + (((5 - (base % 17)) + 17) % 17);
 
